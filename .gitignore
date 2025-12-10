@@ -1,0 +1,20 @@
+# system
+.DS_Store
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# pliki instalacyjne
+*.egg-info/
+
+# duże dane (jak się kiedyś pojawią)
+data/
+*.sp3
+*.clk
+*.rnx
+*.nc
+*.zip
