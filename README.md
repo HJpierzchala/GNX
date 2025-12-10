@@ -7,7 +7,7 @@
 
 **GNX-py** is a Python library for advanced GNSS data processing. It provides a modular architecture covering three major domains in high-precision GNSS analysis:
 
-- **PPP** – Precise Point Positioning (code, phase, uncombined PPP, ambiguity fixing)
+- **PPP** – Precise Point Positioning (code, phase, uncombined PPP)
 - **SISRE / URE** – Satellite orbit and clock quality assessment
 - **Ionosphere** – STEC, VTEC, GIM, spherical harmonics modelling, DCB estimation, and ionospheric monitoring
 
@@ -20,7 +20,6 @@ This project is designed for researchers, engineers, and students requiring high
 ### Precise Point Positioning (PPP)
 - Code-based, phase-based and uncombined PPP
 - Kalman filter framework (EKF)
-- Ambiguity management and optional AR
 - Satellite and receiver corrections (PCO/PCV, tides, troposphere, relativity)
 
 ### SISRE / URE Analysis
@@ -32,9 +31,8 @@ This project is designed for researchers, engineers, and students requiring high
 ### Ionospheric Tools
 - STEC computation
 - VTEC estimation
-- SH modelling
-- Kriging / spatial interpolation
-- Ionospheric monitoring tools
+- Kriging 
+- Ionospheric activity monitoring tools
 
 ---
 
