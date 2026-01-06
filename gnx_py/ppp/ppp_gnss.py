@@ -1,24 +1,26 @@
 import numpy as np
 import pandas as pd
 from filterpy.kalman import ExtendedKalmanFilter
-
 from ..conversion import ecef_to_enu
 from ..utils import calculate_distance
-
+from ..configuration import PPPConfig
 
 class PPPSingleFreqMultiGNSS:
 
-    def __init__(self, gps_obs, gal_obs, gps_mode, gal_mode, ekf, tro=False, pos0=None,interval=0.5):
+    def __init__(self, config:PPPConfig,gps_obs, gal_obs, gps_mode, gal_mode, ekf, tro=False, pos0=None,interval=0.5):
 
         """
-
-        :param gps_obs:
-        :param gal_obs:
-        :param gps_mode:
-        :param gal_mode:
-        :param ekf: ExtendedKalmanFilter
-        :param tro:
+        PPP Single Frequency Multi GNSS estimator
+        :param gps_obs: pd.DataFrame, gps observations
+        :param gal_obs: pd.DataFrame, gal observations
+        :param gps_mode: str, gps signals
+        :param gal_mode: str, gal signals
+        :param ekf: filterpy.ExtendedKalmanFilter instance
+        :param tro: bool, estimate ZTD
+        :param pos0: np.ndarray, initial position
+        :param interval: float, interval of observations
         """
+        self.cfg = config
         self.gps_obs = gps_obs
         self.gal_obs =gal_obs
         self.gps_mode =gps_mode
@@ -35,11 +37,11 @@ class PPPSingleFreqMultiGNSS:
 
     def HJacobian(self, x, gps_satellites, gal_satellites):
         """
-
-        :param x:
-        :param gps_satellites:
-        :param gal_satellites:
-        :return:
+        Hjacobian matrix
+        :param x: np.ndarray, state vector
+        :param gps_satellites: np.ndarray, gps satellite coordinates & mapping function
+        :param gal_satellites: np.ndarray, gal satellite coordinates & mapping function
+        :return: Hjacobian matrix
         """
         num_gps = len(gps_satellites)
         num_gal = len(gal_satellites)
@@ -88,11 +90,11 @@ class PPPSingleFreqMultiGNSS:
 
     def Hx(self, x ,gps_satellites, gal_satellites):
         """
-
-        :param x:
-        :param gps_satellites:
-        :param gal_satellites:
-        :return:
+        Predicted observations vector
+        :param x: np.ndarray, state vector
+        :param gps_satellites: np.ndarray, gps satellite coordinates & mapping function
+        :param gal_satellites: np.ndarray, gal satellite coordinates & mapping function
+        :return: predicted obs matrix
         """
         num_gps = len(gps_satellites)
         num_gal = len(gal_satellites)
@@ -120,14 +122,14 @@ class PPPSingleFreqMultiGNSS:
 
     def rebuild_state(self, x_old, P_old, Q_old, prev_sats, curr_sats, base_dim=6):
         """
-
-        :param x_old:
-        :param P_old:
-        :param Q_old:
-        :param prev_sats:
-        :param curr_sats:
-        :param base_dim:
-        :return:
+        Rebuilding of state vector and KF matrices after satellite visibility change
+        :param x_old: np.ndarray, old state vector
+        :param P_old: np.ndarray, old prior error matrix
+        :param Q_old: np.ndarray, old process noise matrix
+        :param prev_sats: list, previous satellites
+        :param curr_sats: list, current satellites
+        :param base_dim: int, dimension of state vector
+        :return: new X, new P, Q
         """
         old_dim = base_dim + len(prev_sats)
         new_dim = base_dim + len(curr_sats)
@@ -163,7 +165,7 @@ class PPPSingleFreqMultiGNSS:
         new_sats = set(curr_sats) - set(prev_sats)
         for sat in new_sats:
             i_new = base_dim + curr_sats.index(sat)
-            new_P[i_new, i_new] = 400.0
+            new_P[i_new, i_new] = self.cfg.p_amb
 
         # 3) Nowa macierz Q
         new_Q = np.zeros((new_dim, new_dim))
@@ -181,12 +183,16 @@ class PPPSingleFreqMultiGNSS:
         # Nowym satelitom daj Q = 0
         for sat in new_sats:
             i_new = base_dim + curr_sats.index(sat)
-            new_Q[i_new, i_new] = 0.0
+            new_Q[i_new, i_new] = self.cfg.q_amb
 
         return new_x, new_P, new_Q
 
-    def init_filter(self, p_crd=10.0, p_dt=9e9, p_amb=1e3, p_tro=0.25, q_crd=0.0, q_dt=9e9, q_tro=0.00025):
+    def init_filter(self):
+        """
+        Initialization of EKF for PPP estimation
 
+        :return: tuple(list, list), satellites  & observation epochs lists
+        """
         gps_epochs = sorted(self.gps_obs.index.get_level_values('time').unique().tolist())
         gal_epochs = sorted(self.gal_obs.index.get_level_values('time').unique().tolist())
         epochs = sorted(list((set(gps_epochs) & set(gal_epochs))))
@@ -218,15 +224,15 @@ class PPPSingleFreqMultiGNSS:
         self.ekf.x = initial_state.copy()
         # Q
         self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim), np.zeros(N0))))
-        self.ekf.Q[:3, :3] = q_crd
-        self.ekf.Q[3, 3] = q_dt
+        self.ekf.Q[:3, :3] = self.cfg.q_crd
+        self.ekf.Q[3, 3] = self.cfg.q_dt
 
         # P
-        self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, p_crd), np.full(N0, p_amb))))
+        self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, self.cfg.p_crd), np.full(N0, self.cfg.p_amb))))
         if self.pos0 is None:
             self.ekf.P[:3, :3] = 1e12
-        self.ekf.P[3, 3] = p_dt
-        self.ekf.P[4, 4] = p_dt
+        self.ekf.P[3, 3] = self.cfg.p_dt
+        self.ekf.P[4, 4] = self.cfg.p_dt
 
         # F
         self.ekf.F = np.eye(dimx)
@@ -236,6 +242,7 @@ class PPPSingleFreqMultiGNSS:
         return old_sats, epochs
 
     def _prepare_obs(self):
+
         if self.gps_mode == 'L1':
             gps_c1_col = [c for c in self.gps_obs.columns if c.startswith('C1')][0]
             gps_l1_col = [c for c in self.gps_obs.columns if c.startswith('L1')][0]
@@ -265,6 +272,14 @@ class PPPSingleFreqMultiGNSS:
         return gps_data, gal_data
 
     def code_screening(self, x, satellites, code_obs, thr=1):
+        """
+        Screening of code observations for outliers
+        :param x: np.ndarray, reciever coordinates
+        :param satellites: np.ndarray, satellite coordinates
+        :param code_obs: np.ndarray, code observations
+        :param thr: [float,int], threshold for median filter
+        :return: np.ndarray, array of bools, outlier markers
+        """
         dist = calculate_distance(satellites, x)
         prefit = code_obs-dist
         median_prefit = np.median(prefit)
@@ -276,6 +291,16 @@ class PPPSingleFreqMultiGNSS:
         return mask
 
     def phase_residuals_screening(self, sat_list, phase_residuals_dict,num,thr=10,sys='G',len_gps=None):
+        """
+        Screening of phase residuals for outliers based of prefit differences between epochs
+        :param sat_list: list, satellites list
+        :param phase_residuals_dict: dict, phase observations prefit residuals
+        :param num: int, epoch number
+        :param thr: thershold for filtering
+        :param sys: str, sys
+        :param len_gps: int, number of GPS observations
+        :return: Modify state vector and prior matrix (x & P)
+        """
         if sys =='E':
             assert len_gps is not None
         prefit_diff = []
@@ -295,7 +320,11 @@ class PPPSingleFreqMultiGNSS:
                 self.ekf.P[
                     self.base_dim + outlier_idx, self.base_dim + outlier_idx] = 1e3
 
-    def reset_filter(self, epoch,p_crd=10.0, p_dt=9e9, p_amb=1e3, p_tro=0.25, q_crd=0.0, q_dt=9e9, q_tro=0.00025):
+    def reset_filter(self, epoch):
+        """
+        reinitialize (reset) Kalman filter. Init filter function but based on given epoch
+
+        """
         # satellites at epoch
         gps_obs0 = self.gps_obs.loc[(slice(None), epoch), :]
         gal_obs0 = self.gal_obs.loc[(slice(None), epoch), :]
@@ -315,17 +344,17 @@ class PPPSingleFreqMultiGNSS:
 
         # Q
         self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim), np.zeros(N0))))
-        self.ekf.Q[:3, :3] = q_crd
-        self.ekf.Q[3, 3] = q_dt
-        self.ekf.Q[5, 5] = q_tro
+        self.ekf.Q[:3, :3] = self.cfg.q_crd
+        self.ekf.Q[3, 3] = self.cfg.q_dt
+        self.ekf.Q[5, 5] = self.cfg.q_tro
 
         # P
-        self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, p_crd), np.full(N0, p_amb))))
+        self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, self.cfg.p_crd), np.full(N0, self.cfg.p_amb))))
         if self.pos0 is None:
             self.ekf.P[:3, :3] = 1e12
-        self.ekf.P[3, 3] = p_dt
-        self.ekf.P[4, 4] = p_dt
-        self.ekf.P[5, 5] = p_tro
+        self.ekf.P[3, 3] = self.cfg.p_dt
+        self.ekf.P[4, 4] = self.cfg.p_dt
+        self.ekf.P[5, 5] = self.cfg.p_tro
 
         # F
         self.ekf.F = np.eye(dimx)
@@ -334,17 +363,18 @@ class PPPSingleFreqMultiGNSS:
 
         return old_sats
 
-    def run_filter(self, ref=None, flh=None, p_crd=10.0, p_dt=9e9, p_amb=1e3, p_tro=0.25, q_crd=0.0, q_dt=9e9,
-                   q_tro=0.00025, add_dcb=True,trace_filter=False,reset_every=0):
-        old_sats, epochs = self.init_filter(
-            p_crd=p_crd,
-            p_dt=p_dt,
-            p_amb=p_amb,
-            p_tro=p_tro,
-            q_crd=q_crd,
-            q_dt=q_dt,
-            q_tro=q_tro,
-        )
+    def run_filter(self, ref=None, flh=None, add_dcb=True,trace_filter=False,reset_every=0):
+        """
+        Kalman filter PPP Float estimation
+        :param ref: np.ndarray, reference position in ECEF
+        :param flh: np.ndarray, reference position in BLH
+
+        :param add_dcb: bool, whether to add dcb
+        :param trace_filter:bool, whether to trace filter
+        :param reset_every: int, number of epochs to reset filter
+        :return: tuple(pd.Dataframe, pd.Dataframe, pd.Dataframe, float), solution, gps&gal residuals, convergence time
+        """
+        old_sats, epochs = self.init_filter()
 
         gps_data, gal_data = self._prepare_obs()
         gps_c1, gps_l1 = gps_data
@@ -365,7 +395,6 @@ class PPPSingleFreqMultiGNSS:
 
                     reset_epoch = True
                     T0 = t
-            print(t)
             gps_epoch = self.gps_obs.loc[(slice(None), t), :].sort_values(by='sv')
 
 
@@ -401,28 +430,13 @@ class PPPSingleFreqMultiGNSS:
                  'sat_pco_los',
                  'dprel', 'pco_los', 'ion', 'phw']]
 
-            if add_dcb:
-                try:
 
-                    gps_p1_c1 = gps_epoch[f'OSB_{gps_c1}'].to_numpy() * 1e-09 * self.CLIGHT
-                    gps_pl1_l1 = gps_epoch[f'OSB_{gps_l1}'].to_numpy() * 1e-09 * self.CLIGHT
+            gps_p1_c1 = np.asarray(gps_epoch.get(f'OSB_{gps_c1}',0.0)) * 1e-09 * self.CLIGHT
+            gps_pl1_l1 = np.asarray(gps_epoch.get(f'OSB_{gps_l1}',0.0)) * 1e-09 * self.CLIGHT
 
-                except Exception as e:
-                    gps_p1_c1 = 0.0
-                    gps_pl1_l1 = 0.0
+            gal_p1_c1 = np.asarray(gal_epoch.get(f'OSB_{gal_c1}')) * 1e-09 * self.CLIGHT
+            gal_pl1_l1 = np.asarray(gal_epoch.get(f'OSB_{gal_l1}')) * 1e-09 * self.CLIGHT
 
-                try:
-                    gal_p1_c1 = gal_epoch[f'OSB_{gal_c1}'].to_numpy() * 1e-09 * self.CLIGHT
-                    gal_pl1_l1 = gal_epoch[f'OSB_{gal_l1}'].to_numpy() * 1e-09 * self.CLIGHT
-
-                except Exception as e:
-                    gal_p1_c1 = 0.0
-                    gal_pl1_l1 = 0.0
-            else:
-                gps_p1_c1 = 0.0
-                gps_pl1_l1 = 0.0
-                gal_p1_c1 = 0.0
-                gal_pl1_l1 = 0.0
             los_gps = gps_epoch[['LOS1', 'LOS2', 'LOS3']].to_numpy()
             gps_tides = gps_epoch[['dx', 'dy', 'dz']].to_numpy()
             gps_tides_los = np.sum(los_gps * gps_tides, axis=1)
@@ -482,9 +496,9 @@ class PPPSingleFreqMultiGNSS:
 
             ev_gps = gps_epoch['ev'].to_numpy()
             ev_gal = gal_epoch['ev'].to_numpy()
-            sigma_code_gps = 1 + 0.00025 / np.sin(np.deg2rad(ev_gps)) ** 2
+            sigma_code_gps = 1 + 0.0025 / np.sin(np.deg2rad(ev_gps)) ** 2
             sigma_phase_gps = 1e-4 + 0.00025 / np.sin(np.deg2rad(ev_gps)) ** 2
-            sigma_code_gal = 1 + 0.00025 / np.sin(np.deg2rad(ev_gal)) ** 2
+            sigma_code_gal = 1 + 0.0025 / np.sin(np.deg2rad(ev_gal)) ** 2
             sigma_phase_gal = 1e-4 + 0.00025 / np.sin(np.deg2rad(ev_gal)) ** 2
             R_vec = np.concatenate((sigma_code_gps, sigma_phase_gps, sigma_code_gal, sigma_phase_gal))
             R_vec[~mask2] = 1e12
@@ -563,17 +577,20 @@ class PPPSingleFreqMultiGNSS:
 
 class PPPDualFreqMultiGNSS:
 
-    def __init__(self, gps_obs, gal_obs, gps_mode, gal_mode, ekf, tro=True, pos0=None,interval=0.5):
+    def __init__(self,config:PPPConfig, gps_obs, gal_obs, gps_mode, gal_mode, ekf, tro=True, pos0=None,interval=0.5):
 
         """
-
-        :param gps_obs:
-        :param gal_obs:
-        :param gps_mode:
-        :param gal_mode:
-        :param ekf: ExtendedKalmanFilter
-        :param tro:
+        PPP Dual Frequency, Multi GNSS estimator
+        :param gps_obs: pd.DataFrame, gps observations
+        :param gal_obs: pd.DataFrame, gal observations
+        :param gps_mode: str, gps signals
+        :param gal_mode: str, gal signals
+        :param ekf: filterpy.ExtendedKalmanFilter instance
+        :param tro: bool, estimate ZTD
+        :param pos0: np.ndarray, initial position
+        :param interval: float, interval of observations
         """
+        self.cfg=config
         self.gps_obs = gps_obs
         self.gal_obs = gal_obs
         self.gps_mode = gps_mode
@@ -591,11 +608,11 @@ class PPPDualFreqMultiGNSS:
 
     def HJacobian(self, x, gps_satellites, gal_satellites):
         """
-
-        :param x:
-        :param gps_satellites:
-        :param gal_satellites:
-        :return:
+        Hjacobian matrix
+        :param x: np.ndarray, state vector
+        :param gps_satellites: np.ndarray, gps satellite coordinates & mapping function
+        :param gal_satellites: np.ndarray, gal satellite coordinates & mapping function
+        :return: Hjacobian matrix
         """
         num_gps = len(gps_satellites)
         num_gal = len(gal_satellites)
@@ -641,11 +658,11 @@ class PPPDualFreqMultiGNSS:
 
     def Hx(self, x, gps_satellites, gal_satellites):
         """
-
-        :param x:
-        :param gps_satellites:
-        :param gal_satellites:
-        :return:
+        Predicted observations vector
+        :param x: np.ndarray, state vector
+        :param gps_satellites: np.ndarray, gps satellite coordinates & mapping function
+        :param gal_satellites: np.ndarray, gal satellite coordinates & mapping function
+        :return: predicted obs matrix
         """
         num_gps = len(gps_satellites)
         num_gal = len(gal_satellites)
@@ -668,14 +685,14 @@ class PPPDualFreqMultiGNSS:
 
     def rebuild_state(self, x_old, P_old, Q_old, prev_sats, curr_sats, base_dim=6):
         """
-
-        :param x_old:
-        :param P_old:
-        :param Q_old:
-        :param prev_sats:
-        :param curr_sats:
-        :param base_dim:
-        :return:
+        Rebuilding of state vector and KF matrices after satellite visibility change
+        :param x_old: np.ndarray, old state vector
+        :param P_old: np.ndarray, old prior error matrix
+        :param Q_old: np.ndarray, old process noise matrix
+        :param prev_sats: list, previous satellites
+        :param curr_sats: list, current satellites
+        :param base_dim: int, dimension of state vector
+        :return: new X, new P, Q
         """
         old_dim = base_dim + len(prev_sats)
         new_dim = base_dim + len(curr_sats)
@@ -711,7 +728,7 @@ class PPPDualFreqMultiGNSS:
         new_sats = set(curr_sats) - set(prev_sats)
         for sat in new_sats:
             i_new = base_dim + curr_sats.index(sat)
-            new_P[i_new, i_new] = 400.0
+            new_P[i_new, i_new] = self.cfg.p_amb
 
         # 3) Nowa macierz Q
         new_Q = np.zeros((new_dim, new_dim))
@@ -729,12 +746,15 @@ class PPPDualFreqMultiGNSS:
         # Nowym satelitom daj Q = 0
         for sat in new_sats:
             i_new = base_dim + curr_sats.index(sat)
-            new_Q[i_new, i_new] = 0.0
+            new_Q[i_new, i_new] = self.cfg.q_amb
 
         return new_x, new_P, new_Q
 
-    def init_filter(self, p_crd=10.0, p_dt=9e9, p_amb=400, p_tro=0.25, q_crd=0.0, q_dt=9e9, q_tro=0.00025):
-
+    def init_filter(self):
+        """
+        Initialization of EKF for PPP estimation
+        :return: tuple(list, list), satellites  & observation epochs lists
+        """
         gps_epochs = sorted(self.gps_obs.index.get_level_values('time').unique().tolist())
         gal_epochs = sorted(self.gal_obs.index.get_level_values('time').unique().tolist())
         epochs = sorted(list((set(gps_epochs) & set(gal_epochs))))
@@ -761,17 +781,17 @@ class PPPDualFreqMultiGNSS:
 
         # Q
         self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim), np.zeros(N0))))
-        self.ekf.Q[:3, :3] = q_crd
-        self.ekf.Q[3, 3] = q_dt
-        self.ekf.Q[5, 5] = q_tro
+        self.ekf.Q[:3, :3] = self.cfg.q_crd
+        self.ekf.Q[3, 3] = self.cfg.q_dt
+        self.ekf.Q[5, 5] = self.cfg.q_tro
 
         # P
-        self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, p_crd), np.full(N0, p_amb))))
+        self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, self.cfg.p_crd), np.full(N0, self.cfg.p_amb))))
         if self.pos0 is None:
             self.ekf.P[:3, :3] = 1e12
-        self.ekf.P[3, 3] = p_dt
-        self.ekf.P[4, 4] = p_dt
-        self.ekf.P[5, 5] = p_tro
+        self.ekf.P[3, 3] = self.cfg.p_dt
+        self.ekf.P[4, 4] = self.cfg.p_dt
+        self.ekf.P[5, 5] = self.cfg.p_tro
 
         # F
         self.ekf.F = np.eye(dimx)
@@ -838,6 +858,14 @@ class PPPDualFreqMultiGNSS:
         return gps_data, gal_data
 
     def code_screening(self, x, satellites, code_obs, thr=1):
+        """
+        Screening of code observations for outliers
+        :param x: np.ndarray, reciever coordinates
+        :param satellites: np.ndarray, satellite coordinates
+        :param code_obs: np.ndarray, code observations
+        :param thr: [float,int], threshold for median filter
+        :return: np.ndarray, array of bools, outlier markers
+        """
         dist = calculate_distance(satellites, x)
         prefit = code_obs-dist
         median_prefit = np.median(prefit)
@@ -849,6 +877,16 @@ class PPPDualFreqMultiGNSS:
         return mask
 
     def phase_residuals_screening(self, sat_list, phase_residuals_dict,num,thr=1,sys='G',len_gps=None):
+        """
+        Screening of phase residuals for outliers based of prefit differences between epochs
+        :param sat_list: list, satellites list
+        :param phase_residuals_dict: dict, phase observations prefit residuals
+        :param num: int, epoch number
+        :param thr: thershold for filtering
+        :param sys: str, sys
+        :param len_gps: int, number of GPS observations
+        :return: Modify state vector and prior matrix (x & P)
+        """
         if sys =='E':
             assert len_gps is not None
         prefit_diff = []
@@ -868,7 +906,10 @@ class PPPDualFreqMultiGNSS:
                 self.ekf.P[
                     self.base_dim + outlier_idx, self.base_dim + outlier_idx] = 400
 
-    def reset_filter(self, epoch,p_crd=10.0, p_dt=9e9, p_amb=400, p_tro=0.25, q_crd=0.0, q_dt=9e9, q_tro=0.00025):
+    def reset_filter(self, epoch):
+        """
+        reinitialize (reset) Kalman filter. Init filter function but based on given epoch
+        """
         # satellites at epoch
         gps_obs0 = self.gps_obs.loc[(slice(None), epoch), :]
         gal_obs0 = self.gal_obs.loc[(slice(None), epoch), :]
@@ -888,17 +929,17 @@ class PPPDualFreqMultiGNSS:
 
         # Q
         self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim), np.zeros(N0))))
-        self.ekf.Q[:3, :3] = q_crd
-        self.ekf.Q[3, 3] = q_dt
-        self.ekf.Q[5, 5] = q_tro
+        self.ekf.Q[:3, :3] = self.cfg.q_crd
+        self.ekf.Q[3, 3] = self.cfg.q_dt
+        self.ekf.Q[5, 5] = self.cfg.q_tro
 
         # P
-        self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, p_crd), np.full(N0, p_amb))))
+        self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, self.cfg.p_crd), np.full(N0, self.cfg.p_amb))))
         if self.pos0 is None:
             self.ekf.P[:3, :3] = 1e12
-        self.ekf.P[3, 3] = p_dt
-        self.ekf.P[4, 4] = p_dt
-        self.ekf.P[5, 5] = p_tro
+        self.ekf.P[3, 3] = self.cfg.p_dt
+        self.ekf.P[4, 4] = self.cfg.p_dt
+        self.ekf.P[5, 5] = self.cfg.p_tro
 
         # F
         self.ekf.F = np.eye(dimx)
@@ -910,16 +951,18 @@ class PPPDualFreqMultiGNSS:
 
 
 
-    def run_filter(self, ref=None, flh=None, p_crd=10.0, p_dt=9e9, p_amb=400, p_tro=0.25, q_crd=0.0, q_dt=9e9,
-                   q_tro=0.00025, add_dcb=True,trace_filter=False, reset_every = 180):
+    def run_filter(self, ref=None, flh=None,add_dcb=True,trace_filter=False, reset_every = 180):
+        """
+        Kalman filter PPP Float estimation
+        :param ref: np.ndarray, reference position in ECEF
+        :param flh: np.ndarray, reference position in BLH
+        :param add_dcb: bool, whether to add dcb
+        :param trace_filter:bool, whether to trace filter
+        :param reset_every: int, number of epochs to reset filter
+        :return: tuple(pd.Dataframe, pd.Dataframe, pd.Dataframe, float), solution, gps&gal residuals, convergence time
+        """
         old_sats, epochs = self.init_filter(
-            p_crd=p_crd,
-            p_dt=p_dt,
-            p_amb=p_amb,
-            p_tro=p_tro,
-            q_crd=q_crd,
-            q_dt=q_dt,
-            q_tro=q_tro,
+
         )
 
         gps_data, gal_data = self._prepare_obs()
@@ -984,41 +1027,16 @@ class PPPDualFreqMultiGNSS:
             gal_epoch['tides_los'] = gal_tides_los
 
             # gal_tides_los += np.sum(los_gal * dR_gal, axis=1)
+            gps_p1_c1 = np.asarray(gps_epoch.get(f'OSB_{gps_c1}',0.0)) * 1e-09 * self.CLIGHT
+            gps_p2_c2 = np.asarray(gps_epoch.get(f'OSB_{gps_c2}',0.0)) * 1e-09 * self.CLIGHT
+            gps_pl1_l1 = np.asarray(gps_epoch.get(f'OSB_{gps_l1}',0.0)) * 1e-09 * self.CLIGHT
+            gps_pl2_l2 = np.asarray(gps_epoch.get(f'OSB_{gps_l2}',0.0)) * 1e-09 * self.CLIGHT
 
-            if add_dcb:
-                try:
+            gal_p1_c1 = np.asarray(gal_epoch.get(f'OSB_{gal_c1}',0.0)) * 1e-09 * self.CLIGHT
+            gal_p2_c2 = np.asarray(gal_epoch.get(f'OSB_{gal_c2}',0.0)) * 1e-09 * self.CLIGHT
+            gal_pl1_l1 = np.asarray(gal_epoch.get(f'OSB_{gal_l1}',0.0)) * 1e-09 * self.CLIGHT
+            gal_pl2_l2 = np.asarray(gal_epoch.get(f'OSB_{gal_l2}',0.0)) * 1e-09 * self.CLIGHT
 
-                    gps_p1_c1 = gps_epoch[f'OSB_{gps_c1}'].to_numpy() * 1e-09 * self.CLIGHT
-                    gps_p2_c2 = gps_epoch[f'OSB_{gps_c2}'].to_numpy() * 1e-09 * self.CLIGHT
-                    gps_pl1_l1 = gps_epoch[f'OSB_{gps_l1}'].to_numpy() * 1e-09 * self.CLIGHT
-                    gps_pl2_l2 = gps_epoch[f'OSB_{gps_l2}'].to_numpy() * 1e-09 * self.CLIGHT
-
-                except Exception as e:
-                    gps_p1_c1 = 0.0
-                    gps_p2_c2 = 0.0
-                    gps_pl1_l1 = 0.0
-                    gps_pl2_l2 = 0.0
-
-                try:
-                    gal_p1_c1 = gal_epoch[f'OSB_{gal_c1}'].to_numpy() * 1e-09 * self.CLIGHT
-                    gal_p2_c2 = gal_epoch[f'OSB_{gal_c2}'].to_numpy() * 1e-09 * self.CLIGHT
-                    gal_pl1_l1 = gal_epoch[f'OSB_{gal_l1}'].to_numpy() * 1e-09 * self.CLIGHT
-                    gal_pl2_l2 = gal_epoch[f'OSB_{gal_l2}'].to_numpy() * 1e-09 * self.CLIGHT
-
-                except Exception as e:
-                    gal_p1_c1 = 0.0
-                    gal_p2_c2 = 0.0
-                    gal_pl1_l1 = 0.0
-                    gal_pl2_l2 = 0.0
-            else:
-                gps_p1_c1 = 0.0
-                gps_p2_c2 = 0.0
-                gps_pl1_l1 = 0.0
-                gps_pl2_l2 = 0.0
-                gal_p1_c1 = 0.0
-                gal_p2_c2 = 0.0
-                gal_pl1_l1 = 0.0
-                gal_pl2_l2 = 0.0
 
 
             GP3_code = (
@@ -1110,10 +1128,9 @@ class PPPDualFreqMultiGNSS:
             else:
                 enu = np.array([0.0, 0.0, 0.0])
             # # # Save epoch results
-            mxyz = np.diag(self.ekf.P[:3,:3])
             df_epoch = pd.DataFrame(
                 {'de': [enu[0]], 'dn': [enu[1]], 'du': [enu[2]], 'dtr': [dtr], 'isb': [isb], 'ztd': [tro],
-                 'x': [self.ekf.x[0]], 'y': [self.ekf.x[1]], 'z': [self.ekf.x[2]] ,'mx':mxyz[0], 'my':mxyz[1],'mz':mxyz[2]},
+                 'x': [self.ekf.x[0]], 'y': [self.ekf.x[1]], 'z': [self.ekf.x[2]]},
                 index=pd.DatetimeIndex([t], name='time'))
             if trace_filter:
                 print(self.ekf.y)
@@ -1123,23 +1140,9 @@ class PPPDualFreqMultiGNSS:
                 print('===' * 30, '\n')
             result.append(df_epoch)
 
-            gps_epoch['dtr'] = dtr
-            gps_epoch['ztd'] = tro
-            gps_epoch['L3'] = GL3_phase
-            gps_epoch['P3'] = GP3_code
-            gps_epoch['Nif'] = self.ekf.x[self.base_dim:self.base_dim+len(gps_epoch)].copy()
             gps_epoch['v'] = self.ekf.y[len(gps_epoch):2*len(gps_epoch)]
             gps_epoch['vc'] = self.ekf.y[:len(gps_epoch)]
-            gps_epoch['p_if'] = np.diag(self.ekf.P[self.base_dim:self.base_dim+len(gps_epoch),
-                            self.base_dim:self.base_dim+len(gps_epoch)])
 
-            gal_epoch['dtr'] = dtr
-            gal_epoch['isb'] = isb
-            gal_epoch['L3'] = EL3_phase
-            gal_epoch['P3'] = EP3_code
-            gal_epoch['Nif'] = self.ekf.x[self.base_dim+len(gps_epoch): ].copy()
-            gal_epoch['p_if'] = np.diag(self.ekf.P[self.base_dim + len(gps_epoch):,
-                                        self.base_dim + len(gps_epoch):])
             gal_epoch['v'] = self.ekf.y[2*len(gps_epoch)+len(gal_epoch):]
             gal_epoch['vc'] = self.ekf.y[2 * len(gps_epoch): 2 * len(gps_epoch) + len(gal_epoch)]
 

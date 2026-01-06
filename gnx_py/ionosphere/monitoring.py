@@ -1,34 +1,46 @@
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict
-from typing import Optional, Literal, Tuple
-from typing import Union
-
-import matplotlib as mpl
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import xarray as xr
-from matplotlib.dates import DateFormatter
+import matplotlib as mpl
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from dataclasses import dataclass
+from typing import Optional, Literal, Tuple
+import warnings
+from matplotlib import MatplotlibDeprecationWarning
+
+warnings.filterwarnings(
+    "ignore",
+    message="The PostScript backend does not support transparency*"
+)
+
 # --- SIDX, GIX ---
 Re = 6371e3
 IONO_H = 450e3
 MIN_ELEV_DEG = 10.0
 DMIN_KM = 30.0
 DMAX_KM = 50.0
-MAX_PAIR_PER_EPOCH = 200000  # bezpiecznik losowego przerzedzania
+MAX_PAIR_PER_EPOCH = 200000  # random thinning fuse
 # --- ROT/ROTI ---
-ROTI_WINDOW_MIN = 5            # okno dla STD
-ROTI_MIN_SAMPLES = 3           # min. liczba ROT w oknie, żeby wyliczyć STD
-MAX_GAP_S       = 180.0        # odetnij skoki przy dużych lukach czasowych
-SPLIT_BY_DAY    = True         # nie różnicować przez północ UTC (reset per doba)
-DDOF_POP        = 0            # zgodnie z def. ROTI = sqrt(<ROT^2>-<ROT>^2)
+ROTI_WINDOW_MIN = 5            # window for STD
+ROTI_MIN_SAMPLES = 3           # min. number of ROTs in the window to calculate STD
+MAX_GAP_S       = 180.0        # cut off jumps with large time gaps
+SPLIT_BY_DAY    = True         # do not differentiate by UTC midnight (reset per day)
+DDOF_POP        = 0            # according to the definition ROTI = sqrt(<ROT^2>-<ROT>^2)
 
+# --- global standard for plotting ---
+FIGSIZE = (10, 10)
+DPI = 600
+_GS_HEIGHT_RATIOS = (1.0, 0.06)
+_GS_HSPACE = 0.05
 
 @dataclass
 class Region:
+    """
+    Definition of the region covered by the ROTI/GIX/SIDX measurement
+    """
     lat_min: float = -90.0
     lat_max: float =  90.0
     lon_min: float = -180.0
@@ -38,13 +50,28 @@ class Region:
         return (lat >= self.lat_min) & (lat <= self.lat_max) & \
                (lon >= self.lon_min) & (lon <= self.lon_max)
 
-# --- Narzędzia geometryczne ---
 def mapping_M(elev_deg: np.ndarray, Re_m: float = Re, H_m: float = IONO_H) -> np.ndarray:
+    """
+    Mapping function (this shell model)
+    :param elev_deg: elevation in degrees
+    :param Re_m: mean earth radius in meters
+    :param H_m: Ionospheric shell height in meters
+    :return: mapping function value
+    """
     el = np.deg2rad(np.clip(elev_deg, 0.01, 89.99))
     a = (Re_m * np.cos(el)) / (Re_m + H_m)
     return 1.0 / np.sqrt(1.0 - a * a)
 
 def great_circle_distance_km(lat1, lon1, lat2, lon2, radius_m: float) -> np.ndarray:
+    """
+    Distance on a large circle between two points
+    :param lat1: first point latitude
+    :param lon1: first point longitude
+    :param lat2: second point latitude
+    :param lon2: second point longitude
+    :param radius_m: great circle radius in meters
+    :return: distance in meters
+    """
     phi1, lbd1, phi2, lbd2 = map(np.deg2rad, [lat1, lon1, lat2, lon2])
     dphi, dlbd = phi2 - phi1, lbd2 - lbd1
     a = np.sin(dphi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(dlbd/2)**2
@@ -52,6 +79,9 @@ def great_circle_distance_km(lat1, lon1, lat2, lon2, radius_m: float) -> np.ndar
     return (radius_m * c) / 1000.0
 
 def initial_bearing_deg(lat1, lon1, lat2, lon2) -> np.ndarray:
+    """
+    azimuth between a pair of points
+    """
     phi1, lbd1, phi2, lbd2 = map(np.deg2rad, [lat1, lon1, lat2, lon2])
     dlbd = lbd2 - lbd1
     y = np.sin(dlbd) * np.cos(phi2)
@@ -60,6 +90,10 @@ def initial_bearing_deg(lat1, lon1, lat2, lon2) -> np.ndarray:
     return (np.rad2deg(theta) + 360) % 360
 
 def spherical_midpoint(lat1, lon1, lat2, lon2) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Midpoint between a pair of points
+
+    """
     phi1, lbd1, phi2, lbd2 = map(np.deg2rad, [lat1, lon1, lat2, lon2])
     x1, y1, z1 = np.cos(phi1)*np.cos(lbd1), np.cos(phi1)*np.sin(lbd1), np.sin(phi1)
     x2, y2, z2 = np.cos(phi2)*np.cos(lbd2), np.cos(phi2)*np.sin(lbd2), np.sin(phi2)
@@ -76,43 +110,42 @@ def compute_sid(
     min_elev_deg: float = MIN_ELEV_DEG,
     iono_h_m: float = IONO_H,
     stec_scale: float = 1.0,
-    max_gap_s: Optional[float] = 300,      # odrzuć różnice, gdy przerwa > max_gap_s
-    split_on_day_change: bool = True,        # NIE licz różnic przez północ (UTC)
-    robust_sigma_clip: Optional[float] = 5.0,# klip po epoce w oparciu o MAD (None=wyłącz)
-    agg: str = "median",              # 'median' lub 'mean'
+    max_gap_s: Optional[float] = 300,      # reject differences when gap > max_gap_s
+    split_on_day_change: bool = True,        # DO NOT count differences by midnight (UTC)
+    agg: str = "median",              # 'median' or 'mean'
 ) -> pd.Series:
     """
     SIDX ≈ < dltSTEC / (M·dltt) >  (TECU/min).
-    Różnicowanie tylko w obrębie tego samego linku (name, sv) i — jeśli włączone —
-    w obrębie tej samej doby UTC (brak różnic przez północ).
-    Wymagane kolumny: name, sv, time, stec, ev, lat_ipp, lon_ipp.
+    Differentiation only within the same link (name, sv) and — if enabled —
+    within the same UTC day (no differences across midnight).
+    Required columns: name, sv, time, stec, ev, lat_ipp, lon_ipp.
     """
     need = {'name','sv','time','stec','ev','lat_ipp','lon_ipp'}
     miss = need - set(df.columns)
     if miss:
-        raise ValueError(f"Brakuje kolumn: {sorted(miss)}")
+        raise ValueError(f"Columns are missing: {sorted(miss)}")
 
     dfa = df.copy()
     dfa['time'] = pd.to_datetime(dfa['time'], utc=True)
 
-    # filtr elewacji
+    # elevation mask
     dfa = dfa[dfa['ev'] >= min_elev_deg].copy()
     if dfa.empty:
         print(f'No data after elevation mask application')
         return pd.Series(dtype=float, name='SIDX_tecu_per_min')
 
-    # jednostki i mapping
+    # units and mapping function
     dfa['stec_tecu'] = dfa['stec'] * stec_scale
     dfa['M'] = dfa['M'] if 'M' in dfa.columns else mapping_M(dfa['ev'].to_numpy(), H_m=iono_h_m)
 
-    # identyfikacja doby UTC do podziału łuków
+    # identification of UTC time for arc division
     if split_on_day_change:
         dfa['day'] = dfa['time'].dt.floor('D')  # UTC doba
         grp_cols = ['name','sv','day']
     else:
         grp_cols = ['name','sv']
 
-    # różnicowanie wewnątrz grup (link + ewentualnie doba)
+    # differentiation within groups (link + possibly day)
     dfa = dfa.sort_values(grp_cols + ['time']).reset_index(drop=True)
     dfa['dt_s']  = dfa.groupby(grp_cols)['time'].diff().dt.total_seconds()
     dfa['dSTEC'] = dfa.groupby(grp_cols)['stec_tecu'].diff()
@@ -120,32 +153,19 @@ def compute_sid(
     rate = dfa.dropna(subset=['dt_s','dSTEC','M'])
     rate = rate[rate['dt_s'] > 0]
 
-    # odrzuć duże przerwy czasowe
+    # discard large time gaps
     if max_gap_s is not None:
         rate = rate[rate['dt_s'] <= float(max_gap_s)]
 
-    # maska regionu IPP (jeśli podano)
+    # IPP region mask (if specified)
     if region is not None:
         inreg = region.contains(rate['lat_ipp'].to_numpy(), rate['lon_ipp'].to_numpy())
         rate = rate[inreg]
 
-    # wskaźnik chwilowy dla pojedynczych linków
+    # instantaneous indicator for individual links
     rate['sid_link'] = rate['dSTEC'] / (rate['M'] * rate['dt_s'])  # TECU/s
 
-    # ROBUST: sigma-clipping po epoce (MAD)
-    if robust_sigma_clip is not None:
-        k = float(robust_sigma_clip)
-        def _clip_epoch(g):
-            if len(g) < 5:
-                return g
-            med = g['sid_link'].median()
-            mad = 1.4826 * np.median(np.abs(g['sid_link'] - med))
-            if mad == 0 or not np.isfinite(mad):
-                return g
-            return g[np.abs(g['sid_link'] - med) <= k * mad]
-        rate = rate.groupby('time', group_keys=False).apply(_clip_epoch)
-
-    # agregacja po epoce (średnia/mediana po linkach)
+    # post-epoch aggregation (average/median across links)
     if agg == "median":
         sid = rate.groupby('time')['sid_link'].median().sort_index()
     elif agg == "mean":
@@ -158,21 +178,21 @@ def compute_sid(
         raise ValueError("agg must be 'median', 'mean', 'max', or 'p95'")
 
 
-    # skalowanie jednostek → TECU/min
-    sid = sid * 1e3 #* 60
+    # scaling of units → mTECU/s
+    sid = sid * 1e3
     sid.name = 'SIDX_tecu_per_min'
     return sid
 
 # --- GIX ---
 
 
-# --- pomocniczo: warstwowe przerzedzanie po Δs i azymucie ---
+# --- auxiliary: layered thinning by Δs and azimuth---
 def _stratified_subsample(mask_idx: np.ndarray, d_km: np.ndarray, az_deg: np.ndarray,
                           target: int, n_dist_bins: int = 4, n_az_bins: int = 8,
                           rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """
-    Zwraca podzbiór indeksów mask_idx (int) w liczbie <= target,
-    próbkując równomiernie z koszyków 2D: Δs×azymut.
+   Returns a subset of mask_idx (int) indices in number <= target,
+    sampled uniformly from 2D baskets: Δs×azimuth.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -184,7 +204,7 @@ def _stratified_subsample(mask_idx: np.ndarray, d_km: np.ndarray, az_deg: np.nda
 
     # koszyki
     d_bins = np.quantile(dsel, np.linspace(0, 1, n_dist_bins+1))
-    # aby uniknąć duplikatów granic przy małej zmienności
+    # to avoid duplicate boundaries with low variability
     d_bins = np.unique(d_bins)
     if d_bins.size <= 2:  # fallback
         d_bins = np.array([dsel.min(), dsel.max()])
@@ -193,7 +213,7 @@ def _stratified_subsample(mask_idx: np.ndarray, d_km: np.ndarray, az_deg: np.nda
     d_cat = np.clip(np.digitize(dsel, d_bins, right=True)-1, 0, len(d_bins)-2)
     az_cat = np.clip(np.digitize(azsel, az_bins, right=True)-1, 0, len(az_bins)-2)
 
-    # docelowo po równo na koszyk
+    # ultimately equally distributed among the basket
     n_cells = (len(d_bins)-1) * (len(az_bins)-1)
     per_cell = max(1, target // n_cells)
 
@@ -211,7 +231,7 @@ def _stratified_subsample(mask_idx: np.ndarray, d_km: np.ndarray, az_deg: np.nda
 
     chosen = np.concatenate(chosen) if chosen else np.array([], dtype=int)
 
-    # jeśli jeszcze brakuje do target, dobierz losowo z pozostałych
+    # if still short of the target, select randomly from the remaining ones
     if chosen.size < target:
         remaining_pool = np.setdiff1d(mask_idx, chosen, assume_unique=False)
         need = target - chosen.size
@@ -226,44 +246,44 @@ _DIP_PRESETS = {
     "50-500": (50.0, 500.0),
     "50-1000": (50.0, 1000.0),
 }
-# --- GIX „1:1”: dodane GIXSx/GIXSy i percentyle kierunkowe ± ---
+# --- GIX, GIXSx/GIXSy i percentyle kierunkowe ± ---
 def compute_gix(
     df: pd.DataFrame,
     region: Optional[Region] = None,
     min_elev_deg: float = MIN_ELEV_DEG,
     dipole_preset: str = "30-250",          # "30-250" | "50-500" | "50-1000"
-    dmin_km: Optional[float] = None,        # nadpisze preset, jeśli podane
+    dmin_km: Optional[float] = None,        #overwrites the preset if specified
     dmax_km: Optional[float] = None,
     iono_h_m: float = IONO_H,
     stec_scale: float = 1.0,
-    max_delta_M: float = 0.2,               # filtr |Mi−Mj|
+    max_delta_M: float = 0.2,               # filter |Mi−Mj|
     max_pairs_per_epoch: int = MAX_PAIR_PER_EPOCH,
-    stratified_sampling: bool = True,       # warstwowe przerzedzanie Δs×azymut
+    stratified_sampling: bool = True,       # layered thinning Δs×azimuth
     rng: Optional[np.random.Generator] = None
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Wejście (wymagane kolumny): name,time,lat_ipp,lon_ipp,stec,ev,(opcjonalnie M).
-    Zwraca:
-      - times_df (1 rekord/epoka) z polami:
+    Input (required columns): name,time,lat_ipp,lon_ipp,stec,ev,(optional M).
+    Returns:
+      - times_df (1 record/epoch) with fields:
         ['time',
          'GIX_mtecu_km',
          'GIXx_mean_mtecu_km','GIXy_mean_mtecu_km',
-         'GIXS_mtecu_km',       # std(|∇TEC|), jak w artykule – wariant na modułach
-         'GIXSx_mtecu_km','GIXSy_mtecu_km',  # std składowych podpisanych
+         'GIXS_mtecu_km',       # std(|∇TEC|), as in the article – variant on modules
+         'GIXSx_mtecu_km','GIXSy_mtecu_km',  # std of signed components
          'GIXPx95_plus_mtecu_km','GIXPx95_minus_mtecu_km',
          'GIXPy95_plus_mtecu_km','GIXPy95_minus_mtecu_km',
-         'GIXP95_mtecu_km',     # p95 z |∇TEC|
+         'GIXP95_mtecu_km',     # p95 from |∇TEC|
          'n_pairs']
-      - pairs_df (każda para) z polami jak u Ciebie (CP_lat/lon, grad_x/y/abs, Δs, Mi, Mj)
+      - pairs_df (each pair) with fields as in your case (CP_lat/lon, grad_x/y/abs, Δs, Mi, Mj)
     """
     need = {'name','time','lat_ipp','lon_ipp','stec','ev'}
     miss = need - set(df.columns)
     if miss:
-        raise ValueError(f"Brakuje kolumn: {sorted(miss)}")
+        raise ValueError(f"Columns missing: {sorted(miss)}")
 
     if dipole_preset not in _DIP_PRESETS and (dmin_km is None or dmax_km is None):
-        raise ValueError("Podaj poprawny dipole_preset ('30-250'|'50-500'|'50-1000') "
-                         "albo jawnie dmin_km i dmax_km.")
+        raise ValueError("Specify the correct dipole_preset ('30-250'|'50-500'|'50-1000') "
+                         "or explicitly dmin_km and dmax_km.")
 
     if dmin_km is None or dmax_km is None:
         dmin_km, dmax_km = _DIP_PRESETS[dipole_preset]
@@ -295,14 +315,14 @@ def compute_gix(
         if ii.size == 0:
             continue
 
-        # odległości dipoli (w powłoce)
+        # dipole lengths (over a shell)
         d_km_all = great_circle_distance_km(
             sub['lat_ipp'].to_numpy()[ii], sub['lon_ipp'].to_numpy()[ii],
             sub['lat_ipp'].to_numpy()[jj], sub['lon_ipp'].to_numpy()[jj],
             radius_m=Re + iono_h_m
         )
 
-        # azymut par (kierunek j->i)
+        # pair azimuth (direction j->i)
         az_all = initial_bearing_deg(
             sub['lat_ipp'].to_numpy()[jj], sub['lon_ipp'].to_numpy()[jj],
             sub['lat_ipp'].to_numpy()[ii], sub['lon_ipp'].to_numpy()[ii]
@@ -321,7 +341,7 @@ def compute_gix(
 
         idx = np.where(mask)[0]
 
-        # przerzedzanie: zwykłe lub warstwowe Δs×azymut
+        # thinning: regular or layered Δs×azimuth
         if idx.size > max_pairs_per_epoch:
             if stratified_sampling:
                 idx = _stratified_subsample(idx, d_km_all, az_all,
@@ -329,25 +349,25 @@ def compute_gix(
             else:
                 idx = rng.choice(idx, size=max_pairs_per_epoch, replace=False)
 
-        # finalny wybór
+        # final choice
         ii, jj = ii[idx], jj[idx]
         dsel   = d_km_all[idx]
         Mi, Mj = Mi_all[idx], Mj_all[idx]
         az     = az_all[idx]
 
-        # gradient (TECU/km) – ze znakiem
+        # gradient (TECU/km) – signed
         dVTEC = sub['VTEC'].to_numpy()[ii] - sub['VTEC'].to_numpy()[jj]
         sv_ii, sv_jj = sub['sv'].to_numpy()[ii], sub['sv'].to_numpy()[jj]
         name_ii, name_jj = sub['name'].to_numpy()[ii], sub['name'].to_numpy()[jj]
         grad_signed = dVTEC / dsel
         grad_abs    = np.abs(grad_signed)
 
-        # rozkład na składowe x/y (WE/NS) – podpisane
+        # breakdown into x/y components (WE/NS) – signed
         sindlt, cosdlt = np.sin(np.deg2rad(az)), np.cos(np.deg2rad(az))
         grad_x = grad_signed * sindlt # E-W
         grad_y = grad_signed * cosdlt # N-S
 
-        # środek pary (do maski regionu i wizualizacji)
+        # pair midpoint (for region mask and visualization)
         cp_lat, cp_lon = spherical_midpoint(
             sub['lat_ipp'].to_numpy()[ii], sub['lon_ipp'].to_numpy()[ii],
             sub['lat_ipp'].to_numpy()[jj], sub['lon_ipp'].to_numpy()[jj]
@@ -369,31 +389,31 @@ def compute_gix(
         if grad_abs.size == 0:
             continue
 
-        # --- METRYKI 1:1 ---
-        # średnia wektorowa (eq. 12)
+        # --- METRICS  ---
+        # mean
         gx_mean = float(np.mean(grad_x)) * 1000.0  # mTECU/km
         gy_mean = float(np.mean(grad_y)) * 1000.0
         gix     = float(np.hypot(gx_mean, gy_mean))
 
         # dyspersja GIXS:
-        # (a) std na modułach |∇TEC|
+        # (a) std on modules |∇TEC|
         gixs_abs = float(np.std(grad_abs)) * 1000.0
-        # (b) std składowych podpisanych (kierunkowa dyspersja)
+        # (b) std of signed components (directional dispersion)
         gixs_x   = float(np.std(grad_x)) * 1000.0
         gixs_y   = float(np.std(grad_y)) * 1000.0
 
-        # percentyle kierunkowe ± (osobno dla znaków)
+        # directional percentiles ± (separately for signs)
         def _p95_signed(arr: np.ndarray) -> Tuple[float, float]:
             pos = arr[arr > 0]
             neg = arr[arr < 0]
             p_pos = float(np.percentile(pos, 95)) if pos.size else 0.0
-            p_neg = float(np.percentile(neg, 5))  if neg.size else 0.0  # „95% najmniejszych” < 0
+            p_neg = float(np.percentile(neg, 5))  if neg.size else 0.0  # "95% of the smallest" < 0
             return p_pos*1000.0, p_neg*1000.0
 
         px95_plus,  px95_minus  = _p95_signed(grad_x)
         py95_plus,  py95_minus  = _p95_signed(grad_y)
 
-        # p95 z modułów (globalny)
+        # p95 from modules (global)
         gixp95 = float(np.percentile(grad_abs, 95)) * 1000.0
 
         times.append({
@@ -404,11 +424,11 @@ def compute_gix(
             'GIXS_mtecu_km': gixs_abs,      # std(|∇TEC|)
             'GIXSx_mtecu_km': gixs_x,       # std(∇TEC_x)
             'GIXSy_mtecu_km': gixs_y,       # std(∇TEC_y)
-            'GIXPx95_plus_mtecu_km':  px95_plus,   # 95. perc. dodatnich w x
-            'GIXPx95_minus_mtecu_km': px95_minus,  # 5. perc. (wart. ujemne) w x
+            'GIXPx95_plus_mtecu_km':  px95_plus,   # 95. perc. positive in x
+            'GIXPx95_minus_mtecu_km': px95_minus,  # 5. perc. (negative) in x
             'GIXPy95_plus_mtecu_km':  py95_plus,
             'GIXPy95_minus_mtecu_km': py95_minus,
-            'GIXP95_mtecu_km': gixp95,      # 95. perc. z |∇TEC|
+            'GIXP95_mtecu_km': gixp95,      # 95.perc. of |∇TEC|
             'n_pairs': int(grad_abs.size)
         })
 
@@ -427,53 +447,22 @@ def compute_gix(
     pairs_df = pd.concat(pair_rows, ignore_index=True) if pair_rows else pd.DataFrame()
     return times_df, pairs_df
 
-# --- plotting ---
-# --- Agregacja do siatki (quiver-grid) ---
-def grid_mean_vectors(pairs_df: pd.DataFrame, time_sel, res_deg=1.0, min_pairs=20) -> pd.DataFrame:
-    """
-    Agreguje pary do komórek siatki (1 strzałka/komórkę).
-    Zwraca kolumny: lon, lat, gx, gy, gabs, n
-    """
-    sub = pairs_df[pairs_df['time'] == pd.to_datetime(time_sel, utc=True)].copy()
-    if sub.empty:
-        return pd.DataFrame(columns=['lon','lat','gx','gy','gabs','n'])
-    sub['ix'] = np.floor((sub['CP_lon']+180)/res_deg).astype(int)
-    sub['iy'] = np.floor((sub['CP_lat']+ 90)/res_deg).astype(int)
-    g = sub.groupby(['ix','iy'])
-    agg = g.agg(
-        lon = ('CP_lon','mean'),
-        lat = ('CP_lat','mean'),
-        gx  = ('grad_x_mtecu_km','mean'),     # signed mean
-        gy  = ('grad_y_mtecu_km','mean'),     # signed mean
-        gabs=('grad_abs_mtecu_km','median'),  # robust kolor
-        n   = ('grad_x_mtecu_km','size')
-    ).reset_index(drop=True)
-    return agg[agg['n'] >= int(min_pairs)].reset_index(drop=True)
-
-# --- helper: pewność, że 'time' to datetime64[ns, UTC] ---
-def _ensure_time_utc(series):
-    t = pd.to_datetime(series, utc=True)
-    # dropna żeby uniknąć problemów z rysowaniem
-    return t
-
 """
-ROTI dla danych GNSS (STEC/VTEC) — zgodnie z Carmo et al. (2021), Metoda 4 (Cherniak 2018).
-Wejście DataFrame: kolumny ['time','stec','vtec','lat_ipp','lon_ipp','name','sv'] (+ ewentualnie 'ev').
+ROTI for GNSS data (STEC/VTEC) — according to Carmo et al. (2021), Method 4 (Cherniak 2018).
+DataFrame input: columns ['time','stec','vtec','lat_ipp','lon_ipp','name','sv'] (+ possibly 'ev').
 - ROT = dltTEC / dltt  (TECU/min)
-- ROTI = std(ROT) w oknie 5 minut (population std, ddof=0)
+- ROTI = std(ROT) in a 5-minute window (population std, ddof=0)
 
-Funkcje:
-- compute_roti_links(...) : licz ROT/ROTI per link (name, sv) w czasie, odporne na luki i północ
-- grid_roti_map(...)      : zagreguj ROTI do siatki geograficznej (mapa)
-- plot_roti_series(...)   : seria czasowa ROTI (sumarycznie po stacji lub per satelita)
-- plot_roti_map(...)      : mapa ROTI (scatter-grid)
-- save_roti_netcdf(...)   : zapis wyników do NetCDF (xarray)
+Functions:
+- compute_roti_links(...) : calculate ROT/ROTI per link (name, sv) over time, gap-resistant and north-resistant
+- grid_roti_map(...)      : aggregate ROTI to a geographic grid (map)
+- plot_roti_series(...)   : ROTI time series (summarized by station or per satellite)
+- plot_roti_map(...)      : ROTI map (scatter-grid)
+- save_roti_netcdf(...)   : save results to NetCDF (xarray)
 
-Domyślnie operujemy na STEC (rekomendacja Carmo — Metoda 4), ale można przełączyć na VTEC.
+By default, we operate on STEC (Carmo recommendation — Method 4), but you can switch to VTEC.
 """
 
-
-# ---------- Parametry domyślne ----------
 
 
 from astropy.time import Time
@@ -481,25 +470,25 @@ from astropy.time import Time
 
 def _ensure_sm_cols(
     dfa: pd.DataFrame,
-    transformer,                  # np. SolarGeomagneticTransformer()
+    transformer,                  # gnx.SolarGeomagneticTransformer()
     shell_height_m: float = 450e3
 ) -> pd.DataFrame:
     """
-    Dodaje kolumny 'lat_sm','lon_sm' na podstawie 'lat_ipp','lon_ipp','time' (UTC).
-    Wykonuje transformację wektorowo dla każdej epoki.
+    Adds columns 'lat_sm', 'lon_sm' based on 'lat_ipp', 'lon_ipp', 'time' (UTC).
+    Performs vector transformation for each epoch.
     """
     if transformer is None:
-        raise ValueError("Dla mode='SM' podaj transformer z metodą geodetic_to_sm(..., obstime=Time).")
+        raise ValueError("For mode='SM', specify a transformer with the geodetic_to_sm(..., obstime=Time) method.")
     if not {'time','lat_ipp','lon_ipp'}.issubset(dfa.columns):
-        raise ValueError("Brakuje kolumn: 'time','lat_ipp','lon_ipp'.")
+        raise ValueError("The columns 'time', 'lat_ipp', and 'lon_ipp' are missing..")
 
     dfa = dfa.copy()
     dfa['time'] = pd.to_datetime(dfa['time'], utc=True)
-    dfa = dfa.reset_index(drop=True)   # <-- KLUCZOWE
+    dfa = dfa.reset_index(drop=True)
 
     lat_sm = np.empty(len(dfa)); lon_sm = np.empty(len(dfa))
     for t, block_idx in dfa.groupby('time', sort=False).groups.items():
-        b = dfa.loc[block_idx]           # teraz block_idx == pozycje 0..N-1
+        b = dfa.loc[block_idx]
         lat_rad = np.deg2rad(b['lat_ipp'].to_numpy())
         lon_rad = np.deg2rad(b['lon_ipp'].to_numpy())
         h      = np.full_like(lat_rad, shell_height_m, dtype=float)
@@ -507,7 +496,7 @@ def _ensure_sm_cols(
         sm_lat, sm_lon, _h = transformer.geodetic_to_sm(
             lat_rad=lat_rad, lon_rad=lon_rad, h_m=h, obstime=Time(t, scale='utc')
         )
-        idx = np.asarray(block_idx, dtype=int)   # jawnie jako pozycje
+        idx = np.asarray(block_idx, dtype=int)
         lat_sm[idx] = np.rad2deg(sm_lat)
         lon_deg = (np.rad2deg(sm_lon) + 180.0) % 360.0 - 180.0
         lon_sm[idx] = lon_deg
@@ -517,7 +506,7 @@ def _ensure_sm_cols(
     return dfa
 
 
-# ---------- Główna funkcja: ROT/ROTI per link ----------
+# ---------- ROT/ROTI per link ----------
 def compute_roti_links(
     df: pd.DataFrame,
     tec_source: Literal['stec','vtec']='stec',
@@ -531,38 +520,38 @@ def compute_roti_links(
     detrend_5min: bool = True,
     # --- NOWE ---
     coord_mode: Literal['GEO','SM'] = 'GEO',
-    sm_transformer = None,                 # obiekt z geodetic_to_sm(...)
+    sm_transformer = None,
     sm_shell_height_m: float = 450e3,
-    region_frame: Literal['GEO','SM','AUTO'] = 'AUTO',  # w której ramie stosować 'region'
+    region_frame: Literal['GEO','SM','AUTO'] = 'AUTO',
 ) -> pd.DataFrame:
     """
-    Zwraca DataFrame z kolumnami:
+  Returns a DataFrame with columns:
       ['time','name','sv','lat_ipp','lon_ipp','TEC','ROT_tecu_per_min','ROTI_tecu_per_min']
-    ROT liczony dla (name, sv) i (opcjonalnie) w obrębie tej samej doby.
-    ROTI = rolling std(ROT) po czasie (okno 'window_min'), ddof=0, min_periods='min_samples'.
+    ROT calculated for (name, sv) and (optionally) within the same day.
+    ROTI = rolling std(ROT) over time (window 'window_min'), ddof=0, min_periods='min_samples'.
     """
     need = {'time','stec','vtec','lat_ipp','lon_ipp','name','sv'}
     miss = need - set(df.columns)
     if miss:
-        raise ValueError(f"Brakuje kolumn: {sorted(miss)}")
+        raise ValueError(f"Columns missing: {sorted(miss)}")
 
     dfa = df.copy()
     dfa['time'] = pd.to_datetime(dfa['time'], utc=True)
     dfa = dfa.sort_values(['name','sv','time']).reset_index(drop=True)
 
-    # filtr elewacji (jeśli dostępna)
+    # elevation map
     if min_elev_deg is not None and 'ev' in dfa.columns:
         dfa = dfa[dfa['ev'] >= float(min_elev_deg)].copy()
 
-    # wybór źródła TEC
+    # TEC source
     col = 'stec' if tec_source == 'stec' else 'vtec'
     dfa['TEC'] = dfa[col].astype(float) * tec_scale
 
-        # --- SM kolumny (opcjonalnie) ---
+        # --- SM columns  ---
     if coord_mode == 'SM' or region_frame == 'SM':
         dfa = _ensure_sm_cols(dfa, sm_transformer, shell_height_m=sm_shell_height_m)
 
-    # --- filtr regionu (w wybranej ramie) ---
+    # --- region filter (in selected reference frame) ---
     if region is not None:
         rf = coord_mode if region_frame == 'AUTO' else region_frame
         latv = dfa['lat_sm'] if rf == 'SM' else dfa['lat_ipp']
@@ -577,7 +566,7 @@ def compute_roti_links(
         ] + (['lat_sm','lon_sm'] if 'lat_sm' in dfa.columns else []))
 
 
-    # podział na doby UTC, aby nie różnicować przez północ (skoki dzienne)
+    # division into UTC days, so as not to differentiate by midnight (daily jumps)
     if split_on_day_change:
         dfa['day'] = dfa['time'].dt.floor('D')
         grp_cols = ['name', 'sv', 'day']
@@ -585,18 +574,18 @@ def compute_roti_links(
         grp_cols = ['name', 'sv']
     dfa = dfa.sort_values(grp_cols + ['time'])
     if detrend_5min:
-        # liczymy rolling mean tylko na kolumnach ['time','TEC'] wewnątrz każdej grupy,
-        # dzięki czemu apply dostaje mini-DataFrame BEZ kolumn grupujących
+        # we calculate the rolling mean only on the columns ['time','TEC'] within each group,
+        # so that apply gets a mini-DataFrame WITHOUT grouping columns
         rm5 = (
             dfa.groupby(grp_cols, group_keys=False)
                .apply(
                    lambda g: g[['time','TEC']]
                              .rolling('5min', on='time', min_periods=1, closed='both')['TEC']
                              .mean(),
-                   include_groups=False  # pandas>=2.2; jeśli masz starszego, zobacz wariant B poniżej
+                   include_groups=False
                )
         )
-        # rm5 ma indeks ORYGINALNYCH WIERSZY -> można bezpiecznie wstawić do dfa
+        # rm5 has an index of ORIGINAL LINES -> can be safely inserted into dfa
         dfa['TEC_d'] = dfa['TEC'] - rm5
         dfa['rm5'] = rm5.values
 
@@ -604,11 +593,11 @@ def compute_roti_links(
         dfa['TEC_d'] = dfa['TEC']
         dfa['rm5'] = 0.0
 
-    # różnicowanie w obrębie grup (link [+ doba])
+    # differentiation within groups (link [+ day])
     dfa['dt_s']  = dfa.groupby(grp_cols)['time'].diff().dt.total_seconds()
     dfa['dTEC']  = dfa.groupby(grp_cols)['TEC_d'].diff()
 
-    # obetnij nielogiczne kroki czasu
+    # cut out illogical steps in time
     valid = dfa['dt_s'].notna() & (dfa['dt_s'] > 0)
     if max_gap_s is not None:
         valid &= dfa['dt_s'] <= float(max_gap_s)
@@ -618,10 +607,9 @@ def compute_roti_links(
     dfa['ROT_tecu_per_min'] = (dfa['dTEC'] / dfa['dt_s']) * 60.0
     dfa['ROT_mtecu_per_s'] = (dfa['dTEC'] / dfa['dt_s']) * 1000
     # jest w TECU/min
-    # zeby zrobic mTECU/s - pomnozyc przez 1000 i  NIE MNOZYC przez 60
 
-    # Rolling STD po czasie (okno czasowe) dla każdej grupy
-    # Uwaga: używamy rolling(time-based) z min_periods, ddof=0 (definicja populacyjna)
+    # Rolling STD over time (time window) for each group
+    # Note: we use rolling(time-based) with min_periods, ddof=0 (population definition)
     def _rolling_std(g: pd.DataFrame, col) -> pd.Series:
         g = g.set_index('time')
         # tylko kolumna ROT; lat/lon nie są potrzebne do STD
@@ -629,10 +617,6 @@ def compute_roti_links(
 
     roti = dfa.groupby(grp_cols, group_keys=False).apply(_rolling_std,'ROT_tecu_per_min')
     roti_mtecu_s = dfa.groupby(grp_cols, group_keys=False).apply(_rolling_std, 'ROT_mtecu_per_s')
-    # roti = (
-    # dfa.groupby(grp_cols, group_keys=False)[['time','ROT_tecu_per_min']]
-    #    .apply(_rolling_std)
-    # )
     dfa['ROTI_tecu_per_min'] = roti.values
     dfa['ROTI_mtecu_per_s'] = roti_mtecu_s.values
 
@@ -645,7 +629,7 @@ def compute_roti_links(
 
 
 # ------ ------ ------ ------ ------ ------ ROTI PLOTTING ------- ------ ------ ------ ------ ------
-# --- 1) GRID dla wskazanej epoki (snapshot) ---
+# --- 1) GRID for given epoch (snapshot) ---
 def roti_snapshot_grid(
     roti_df: pd.DataFrame,
     epoch,
@@ -658,8 +642,8 @@ def roti_snapshot_grid(
     coord_mode: Literal['GEO','SM'] = 'GEO'
 ) -> pd.DataFrame:
     """
-    Agreguje ROTI do siatki w oknie czasowym wokół (lub przed) 'epoch'.
-    Zwraca: DataFrame ['lon','lat','ROTI','n'] (po 1 punkcie/komórkę siatki).
+    Aggregates ROTI into a grid in a time window around (or before) 'epoch'.
+    Returns: DataFrame ['lon','lat','ROTI','n'] (1 point/grid cell).
     """
     if roti_df.empty:
         return pd.DataFrame(columns=['lon','lat','ROTI','n'])
@@ -668,7 +652,7 @@ def roti_snapshot_grid(
     if mode == 'center':
         half = pd.Timedelta(minutes=window_min/2)
         t1, t2 = t0 - half, t0 + half
-    elif mode =='trailing':  # 'trailing' – okno wsteczne
+    elif mode =='trailing':  # 'trailing' – backward window
         t1, t2 = t0 - pd.Timedelta(minutes=window_min), t0
     else: #top
         t1, t2 = t0, t0 + pd.Timedelta(minutes=window_min)
@@ -693,15 +677,15 @@ def roti_snapshot_grid(
     g = sub.groupby(['ix','iy']).agg(**base_agg).reset_index()
     return g[g['n'] >= int(min_points)].reset_index(drop=True)
 
-# --- 2) Skala globalna (stałe vmin/vmax dla wszystkich snapshotów) ---
+# --- 2) Global scale (fixed vmin/vmax for all snapshots) ---
 def compute_roti_global_scale(
     roti_df: pd.DataFrame,
     window_min: int = 5,
     q_low_high: Tuple[float,float] = (5.0, 95.0)
 ) -> Tuple[float, float]:
     """
-    Liczy globalne (vmin, vmax) oparte na percentylach ROTI w całym zbiorze.
-    Dla porównywalności klatek warto to policzyć po zgrubnym odfiltrowaniu NaN.
+    Calculates global (vmin, vmax) based on ROTI percentiles across the entire set.
+    For frame comparability, it is worth calculating this after roughly filtering out NaN.
     """
     s = roti_df['ROTI_tecu_per_min'].dropna()
     if s.empty:
@@ -712,6 +696,17 @@ def compute_roti_global_scale(
         vmax = vmin + 1e-3
     return vmin, vmax
 
+
+
+
+
+def _new_map_axes(proj, *, figsize=FIGSIZE, dpi=DPI):
+    """Tworzy zawsze identyczny układ: ax (mapa) + cax (colorbar pod spodem)."""
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    gs = gridspec.GridSpec(2, 1, height_ratios=_GS_HEIGHT_RATIOS, hspace=_GS_HSPACE)
+    ax = fig.add_subplot(gs[0, 0], projection=proj)
+    cax = fig.add_subplot(gs[1, 0])
+    return fig, ax, cax
 
 
 def plot_roti_snapshot(
@@ -729,88 +724,141 @@ def plot_roti_snapshot(
     map_background: bool = True,
     coast_res: str = "50m",
     draw: Literal['tiles','scatter'] = 'tiles',
-    # --- NOWE ---
-    coord_mode: Literal['GEO','SM'] = 'GEO'
+    coord_mode: Literal['GEO','SM'] = 'GEO',
+    extent: Optional[list] = None,   # [lon_min, lon_max, lat_min, lat_max]
+    cmap_name: str = "viridis",
 ):
     grid = roti_snapshot_grid(
         roti_df, epoch=epoch, window_min=window_min, mode=mode,
         res_deg=res_deg, min_points=min_points, agg=agg, coord_mode=coord_mode
     )
     if grid.empty:
-        print("Brak punktów w oknie – pomijam rysowanie."); return
+        print("Brak punktów w oknie – pomijam rysowanie.")
+        return
 
     # skala kolorów
     if vmin is None or vmax is None:
         vmin = float(np.percentile(grid['ROTI'], 5)) if vmin is None else vmin
         vmax = float(np.percentile(grid['ROTI'], 95)) if vmax is None else vmax
-        if vmin >= vmax: vmax = vmin + 1e-3
-    cmap = plt.get_cmap('viridis'); norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+        if vmin >= vmax:
+            vmax = vmin + 1e-3
 
-    # obrys mapy
+    cmap = plt.get_cmap(cmap_name)
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+
+    # extent (jeśli nie podany – wylicz z danych)
     lon = ((grid['lon'].to_numpy() + 180) % 360) - 180
     lat = grid['lat'].to_numpy()
-    margin_lon = max(2.0, res_deg*2); margin_lat = max(2.0, res_deg*2)
-    lon_min, lon_max = np.nanmin(lon)-margin_lon, np.nanmax(lon)+margin_lon
-    lat_min, lat_max = max(-90, np.nanmin(lat)-margin_lat), min(90, np.nanmax(lat)+margin_lat)
+    if extent is None:
+        margin_lon = max(2.0, res_deg * 2)
+        margin_lat = max(2.0, res_deg * 2)
+        lon_min, lon_max = np.nanmin(lon) - margin_lon, np.nanmax(lon) + margin_lon
+        lat_min, lat_max = max(-90, np.nanmin(lat) - margin_lat), min(90, np.nanmax(lat) + margin_lat)
+        extent = [lon_min, lon_max, lat_min, lat_max]
 
-    # rysowanie z Cartopy (tło opcjonalne)
     try:
-        import cartopy.crs as ccrs, cartopy.feature as cfeature
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+
         proj = ccrs.PlateCarree()
-        fig = plt.figure(figsize=(10, 5.5))
-        ax = plt.axes(projection=proj)
+        fig, ax, cax = _new_map_axes(proj)
+
+        ax.set_extent(extent, crs=ccrs.PlateCarree())
+        ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', linestyle='--', alpha=0.6)
 
         if map_background and coord_mode == 'GEO':
             ax.add_feature(cfeature.OCEAN.with_scale(coast_res), facecolor="#dfe9f3")
             ax.add_feature(cfeature.LAND.with_scale(coast_res),  facecolor="#ececec")
             ax.add_feature(cfeature.COASTLINE.with_scale(coast_res), linewidth=0.6)
             ax.add_feature(cfeature.BORDERS.with_scale(coast_res), linewidth=0.4)
-        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=proj)
-        gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
-        gl.top_labels = False; gl.right_labels = False
 
         if draw == 'tiles':
-            # kafle: prostokąty o wymiarach res_deg x res_deg (bez nachodzenia)
             for _, r in grid.iterrows():
-                # krawędzie komórki z indeksów ix, iy
-                west  = r['ix']*res_deg - 180.0
-                south = r['iy']*res_deg -  90.0
-                color = cmap(norm(r['ROTI']))
-                rect = mpatches.Rectangle((west, south), res_deg, res_deg,
-                                          transform=proj, facecolor=color, edgecolor='none')
+                west  = r['ix'] * res_deg - 180.0
+                south = r['iy'] * res_deg -  90.0
+                rect = mpatches.Rectangle(
+                    (west, south), res_deg, res_deg,
+                    transform=ccrs.PlateCarree(),
+                    facecolor=cmap(norm(r['ROTI'])),
+                    edgecolor='none'
+                )
                 ax.add_patch(rect)
             sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
-            cb = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02, label='ROTI [TECU/min]')
         else:
-            # fallback: punktowe kwadraty (mogą lekko nachodzić przy małym res_deg)
-            sc = ax.scatter(grid['lon'], grid['lat'], c=grid['ROTI'], s=60, marker='s',
-                            vmin=vmin, vmax=vmax, transform=proj)
-            cb = plt.colorbar(sc, ax=ax, orientation='vertical', pad=0.02, label='ROTI [TECU/min]')
+            ax.scatter(
+                grid['lon'], grid['lat'],
+                c=grid['ROTI'],
+                s=60, marker='s',
+                cmap=cmap, norm=norm,
+                transform=ccrs.PlateCarree(),
+                edgecolor='none',
+                linewidths=0
+            )
+            sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
 
-        ax.set_title(f"{title_prefix} ({coord_mode}) — {pd.to_datetime(epoch, utc=True)}  (okno {window_min} min, {mode})")
-        plt.tight_layout()
-        if save_path: plt.savefig(save_path, dpi=150); plt.close(fig)
-        else: plt.show()
+        def place_cax_below(ax, cax, gap=0.006, height=0.018):
+            """
+            gap, height w jednostkach figury (0..1).
+            """
+            pos = ax.get_position()
+            cax.set_position([pos.x0, pos.y0 - gap - height, pos.width, height])
+
+
+        cb = plt.colorbar(sm, cax=cax, orientation='horizontal')
+        cb.set_label('ROTI [TECU/min]')
+        fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.08)
+        place_cax_below(ax, cax, gap=0.05, height=0.018)
+
+        ts = pd.to_datetime(epoch, utc=True)
+        ax.set_title(f"{title_prefix} — {ts}  ({window_min} min window, {mode})")
+
+        if save_path:
+            fig.savefig(save_path, dpi=600)
+            plt.close(fig)
+
     except ImportError:
-        # bez Cartopy – narysujemy „tiles” w osi danych (też się nie będą nachodzić)
-        plt.figure(figsize=(9,5))
+        # fallback bez cartopy: identyczny layout osi danych
+        fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
+        gs = gridspec.GridSpec(2, 1, height_ratios=_GS_HEIGHT_RATIOS, hspace=_GS_HSPACE)
+        ax = fig.add_subplot(gs[0, 0])
+        cax = fig.add_subplot(gs[1, 0])
+
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        ax.grid(alpha=0.3)
+
         if draw == 'tiles':
             for _, r in grid.iterrows():
-                west  = r['ix']*res_deg - 180.0
-                south = r['iy']*res_deg -  90.0
-                color = cmap(norm(r['ROTI']))
-                rect = plt.Rectangle((west, south), res_deg, res_deg, facecolor=color, edgecolor='none')
-                plt.gca().add_patch(rect)
-            plt.xlim(lon_min, lon_max); plt.ylim(lat_min, lat_max)
+                west  = r['ix'] * res_deg - 180.0
+                south = r['iy'] * res_deg -  90.0
+                ax.add_patch(
+                    plt.Rectangle((west, south), res_deg, res_deg,
+                                  facecolor=cmap(norm(r['ROTI'])), edgecolor='none')
+                )
             sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
-            plt.colorbar(sm, label='ROTI [TECU/min]')
         else:
-            sc = plt.scatter(grid['lon'], grid['lat'], c=grid['ROTI'], s=60, marker='s', vmin=vmin, vmax=vmax)
-            plt.colorbar(sc, label='ROTI [TECU/min]')
-        plt.title(f"{title_prefix} — {pd.to_datetime(epoch, utc=True)}  (okno {window_min} min, {mode})")
-        plt.xlabel('lon'); plt.ylabel('lat'); plt.grid(alpha=0.3); plt.tight_layout()
-        if save_path: plt.savefig(save_path, dpi=150); plt.close()
-        else: plt.show()
+            ax.scatter(grid['lon'], grid['lat'], c=grid['ROTI'], s=60, marker='s', cmap=cmap, norm=norm)
+            sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+
+        cb = plt.colorbar(sm, cax=cax, orientation='horizontal')
+        cb.set_label('ROTI [TECU/min]')
+
+        ts = pd.to_datetime(epoch, utc=True)
+        ax.set_title(f"{title_prefix} — {ts}  ({window_min} min window, {mode})")
+        ax.set_xlabel('lon')
+        ax.set_ylabel('lat')
+
+        if save_path:
+            fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.08)
+
+            fig.savefig(save_path, dpi=DPI)
+            # fig.savefig(
+            #     save_path.split('.')[0] + '.tiff',
+            #     dpi=DPI,
+            #     format="tiff",
+            #     pil_kwargs={"compression": "tiff_lzw"}
+            # )
+            plt.close(fig)
 
 
 # --- 4) Generator snapshotów (pętla po epokach) ---
@@ -830,7 +878,8 @@ def make_roti_snapshots(
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     # --- NOWE ---
-    coord_mode: Literal['GEO','SM'] = 'GEO'
+    coord_mode: Literal['GEO','SM'] = 'GEO',
+    extent=None
 ):
     """
     Tworzy serię snapshotów ROTI.
@@ -861,44 +910,36 @@ def make_roti_snapshots(
         plot_roti_snapshot(
             roti_df, epoch=t, window_min=window_min, mode=mode,
             res_deg=res_deg, min_points=min_points, agg=agg,
-            vmin=vmin, vmax=vmax, save_path=save_path_i, coord_mode=coord_mode,map_background=True
+            vmin=vmin, vmax=vmax, save_path=save_path_i, coord_mode=coord_mode,map_background=True,extent=extent
         )
 
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import numpy as np
-from matplotlib.colors import LogNorm
+
+
 
 
 def plot_gix(
-    pairs_df,
+    pairs_df: pd.DataFrame,
     epoch,
-    clip_outliers = True,
+    clip_outliers: bool = True,
     *,
-    # --- dane / skala ---
     vmin=None,
     vmax=None,
-    vclip=(0.01, 0.995),          # percentyle do automatycznego przycięcia
-    log_scale=False,             # log10 skala dla kolorów
-    cmap='viridis',
+    vclip=(0.01, 0.995),
+    log_scale: bool = False,
+    cmap: str = 'viridis',
 
-    # --- projekcja i zasięg mapy ---
-    projection='PlateCarree',    # 'PlateCarree', 'Robinson', 'Mollweide', ...
-    central_longitude=0.0,
-    extent=None,                 # [lon_min, lon_max, lat_min, lat_max]
+    projection: str = 'PlateCarree',
+    central_longitude: float = 0.0,
+    extent=None,
 
-    # --- figura / oś ---
-    ax=None,                     # możesz podać istniejący ax, np. do subplotów
-    figsize=(10, 7),
+    figsize=FIGSIZE,
+    dpi=DPI,
 
-    # --- punkty (scatter) ---
     point_size=16,
     point_alpha=0.8,
     point_edgecolor='none',
     point_zorder=3,
 
-    # --- tło mapy ---
     draw_coastlines=True,
     coast_resolution='110m',
     coast_linewidth=0.7,
@@ -906,39 +947,25 @@ def plot_gix(
     borders_linewidth=0.5,
     draw_land=True,
     land_facecolor='0.9',
-    ocean_facecolor='0.95',      # jednolite tło oceanu
+    ocean_facecolor='0.95',
     draw_ocean=True,
 
-    # --- siatka / opisy ---
     draw_gridlines=True,
     gridlines_kwargs=None,
     title_prefix=r"GIX |$\nabla$TEC|",
     title_kwargs=None,
 
-    # --- colorbar ---
-    #r"$\nabla$TEC"
     cbar_label=r'|$\nabla$TEC| [mTECU/km]',
-    cbar_orientation='vertical',
-    cbar_pad=0.02,
-    cbar_kwargs=None,
-
-    # --- adnotacje statystyk ---
     annotate_stats=True,
-    stats_loc='lower left',      # 'lower left', 'lower right', 'upper left', ...
+    stats_loc='lower left',
     stats_fontsize=9,
     stats_alpha=0.7,
+
+    save_path: Optional[str] = None,
 ):
-    """
-    Wykres punktowy GIX dla jednej epoki z dużą kontrolą estetyki.
-    Zwraca (fig, ax, sc) – figurę, oś i obiekt scatter.
-    """
-    import warnings
-    warnings.filterwarnings(
-        "ignore",
-        message="invalid value encountered in create_collection",
-        category=RuntimeWarning,
-        module="shapely.creation"
-    )
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    from matplotlib.colors import LogNorm
 
     # --- wybór epoki i czyszczenie NaN ---
     pairs_df = pairs_df.dropna(subset=['CP_lat', 'CP_lon']).copy()
@@ -950,103 +977,77 @@ def plot_gix(
     lons = sub['CP_lon'].to_numpy()
     vals = sub['grad_abs_mtecu_km'].to_numpy()
 
-    # --- usuwanie outlierów powyżej 99 percentyla ---
     if clip_outliers:
         p99 = np.nanpercentile(vals, 99)
         mask = vals <= p99
+        lats, lons, vals = lats[mask], lons[mask], vals[mask]
 
-        lats = lats[mask]
-        lons = lons[mask]
-        vals = vals[mask]
-
-    # --- sortowanie po wartości gradientu (rosnąco) ---
-    # dzięki temu najmniejsze wartości są rysowane jako pierwsze,
-    # a „gorące” punkty ładnie przebijają się na wierzch
     order = np.argsort(vals)
-    lats = lats[order]
-    lons = lons[order]
-    vals = vals[order]
+    lats, lons, vals = lats[order], lons[order], vals[order]
 
-    # --- automatyczne przycinanie zakresu (percentyle) ---
-    # jeśli vmin/vmax nie zostały podane, używamy percentyli z vclip
     if vmin is None or vmax is None:
         lo_p, hi_p = vclip
         vmin_auto = np.nanpercentile(vals, lo_p * 100)
         vmax_auto = np.nanpercentile(vals, hi_p * 100)
+        if vmin is None: vmin = float(vmin_auto)
+        if vmax is None: vmax = float(vmax_auto)
 
-        if vmin is None:
-            vmin = float(vmin_auto)
-        if vmax is None:
-            vmax = float(vmax_auto)
+    # --- projekcja ---
+    proj_cls = getattr(ccrs, projection, ccrs.PlateCarree)
+    proj = proj_cls(central_longitude=central_longitude) \
+        if 'central_longitude' in proj_cls.__init__.__code__.co_varnames else proj_cls()
 
-    # --- wybór projekcji ---
-    if isinstance(projection, str):
-        proj_cls = getattr(ccrs, projection, ccrs.PlateCarree)
-        proj = proj_cls(central_longitude=central_longitude) \
-               if 'central_longitude' in proj_cls.__init__.__code__.co_varnames \
-               else proj_cls()
-    else:
-        # użytkownik może podać już gotowy obiekt projekcji
-        proj = projection
+    # --- identyczny layout jak ROTI: ax + cax ---
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    gs = gridspec.GridSpec(2, 1, height_ratios=_GS_HEIGHT_RATIOS, hspace=_GS_HSPACE)
+    ax = fig.add_subplot(gs[0, 0], projection=proj)
+    cax = fig.add_subplot(gs[1, 0])
 
-    # --- tworzenie figury / osi ---
-    if ax is None:
-        fig = plt.figure(figsize=figsize)
-        ax = plt.axes(projection=proj)
-    else:
-        fig = ax.figure
-
-    # --- zasięg mapy ---
+    # extent
     if extent is not None:
-        ax.set_extent(extent, crs=ccrs.PlateCarree())
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
 
-    # --- tło ocean/land ---
+    # tło
     if draw_ocean:
         ax.set_facecolor(ocean_facecolor)
     if draw_land:
-        land = cfeature.LAND.with_scale(coast_resolution)
-        ax.add_feature(land, facecolor=land_facecolor, edgecolor='none', zorder=0)
+        ax.add_feature(cfeature.LAND.with_scale(coast_resolution),
+                       facecolor=land_facecolor, edgecolor='none', zorder=0)
 
-    # --- kontury / granice ---
+    # kontury
     if draw_coastlines:
         ax.coastlines(resolution=coast_resolution, linewidth=coast_linewidth, zorder=1)
     if draw_borders:
-        borders = cfeature.BORDERS.with_scale(coast_resolution)
-        ax.add_feature(borders, linewidth=borders_linewidth, zorder=2)
+        ax.add_feature(cfeature.BORDERS.with_scale(coast_resolution),
+                       linewidth=borders_linewidth, zorder=2)
 
-    # --- siatka geograficzna ---
+    # gridlines (bez labeli -> spójny layout)
     if draw_gridlines:
-        gl_kwargs = dict(
-            draw_labels=True,
-            linestyle='--',
-            linewidth=0.4,
-            alpha=0.6,
-        )
+        gl_kwargs = dict(draw_labels=True, linestyle='--', linewidth=0.4, alpha=0.6)
         if gridlines_kwargs is not None:
             gl_kwargs.update(gridlines_kwargs)
-        gl = ax.gridlines(**gl_kwargs)
-        # w cartopy >=0.20 atrybuty label_* mogą mieć inne nazwy – dopasuj w razie czego
+        ax.gridlines(**gl_kwargs)
 
-    # --- przygotowanie normalizacji kolorów ---
+    # norm
     if log_scale:
-        # minimalna wartość > 0, żeby log10 miało sens
         positive_vals = vals[vals > 0]
         if positive_vals.size == 0:
             raise ValueError("Brak dodatnich wartości do log_scale=True.")
         if vmin <= 0:
             vmin = float(np.nanmin(positive_vals))
         norm = LogNorm(vmin=vmin, vmax=vmax)
+        vmin_sc = vmax_sc = None
     else:
-        norm = None
+        norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+        vmin_sc, vmax_sc = None, None
 
-    # --- scatter ---
+    # scatter
     sc = ax.scatter(
         lons, lats,
         c=vals,
         s=point_size,
         cmap=cmap,
-        vmin=None if log_scale else vmin,
-        vmax=None if log_scale else vmax,
         norm=norm,
         transform=ccrs.PlateCarree(),
         alpha=point_alpha,
@@ -1055,30 +1056,32 @@ def plot_gix(
         zorder=point_zorder,
     )
 
-    # --- colorbar ---
-    cbar_opts = dict(orientation=cbar_orientation, pad=cbar_pad)
-    if cbar_kwargs is not None:
-        cbar_opts.update(cbar_kwargs)
-    cbar = plt.colorbar(sc, ax=ax, **cbar_opts)
-    cbar.set_label(cbar_label)
+    def place_cax_below(ax, cax, gap=0.006, height=0.018):
+        """
+        gap, height w jednostkach figury (0..1).
+        """
+        pos = ax.get_position()
+        cax.set_position([pos.x0, pos.y0 - gap - height, pos.width, height])
 
-    # --- tytuł ---
+    # colorbar zawsze w cax i zawsze horizontal
+    cb = plt.colorbar(sc, cax=cax, orientation='horizontal',pad=0.02)
+    cb.set_label(cbar_label)
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.08)
+    place_cax_below(ax, cax, gap=0.05, height=0.018)
+
+    # title
     ttl_opts = dict(fontsize=12)
     if title_kwargs is not None:
         ttl_opts.update(title_kwargs)
-    ax.set_title(f"{title_prefix} – {epoch}", **ttl_opts)
+    ax.set_title(f"{title_prefix} — {pd.to_datetime(epoch)}", **ttl_opts)
 
-    # --- adnotacja statystyki w rogu ---
+    # stats
     if annotate_stats:
         mn = float(np.nanmin(vals))
         mx = float(np.nanmax(vals))
         med = float(np.nanmedian(vals))
         p95 = float(np.nanpercentile(vals, 95))
-
-        text = (
-            f"min={mn:.2f}, median={med:.2f}, max={mx:.2f}\n"
-            f"p95={p95:.2f}"
-        )
+        text = f"min={mn:.2f}, median={med:.2f}, max={mx:.2f}\np95={p95:.2f}"
 
         loc2xy = {
             'lower left':  (0.02, 0.02),
@@ -1094,38 +1097,44 @@ def plot_gix(
             fontsize=stats_fontsize,
             ha='left' if 'left' in stats_loc else 'right',
             va='bottom' if 'lower' in stats_loc else 'top',
-            bbox=dict(
-                boxstyle='round',
-                facecolor='white',
-                edgecolor='0.7',
-                alpha=stats_alpha
-            ),
+            bbox=dict(boxstyle='round', facecolor='white', edgecolor='0.7', alpha=stats_alpha),
             zorder=4,
         )
 
+    if save_path:
+        fig.savefig(save_path, dpi=dpi)
+        # fig.savefig(
+        #     save_path.split('.')[0] + '.tiff',
+        #     dpi=dpi,
+        #     format="tiff",
+        #     pil_kwargs={"compression": "tiff_lzw"}
+        # )
+
+        plt.close(fig)
+
     return fig, ax, sc
 
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+
+
 
 def plot_gix_family(times, reg, dmin, dmax, figsize=(12,9), dpi=100):
     """
-    Tworzy 3-panelowy wykres rodzinny GIX:
-        (a) GIX      = sqrt(gx_bar^2 + gy_bar^2)
-        (b) GIXσ     = std(|grad(VTEC)|)
-        (c) GIX95    = 95%(|grad(VTEC)|)
+        Creates a 3-panel GIX family chart:
+            (a) GIX      = sqrt(gx_bar^2 + gy_bar^2)
+            (b) GIXσ     = std(|grad(VTEC)|)
+            (c) GIX95    = 95%(|grad(VTEC)|)
 
-    Parametry:
-        times : DataFrame zawierający kolumny:
-            - 'time'
-            - 'GIX_mtecu_km'
-            - 'GIXS_mtecu_km'
-            - 'GIXP95_mtecu_km'
-        reg   : nazwa regionu (str)
-        dmin, dmax : zakres długości dipola
-        figsize : rozmiar figury
-        dpi : gęstość do zapisu
-    """
+        Parameters:
+            times : DataFrame containing columns:
+                - 'time'
+                - 'GIX_mtecu_km'
+                - 'GIXS_mtecu_km'
+                - 'GIXP95_mtecu_km'
+            reg   : region name (str)
+            dmin, dmax : dipole length range
+            figsize : figure size
+            dpi : density to save
+        """
 
     t     = times['time'].values
     gix_  = times['GIX_mtecu_km'].values
@@ -1183,13 +1192,10 @@ def plot_gix_family(times, reg, dmin, dmax, figsize=(12,9), dpi=100):
         loc='upper right', fontsize=10, frameon=True
     )
 
-    # ---- Formatowanie osi czasu, siatki, itd. ----
+    # ---- Layout formatting ----
     for ax in axes:
         ax.grid(True, which='both', linestyle='--', linewidth=0.4, alpha=0.7)
         ax.tick_params(axis='both', labelsize=10)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-
-    fig.tight_layout(rect=[0, 0.02, 1, 0.92])
-
     return fig, axes

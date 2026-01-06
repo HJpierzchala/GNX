@@ -246,17 +246,17 @@ def get_vtec(LT, doy, fmag, fmag_deg, klobpar, cos3x, cos2x, sys='GPS'):
             fmag (array-like or float): Geomagnetic latitude in radians.
             fmag_deg (array-like or float): Geomagnetic latitude in degrees.
             klobpar (float or array-like): Model driving parameter (derived from broadcast
-                coefficients or system-specific parameters).
+                coefficients or sys-specific parameters).
             cos3x (array-like or float): Solar-zenith dependent coefficient (from sol_zen_deps).
             cos2x (array-like or float): Solar-zenith dependent coefficient (from sol_zen_deps).
-            sys (str, optional): GNSS system identifier; affects empirical coefficients.
+            sys (str, optional): GNSS sys identifier; affects empirical coefficients.
                 Supported values: 'GPS' (default), 'GAL'.
 
         Returns:
             numpy.ndarray or float: Estimated VTEC in TECU.
 
         Notes:
-            - The model is parameterized with system-dependent constants (k).
+            - The model is parameterized with sys-dependent constants (k).
             - Inputs may be arrays; broadcasting follows NumPy semantics.
         """
 
@@ -350,7 +350,7 @@ def ntcm_vtec(pos, DOY, ev, az, epoch, gala, mf_no=1,return_vtec=False):
         ev (float or array-like): Satellite elevation angle(s) in degrees.
         az (float or array-like): Satellite azimuth angle(s) in degrees.
         epoch (datetime.datetime): GPST epoch of observation.
-        gala (array-like): Galileo system parameters (e.g., two/three coefficients).
+        gala (array-like): Galileo sys parameters (e.g., two/three coefficients).
         mf_no (int, optional): Mapping function selector passed to stec_mf (default: 1).
 
     Returns:
@@ -393,50 +393,45 @@ def compute_ntcm_grid(
     doy: int | None = None,
 ) -> xr.Dataset:
     """
-    Oblicz VTEC z modelu NTCM na siatce (lat, lon, time) i zwróć xarray.Dataset.
+    Calculate VTEC from the NTCM model on a grid (lat, lon, time) and return xarray.Dataset.
 
     Parameters
     ----------
     lat_grid : array-like
-        Wektor szerokości geograficznych (deg).
+        Vector of latitudes (deg).
     lon_grid : array-like
-        Wektor długości geograficznych (deg).
+        Vector of longitudes (deg).
     times : array-like
-        Wektor czasów (np. np.datetime64, list[Timestamp], DatetimeIndex).
+        Vector of times (e.g., np.datetime64, list[Timestamp], DatetimeIndex).
     gal_alpha : any
-        Parametr/parametry gal_alpha przekazywane do gnx.ntcm_vtec (argument 'gala').
+        Parameter(s) gal_alpha passed to gnx.ntcm_vtec (argument 'gala').
     shell_height : float, optional
-        Wysokość powłoki jonosferycznej nad powierzchnią Ziemi [m], domyślnie 450e3.
+        Height of the ionospheric shell above the Earth's surface [m], default 450e3.
     earth_radius : float, optional
-        Promień Ziemi [m], domyślnie 6371e3.
+        Earth's radius [m], default 6371e3.
     doy : int or None, optional
-        Day-of-year przekazywany do gnx.ntcm_vtec (argument DOY).
-        Jeśli None, zostanie wyliczony z pierwszego elementu `times`.
+        Day-of-year passed to gnx.ntcm_vtec (DOY argument).
+        If None, it will be calculated from the first element of `times`.
 
     Returns
     -------
     xr.Dataset
-        Dataset z jedną zmienną 'V' o wymiarach (time, lat, lon),
-        z atrybutami jednostek i opisu.
+        Dataset with one variable 'V' with dimensions (time, lat, lon),
+        with unit and description attributes.
     """
 
-    # Upewnij się, że mamy poprawne wektory i typy
     lat_grid = np.asarray(lat_grid, dtype=float)
     lon_grid = np.asarray(lon_grid, dtype=float)
     times = pd.to_datetime(times)
 
-    # Jeżeli DOY nie podany, wyznacz z pierwszej epoki
     if doy is None:
         doy = times[0].dayofyear
 
-    # Przygotuj pustą tablicę na wyniki: (czas, lat, lon)
     V = np.empty((times.size, lat_grid.size, lon_grid.size), dtype=float)
 
-    # Pętla po siatce i czasie
     for i, lat in enumerate(lat_grid):
         for j, lon in enumerate(lon_grid):
-            # pozycja IPP na powłoce h = shell_height
-            # wektor sferyczny: [lat, lon, r]
+
             sph = np.array([lat, lon, earth_radius + shell_height], dtype=float)
             ecef = spherical2ecef(sph=sph)
             geodetic = ecef2geodetic(ecef=ecef, deg=True)  # [lat, lon, h]
@@ -447,14 +442,13 @@ def compute_ntcm_grid(
                     pos=geodetic,
                     DOY=doy,
                     ev=0.0,
-                    az=0.0,        # VTEC nad punktem
+                    az=0.0,
                     epoch=t,
                     gala=gal_alpha,
                     return_vtec=True,
                 )
                 V[k, i, j] = vtec
 
-    # Tworzenie DataArray
     da_V = xr.DataArray(
         V,
         dims=("time", "lat", "lon"),
@@ -470,7 +464,5 @@ def compute_ntcm_grid(
         },
     )
 
-    # Dataset w tej samej postaci, co miałeś
     ds_vtec = xr.Dataset({"V": da_V})
-
     return ds_vtec

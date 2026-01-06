@@ -34,6 +34,10 @@ from ..configuration import TECConfig
 import numpy as np
 from scipy.signal import savgol_filter
 from scipy.signal import cheby1, filtfilt
+from ..io import GNSSDataProcessor2, read_sp3
+from ..coordinates import make_ionofree, emission_interp, BroadcastInterp
+from ..tools import CSDetector
+from ..tools import DDPreprocessing
 
 
 def apply_savgol_filter_1d(
@@ -605,7 +609,6 @@ class TECSession:
 
         self.config: TECConfig = config
         self.log: logging.Logger = logger or self._default_logger()
-        self.gnss = gnss_api or self._import_gnss_api()
         self.use_sys = self.config.sys
 
 
@@ -616,7 +619,7 @@ class TECSession:
             pd.DataFrame: TEC output DataFrame with per‑arc results.
         """
 
-        processor = self.gnss.GNSSDataProcessor2(
+        processor =  GNSSDataProcessor2(
             obs_path=self.config.obs_path,
             nav_path=self.config.nav_path,
             dcb_path=self.config.dcb_path,
@@ -681,7 +684,7 @@ class TECSession:
         if self.config.rcv_dcb_source == 'calibrate':
             self.config.add_dcb=False
 
-            monitor = self.gnss.STECMonitor(obs=obs_gps_crd, mode=mode, config=self.config, sys=self.use_sys, flh=flh,
+            monitor =  STECMonitor(obs=obs_gps_crd, mode=mode, config=self.config, sys=self.use_sys, flh=flh,
                                             broadcast=broadcast)
             obs_tec = monitor.run()
             calib = Calibration(name=self.config.station_name, df=obs_tec, sys=self.use_sys, mode=mode)
@@ -689,11 +692,11 @@ class TECSession:
             obs_tec['sta_dcb'] = dcb_u
             # po kalibracji aplikujemy DCB satelitow do pomiarow
             self.config.add_dcb=True
-            monitor = self.gnss.STECMonitor(obs=obs_tec, mode=mode, config=self.config,
+            monitor =  STECMonitor(obs=obs_tec, mode=mode, config=self.config,
                                             sys=self.use_sys, flh=flh, broadcast=broadcast)
             obs_tec = monitor.run()
         else:
-            monitor = self.gnss.STECMonitor(obs=obs_gps_crd, mode=mode, config=self.config, sys=self.use_sys, flh=flh,
+            monitor =  STECMonitor(obs=obs_gps_crd, mode=mode, config=self.config, sys=self.use_sys, flh=flh,
                                             broadcast=broadcast)
             obs_tec = monitor.run()
         return obs_tec
@@ -730,6 +733,22 @@ class TECSession:
 
         return gps_obs, gal_obs
 
+    def _interpolate_broadcast(self, obs_df, xyz, flh,sys,mode, orbit, tolerance):
+        make_ionofree(obs_df,sys,mode)
+        if sys == 'G':
+            orb = orbit.gps_orb
+        elif sys == 'E':
+            orb = orbit.gal_orb
+        else:
+            raise ValueError("Invalid sys: %s", sys)
+
+        interpolator =BroadcastInterp(obs=obs_df,mode=mode,sys=sys,nav=orb,emission_time=True)
+        obs_crd = interpolator.interpolate()
+        wrapper = CustomWrapper(obs=obs_crd, epochs=None, flh=flh.copy(), xyz_a=xyz.copy(),
+                                mode=mode)
+        obs_crd = wrapper.run()
+        return obs_crd
+
     def _interpolate_lgr(self, obs, flh, xyz, mode):
         obs = obs.swaplevel('sv','time')
         start = datetime.now()
@@ -755,8 +774,8 @@ class TECSession:
         """
 
 
-        self.gnss.make_ionofree(obs_df,sys,mode)
-        obs_crd =self.gnss.emission_interp(
+        make_ionofree(obs_df,sys,mode)
+        obs_crd = emission_interp(
             obs=obs_df,
             crd=positions,
             prev_sp3_df=sp3[0],
@@ -764,7 +783,7 @@ class TECSession:
             sp3_df=sp3[1]
         )
 
-        wrapper = self.gnss.CustomWrapper(obs=obs_crd,epochs=None,flh=flh.copy(),xyz_a=xyz.copy(),
+        wrapper =  CustomWrapper(obs=obs_crd,epochs=None,flh=flh.copy(),xyz_a=xyz.copy(),
                                           mode=mode)
         obs_crd = wrapper.run()
         return obs_crd
@@ -782,7 +801,7 @@ class TECSession:
             gpsa, gpsb, gala = None, None, None
         else:
             gpsa, gpsb, gala = broadcast.gpsa, broadcast.gpsb, broadcast.gala
-        prc = self.gnss.DDPreprocessing(df=obs, flh=flh.copy(), xyz=xyz.copy(), config=self.config, gpsa=gpsa,
+        prc =  DDPreprocessing(df=obs, flh=flh.copy(), xyz=xyz.copy(), config=self.config, gpsa=gpsa,
                                   gpsb=gpsb, gala=gala, phase_shift_dict=phase_shift, sat_pco=sat_pco, rec_pco=rec_pco,
                                   antenna_h=antenna_h, system=system)
         obs_preprocessed = prc.run()
@@ -804,7 +823,7 @@ class TECSession:
         self.log.debug("Detecting cycle slips with arc max = %s min", self.config.min_arc_len)
 
 
-        detector = self.gnss.CSDetector(obs=obs_df,phase_shift_dict=None,dcb=None,sys=system,mode=mode,
+        detector =  CSDetector(obs=obs_df,phase_shift_dict=None,dcb=None,sys=system,mode=mode,
                                      interval=interval*60)
         obs_df = detector.run(min_arc_lenth=self.config.min_arc_len)
         obs_df = obs_df.reset_index()
@@ -823,7 +842,7 @@ class TECSession:
 
     @staticmethod
     def _import_gnss_api():  # -> ModuleType
-        """Import the supported GNSS backend 'gps_lib'.
+        """Import the supported GNSS backend 'gnx_py'.
 
         Raises:
             ImportError: If the backend is not installed.
@@ -832,12 +851,11 @@ class TECSession:
         import importlib, sys, logging
 
         try:
-            module = importlib.import_module("gps_lib")
-            # (opcjonalnie) alias, jeżeli gdzieś indziej spodziewamy się `import gps`
+            module = importlib.import_module("gnx_py")
             sys.modules.setdefault("gps", module)
             return module
         except ModuleNotFoundError as exc:
-            logging.getLogger(__name__).error("Brak biblioteki 'gps_lib'.")
+            logging.getLogger(__name__).error("Brak biblioteki 'gnx_py'.")
             raise ImportError(
-                "GNSS backend 'gps_lib' nie jest zainstalowany (pip install gps_lib)"
+                "GNSS backend 'gnx_py' nie jest zainstalowany (pip install gnx_py)"
             ) from exc

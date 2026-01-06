@@ -205,40 +205,62 @@ def spherical2ecef(sph):
 
 
 
+import numpy as np
+
 def ecef_to_enu(dXYZ, flh, degrees=True):
     """
     Converts ECEF displacements (dx, dy, dz) to ENU displacements (E, N, U).
 
-    Args:
+    Parameters
+    ----------
+    dXYZ : array-like
+        Shape (3,) or (N, 3)
+    flh : array-like
+        Receiver latitude, longitude, height (only lat, lon used)
+    degrees : bool
+        If True, lat/lon are given in degrees
 
-    Returns:
-
-    np.array: (E, N, U) – displacements in the ENU coordinate system.
+    Returns
+    -------
+    np.ndarray
+        Shape (3,) or (N, 3) – same shape as input
     """
-    # Konwersja kątów na radiany, jeśli podano w stopniach
-    dx, dy, dz = dXYZ
+
+    dXYZ = np.asarray(dXYZ, dtype=float)
+    single_input = dXYZ.ndim == 1
+
+    if single_input:
+        dXYZ = dXYZ.reshape(1, 3)
+
     lat, lon = flh[0], flh[1]
     if degrees:
         lat = np.deg2rad(lat)
         lon = np.deg2rad(lon)
 
-    # Transformacja: macierz obrotu z ECEF do ENU
-    # E = -sin(lon)*dx + cos(lon)*dy
-    # N = -sin(lat)*cos(lon)*dx - sin(lat)*sin(lon)*dy + cos(lat)*dz
-    # U = cos(lat)*cos(lon)*dx + cos(lat)*sin(lon)*dy + sin(lat)*dz
-    E = -np.sin(lon) * dx + np.cos(lon) * dy
-    N = -np.sin(lat) * np.cos(lon) * dx - np.sin(lat) * np.sin(lon) * dy + np.cos(lat) * dz
-    U = np.cos(lat) * np.cos(lon) * dx + np.cos(lat) * np.sin(lon) * dy + np.sin(lat) * dz
-    return np.array([E, N, U])
+    sin_lat, cos_lat = np.sin(lat), np.cos(lat)
+    sin_lon, cos_lon = np.sin(lon), np.cos(lon)
+
+    dx = dXYZ[:, 0]
+    dy = dXYZ[:, 1]
+    dz = dXYZ[:, 2]
+
+    E = -sin_lon * dx + cos_lon * dy
+    N = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
+    U =  cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz
+
+    enu = np.column_stack((E, N, U))
+
+    return enu[0] if single_input else enu
+
 
 
 def enu_to_ecef(dENU, flh, degrees=True):
     """
-    Converts displacements in the ENU coordinate system (E, N, U) to displacements in the ECEF coordinate system (dx, dy, dz).
+    Converts displacements in the ENU coordinate sys (E, N, U) to displacements in the ECEF coordinate sys (dx, dy, dz).
 
     Args:
     Returns:
-    np.array: (dx, dy, dz) – displacements in the ECEF coordinate system.
+    np.array: (dx, dy, dz) – displacements in the ECEF coordinate sys.
     """
     # Konwersja kątów na radiany, jeśli podano w stopniach
     E,N,U = dENU

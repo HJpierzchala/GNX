@@ -1,7 +1,8 @@
-from dataclasses import dataclass
-from typing import Optional, Union, List, Tuple, Literal, Set
+from __future__ import annotations
+from typing import List, Set,Optional, Union, Literal, Dict, Any
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass, field
 
 @dataclass()
 class Config:
@@ -93,82 +94,205 @@ class TECConfig(Config):
     use_iono_rms: Optional[bool] = True,
     skip_sat: Optional[Union[bool, list[str]]] = False
 
+# @dataclass
+# class PPPConfig(Config):
+#     """GNX-py PPP Configuration class"""
+#     # --- positioning parameters
+#     positioning_mode:Optional[Literal['combined','uncombined','single']]= 'combined'
+#
+#     # - ionosphere parameters
+#     use_iono_constr: Optional[bool] = True
+#     use_iono_rms: Optional[bool] = True
+#     sigma_iono_0: Optional[Union[float, int]] = 1.1
+#     sigma_iono_end: Optional[Union[float, int]] = 3.0
+#     t_end: Optional[int] = 30
+#
+#     # --- processing parameters
+#     trace_filter: Optional[bool] = False
+#     reset_every: Optional[int] = 0
+#
+#     # --- Kalman Filter params
+#     # clock process
+#     clock_process: Optional[Literal['RW','WN']]='WN'
+#     # P - prior variances
+#     p_crd: Union[float, int] = 10.0
+#     p_dt: Union[float, int] = 9e9
+#     p_amb: Union[float, int] = 400
+#     p_tro: Union[float, int] = 0.0
+#     # Q - process noise
+#     q_crd: Union[float, int] = 0.0
+#     q_dt: Union[float, int] = 9e9
+#     q_tro: Union[float, int] = 0.00025
+#     q_amb: Union[float, int] = 0.0
+#
+#     # uduc params
+#     p_isb: Union[float, int] = 0.0
+#     q_isb: Union[float, int] = 0.0
+#     p_N: Union[float, int] = 0.0
+#     q_N: Union[float, int] = 0.0
+#
+#     p_iono: Union[float, int] = 0.0
+#     q_iono: Union[float, int] = 0.0
+#
+#     p_dcb: Union[float, int] = 0.0
+#     q_dcb: Union[float, int] = 0.0
+#
+#     def __post_init__(self):
+#         super().__post_init__()
+#         if self.positioning_mode == 'uncombined':
+#             self.p_crd = 100
+#             self.p_dt =1e9
+#             self.p_tro = 2.0
+#             self.p_iono = 3.0
+#             self.p_N = 1e6
+#             self.p_isb = 100
+#             self.p_dcb = 1e2
+#             self.p_amb = 1e6
+#
+#             self.clock_process ='RW'
+#             self.q_dt = 1e9
+#             self.q_tro  = 0.025
+#             self.q_iono = 2.0 # RW model
+#             self.q_N = 0.0
+#             self.q_isb = 1.0
+#             self.q_dcb = 1e-4
+#         if self.positioning_mode == 'single':
+#             self.p_crd = 100
+#             self.p_dt =1e9
+#             self.p_tro = 2.0
+#             self.p_iono = 100
+#             self.p_N = 1e6
+#
+#             self.clock_process ='WN'
+#             self.q_dt = 9e9
+#             self.q_tro  = 0.025
+#             self.q_iono = 25
+#             self.q_N = 0.0
+#
+
+
+
+
+MISSING = object()
+def _merge_preset_with_overrides(preset: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(preset)
+    out.update(overrides)
+    return out
+
+
 @dataclass
 class PPPConfig(Config):
-    """GNX-py PPP Configuration class"""
-    # --- positioning parameters
-    positioning_mode:Optional[Literal['combined','uncombined','single']]= 'combined'
+    """GNX-py PPP Configuration class with mode presets + overrides."""
 
-    # - ionosphere parameters
+    positioning_mode: Literal["combined", "uncombined", "single"] = "combined"
+
+    # iono / processing (zostają jak u Ciebie)
     use_iono_constr: Optional[bool] = True
     use_iono_rms: Optional[bool] = True
     sigma_iono_0: Optional[Union[float, int]] = 1.1
     sigma_iono_end: Optional[Union[float, int]] = 3.0
     t_end: Optional[int] = 30
 
-    # --- processing parameters
     trace_filter: Optional[bool] = False
     reset_every: Optional[int] = 0
 
-    # --- Kalman Filter params
-    # clock process
-    clock_process: Optional[Literal['RW','WN']]='WN'
-    # P - prior variances
-    p_crd: Union[float, int] = 10.0
-    p_dt: Union[float, int] = 9e9
-    p_amb: Union[float, int] = 400
-    p_tro: Union[float, int] = 0.0
-    # Q - process noise
-    q_crd: Union[float, int] = 0.0
-    q_dt: Union[float, int] = 9e9
-    q_tro: Union[float, int] = 0.00025
-    q_amb: Union[float, int] = 0.0
+    # KF params: ustawiamy MISSING, żeby wykryć override od użytkownika
+    clock_process: Any = field(default=MISSING)  # Literal['RW','WN']
+    p_crd: Any = field(default=MISSING)
+    p_dt: Any = field(default=MISSING)
+    p_amb: Any = field(default=MISSING)
+    p_tro: Any = field(default=MISSING)
 
-    # uduc params
-    p_isb: Union[float, int] = 0.0
-    q_isb: Union[float, int] = 0.0
-    p_N: Union[float, int] = 0.0
-    q_N: Union[float, int] = 0.0
+    q_crd: Any = field(default=MISSING)
+    q_dt: Any = field(default=MISSING)
+    q_tro: Any = field(default=MISSING)
+    q_amb: Any = field(default=MISSING)
 
-    p_iono: Union[float, int] = 0.0
-    q_iono: Union[float, int] = 0.0
+    p_isb: Any = field(default=MISSING)
+    q_isb: Any = field(default=MISSING)
+    p_N: Any = field(default=MISSING)
+    q_N: Any = field(default=MISSING)
 
-    p_dcb: Union[float, int] = 0.0
-    q_dcb: Union[float, int] = 0.0
+    p_iono: Any = field(default=MISSING)
+    q_iono: Any = field(default=MISSING)
+
+    p_dcb: Any = field(default=MISSING)
+    q_dcb: Any = field(default=MISSING)
+
+    _overrides: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+
+    _PRESETS: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
+        "combined": {
+            "clock_process": "WN",
+            "p_crd": 10.0, "p_dt": 9e9, "p_amb": 400, "p_tro": 2.0,
+            "q_crd": 0.0,  "q_dt": 9e9, "q_tro": 0.00025, "q_amb": 0.0,
+            "p_isb": 0.0, "q_isb": 0.0, "q_N": 0.0,
+            "p_iono": 0.0, "q_iono": 0.0, "p_dcb": 0.0, "q_dcb": 0.0,
+        },
+        "uncombined": {
+            "clock_process": "RW",
+            "p_crd": 100, "p_dt": 1e9, "p_tro": 2.0, "p_iono": 10,
+             "p_isb": 100, "p_dcb": 1e2, "p_amb": 1e6,
+            "q_crd": 0.0, "q_dt": 1e9, "q_tro": 0.025, "q_iono": 10.0,
+            "q_N": 0.0, "q_isb": 1.0, "q_dcb": 1e-4, "q_amb": 0.0,
+        },
+        "single": {
+            "clock_process": "WN",
+            "p_crd": 100, "p_dt": 1e9, "p_tro": 2.0, "p_iono": 100,
+             "p_amb": 1e6,
+            "q_crd": 0.0, "q_dt": 9e9, "q_tro": 0.025, "q_iono": 10.0,
+            "q_N": 0.0, "q_amb": 0.0,
+            "p_isb": 0.0, "q_isb": 0.0, "p_dcb": 0.0, "q_dcb": 0.0,
+        },
+    }, init=False, repr=False)
 
     def __post_init__(self):
+        # 1) najpierw baza
         super().__post_init__()
-        if self.positioning_mode == 'uncombined':
-            self.p_crd = 100
-            self.p_dt =1e9
-            self.p_tro = 2.0
-            self.p_iono = 1.5
-            self.p_N = 1e6
-            self.p_isb = 100
-            self.p_dcb = 1e2
 
-            self.clock_process ='RW'
-            self.q_dt = 1e9
-            self.q_tro  = 0.025
-            self.q_iono = 2.0 # RW model
-            self.q_N = 0.0
-            self.q_isb = 1.0
-            self.q_dcb = 1e-4
-        if self.positioning_mode == 'single':
-            self.p_crd = 100
-            self.p_dt =1e9
-            self.p_tro = 2.0
-            self.p_iono = 100
-            self.p_N = 1e6
+        # 2) zbierz override'y przekazane w konstruktorze
+        for k in self._preset_keys():
+            v = getattr(self, k)
+            if v is not MISSING:
+                self._overrides[k] = v
 
-            self.clock_process ='WN'
-            self.q_dt = 9e9
-            self.q_tro  = 0.025
-            self.q_iono = 25
-            self.q_N = 0.0
+        # 3) ustaw effective (preset + overrides)
+        self._apply_effective_to_self()
 
+    # -------- public API --------
+    def set_mode(self, mode: Literal["combined", "uncombined", "single"], keep_overrides: bool = True) -> None:
+        self.positioning_mode = mode
+        if not keep_overrides:
+            self._overrides.clear()
+        self._apply_effective_to_self()
 
+    def set_param(self, **kwargs: Any) -> None:
+        for k, v in kwargs.items():
+            if k not in self._preset_keys():
+                raise KeyError(f"Unknown/unsupported param: {k}")
+            self._overrides[k] = v
+        self._apply_effective_to_self()
 
+    def clear_override(self, *keys: str) -> None:
+        for k in keys:
+            self._overrides.pop(k, None)
+        self._apply_effective_to_self()
+
+    def effective(self) -> Dict[str, Any]:
+        preset = self._PRESETS[self.positioning_mode]
+        return _merge_preset_with_overrides(preset, self._overrides)
+
+    # -------- internals --------
+    def _preset_keys(self) -> set[str]:
+        keys = set()
+        for p in self._PRESETS.values():
+            keys |= set(p.keys())
+        return keys
+
+    def _apply_effective_to_self(self) -> None:
+        eff = self.effective()
+        for k, v in eff.items():
+            setattr(self, k, v)
 
 
 

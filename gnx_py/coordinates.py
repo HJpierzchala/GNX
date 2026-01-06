@@ -4,7 +4,7 @@ import math
 import warnings
 import numpy as np
 import pandas as pd
-import gps_lib.time
+import gnx_py.time
 from .utils import calculate_distance
 from typing import Optional, Union
 
@@ -664,12 +664,36 @@ class CrdWrapper:
         df['ev'] = np.rad2deg(ev)
         return df
 
+    # def correct_crd(self):
+    #     xyz= self.obs[['x', 'y', 'z']].to_numpy()
+    #     xyze = np.array(list(map(lambda row: correct_sat_coordinates(row,xyz_a=self.xyz_a),xyz)))
+    #     xyze = pd.DataFrame(index=self.obs.index,data={'xe':xyze[:,0],'ye':xyze[:,1],'ze':xyze[:,2]})
+    #     self.obs[['xe_ur', 'ye_ur','ze_ur']] = self.obs[['x', 'y', 'z']].copy()
+    #     self.obs[['xe', 'ye', 'ze']] = xyze
+    #     return self.obs
     def correct_crd(self):
-        xyz= self.obs[['x', 'y', 'z']].to_numpy()
-        xyze = np.array(list(map(lambda row: correct_sat_coordinates(row,xyz_a=self.xyz_a),xyz)))
-        xyze = pd.DataFrame(index=self.obs.index,data={'xe':xyze[:,0],'ye':xyze[:,1],'ze':xyze[:,2]})
-        self.obs[['xe_ur', 'ye_ur','ze_ur']] = self.obs[['x', 'y', 'z']].copy()
-        self.obs[['xe', 'ye', 'ze']] = xyze
+        xyz = self.obs[['x', 'y', 'z']].to_numpy(dtype=np.float64, copy=False)
+        a = np.asarray(self.xyz_a, dtype=np.float64)
+
+        dx = xyz[:, 0] - a[0]
+        dy = xyz[:, 1] - a[1]
+        dz = xyz[:, 2] - a[2]
+
+        c = 299792458.0
+        omega = 7.2921159e-5
+
+        dT = np.sqrt(dx * dx + dy * dy + dz * dz) / c
+        omw = dT * omega
+
+        cos0 = np.cos(omw)
+        sin0 = np.sin(omw)
+
+        xe = cos0 * xyz[:, 0] + sin0 * xyz[:, 1]
+        ye = -sin0 * xyz[:, 0] + cos0 * xyz[:, 1]
+        ze = xyz[:, 2]
+
+        self.obs[['xe_ur', 'ye_ur', 'ze_ur']] = self.obs[['x', 'y', 'z']].to_numpy(copy=True)
+        self.obs[['xe', 'ye', 'ze']] = np.column_stack((xe, ye, ze))
         return self.obs
 
     def get_emission_epochs(self):
@@ -711,7 +735,7 @@ def emission_interp(obs, crd, prev_sp3_df, sp3_df, next_sp3_df):
     Łączy dane obserwacyjne z interpolowanymi współrzędnymi.
     Funkcja pozostaje bez zmian, poza tym że wykorzystuje zoptymalizowaną
     wersję interpolatora (SP3CustomInterpolator) do obliczeń.
-    :param obs - dataframe z obserwacjami (jeden system)
+    :param obs - dataframe z obserwacjami (jeden sys)
     :param crd - dataframe z pozycjami satelitow (wszystkie systemy)
     :param prev_sp3_df: dataframe z dnia poprzedniego
     :param next_sp3_df: dataframe z dnia nastepnego
@@ -785,7 +809,7 @@ def make_ionofree(obs_df,  mode,sys='G'):
         c7 = [c for c in obs_df.columns if c.startswith('C7')][0]
         obs_df['P3'] = K1 * obs_df[c1] - K2 * obs_df[c7]
     # else:
-    #     raise NotImplementedError('Unknown system!')
+    #     raise NotImplementedError('Unknown sys!')
 
 
 def eccentric_anomaly(mk, e, pi):
@@ -1133,6 +1157,627 @@ def gal_numpy_broadcast_interpolation(message_toc, observation_toc, message, wit
         return np.array([x, y, z, dt]), np.array([x_dot, y_dot, z_dot, dt_dot])
 
 
+
+def _wrap_dist_sow(a_sow: np.ndarray, b_sow: np.ndarray) -> np.ndarray:
+    d = np.abs(a_sow[:, None] - b_sow[None, :])
+    return np.minimum(d, WEEK - d)
+
+def _wrap_signed(t):
+    return (t + WEEK/2) % WEEK - WEEK/2
+
+
+def _ensure_obs_block(df_obs, sv_hint=None):
+    """
+        Returns df with columns 'sv','time','toc' (without messing with df.columns!).
+        Accepts both MultiIndex (sv,time) and regular index.
+        """
+    if not isinstance(df_obs, pd.DataFrame):
+        df_obs = pd.DataFrame(df_obs)
+
+    if ('sv' not in df_obs.columns) or ('time' not in df_obs.columns):
+        df_obs = df_obs.reset_index()
+    if 'sv' not in df_obs.columns and sv_hint is not None:
+        df_obs['sv'] = sv_hint
+    if 'toc' not in df_obs.columns:
+        raise ValueError("df_obs must have 'toc' column.")
+
+    return df_obs[['sv','time','toc']].copy()
+
+
+def _ensure_nav_block(df_orb, sv_hint=None):
+    """
+        Returns df with columns NAV + 'sv','time','Toe','nav_toc' (without messing with df.columns!).
+        """
+    if not isinstance(df_orb, pd.DataFrame):
+        df_orb = pd.DataFrame(df_orb)
+
+    if ('sv' not in df_orb.columns) or ('time' not in df_orb.columns):
+        df_orb = df_orb.reset_index()
+    if 'sv' not in df_orb.columns and sv_hint is not None:
+        df_orb['sv'] = sv_hint
+
+    need = ['sv','time','Toe','nav_toc']
+    miss = [c for c in need if c not in df_orb.columns]
+    if miss:
+        raise ValueError(f"df_orb missing columns: {miss} (make sure _add_nav_toc() was already there).")
+
+    return df_orb.copy()
+import numpy as np
+import pandas as pd
+
+
+def _prep_nav_arrays(system: str, nav_block: pd.DataFrame):
+    """
+    Prepare nav arrays + iloc mapping (so we can filter and still return indices
+    compatible with nav_block.iloc[...] later).
+    """
+    toe = nav_block['Toe'].to_numpy(float)
+    trans = pd.to_datetime(nav_block['TransTime']) if 'TransTime' in nav_block.columns else None
+
+    if 'SISA' in nav_block.columns:
+        quality = nav_block['SISA'].to_numpy(float)
+    elif 'SVacc' in nav_block.columns:
+        quality = nav_block['SVacc'].to_numpy(float)
+    else:
+        quality = np.zeros_like(toe, dtype=float)
+
+    orig_iloc = np.arange(len(nav_block), dtype=int)
+
+    # GPS health filter (keep only healthy)
+    if system == 'G' and 'health' in nav_block.columns:
+        good = (nav_block['health'].to_numpy() == 0)
+        toe = toe[good]
+        quality = quality[good]
+        orig_iloc = orig_iloc[good]
+        if trans is not None:
+            trans = trans.iloc[good].reset_index(drop=True)
+
+    return toe, trans, quality, orig_iloc
+
+
+def _pick_nav_rows_pref_future_else_past_with_hold(
+    system: str,
+    toc_vec: np.ndarray,
+    nav_block: pd.DataFrame,
+    hold_sec: float = None,
+    switch_thresh_sec: float = 900.0,
+    nearest_h: float | None = None,
+) -> np.ndarray:
+    """
+    GPS-friendly hybrid:
+      1) prefer FUTURE:   -valid_h <= age <= 0
+      2) fallback PAST:    0 <= age <= valid_h
+      3) fallback NEAREST: |age| <= nearest_h (default=valid_h), otherwise any
+
+    Stickiness (hold) + thresholding as before.
+
+    age := wrap_signed(toc - Toe):
+      age < 0  -> Toe in FUTURE
+      age > 0  -> Toe in PAST
+    """
+    valid_h = 14400.0 if system == 'E' else 7200.0
+    if hold_sec is None:
+        hold_sec = 3600.0 if system == 'G' else 7200.0
+    if nearest_h is None:
+        nearest_h = valid_h
+
+    toe, trans, quality, orig_iloc = _prep_nav_arrays(system, nav_block)
+
+    N = len(toc_vec)
+    choice = np.full(N, -1, dtype=int)
+    if len(toe) == 0:
+        return choice
+
+    age = _wrap_signed(toc_vec[:, None] - toe[None, :])  # [N, M]
+
+    future_mask = (age <= 0.0) & (age >= -valid_h)
+    past_mask   = (age >= 0.0) & (age <=  valid_h)
+    near_mask   = (np.abs(age) <= nearest_h)
+
+    def _tiebreak(idxs: np.ndarray):
+        if len(idxs) == 1 or trans is None:
+            return idxs[0]
+        latest_t = trans.iloc[idxs].values
+        tmax = latest_t.max()
+        idxs2 = idxs[latest_t == tmax]
+        if len(idxs2) == 1:
+            return idxs2[0]
+        q = quality[idxs2]
+        return idxs2[np.argmin(q)]
+
+    def pick_best(i: int):
+        # 1) future: pick closest future (max age, i.e. closest to 0 from below)
+        m = future_mask[i]
+        if m.any():
+            best_age = np.max(age[i, m])
+            idxs = np.flatnonzero(m & (np.abs(age[i] - best_age) < 1e-9))
+            return _tiebreak(idxs), 'future'
+
+        # 2) past: pick freshest past (min age)
+        m = past_mask[i]
+        if m.any():
+            best_age = np.min(age[i, m])
+            idxs = np.flatnonzero(m & (np.abs(age[i] - best_age) < 1e-9))
+            return _tiebreak(idxs), 'past'
+
+        # 3) nearest: minimal |age| (prefer in-window near_mask; if empty, use all)
+        m = near_mask[i]
+        if not m.any():
+            m = np.ones(age.shape[1], dtype=bool)
+        best_abs = np.min(np.abs(age[i, m]))
+        idxs = np.flatnonzero(m & (np.abs(np.abs(age[i]) - best_abs) < 1e-9))
+        return _tiebreak(idxs), 'nearest'
+
+    i0_idx, _ = pick_best(0)
+    if i0_idx < 0:
+        return choice
+    cur_fidx = i0_idx
+    cur_toe = toe[cur_fidx]
+    cur_start_toc = toc_vec[0]
+    choice[0] = orig_iloc[cur_fidx]
+
+    for i in range(1, N):
+        # if current went missing (shouldn't), re-pick
+        if cur_fidx < 0:
+            fidx, _ = pick_best(i)
+            cur_fidx = fidx
+            if cur_fidx >= 0:
+                cur_toe = toe[cur_fidx]
+                cur_start_toc = toc_vec[i]
+                choice[i] = orig_iloc[cur_fidx]
+            continue
+
+        cur_age = _wrap_signed(toc_vec[i] - cur_toe)
+        still_valid = (np.abs(cur_age) <= valid_h)  # “reasonable” validity
+        if not still_valid:
+            fidx, _ = pick_best(i)
+            cur_fidx = fidx
+            if cur_fidx >= 0:
+                cur_toe = toe[cur_fidx]
+                cur_start_toc = toc_vec[i]
+                choice[i] = orig_iloc[cur_fidx]
+            continue
+
+        elapsed_hold = _wrap_signed(toc_vec[i] - cur_start_toc)
+        if elapsed_hold < hold_sec:
+            choice[i] = orig_iloc[cur_fidx]
+            continue
+
+        cand_fidx, cand_kind = pick_best(i)
+        if cand_fidx < 0:
+            choice[i] = orig_iloc[cur_fidx]
+            continue
+
+        cand_age = age[i, cand_fidx]
+
+        # Decide if switch is worth it: compare absolute closeness to zero
+        gain = (abs(cur_age) - abs(cand_age))
+
+        # If we were forced into fallback (e.g., future->past after 22:00),
+        # we still keep the same switching rule; it naturally switches once.
+        if gain >= switch_thresh_sec:
+            cur_fidx = cand_fidx
+            cur_toe = toe[cur_fidx]
+            cur_start_toc = toc_vec[i]
+            choice[i] = orig_iloc[cur_fidx]
+        else:
+            choice[i] = orig_iloc[cur_fidx]
+
+    return choice
+
+
+def _pick_nav_rows_pref_past_else_future_with_hold(
+    system: str,
+    toc_vec: np.ndarray,
+    nav_block: pd.DataFrame,
+    hold_sec: float = None,
+    switch_thresh_sec: float = 900.0,
+    nearest_h: float | None = None,
+) -> np.ndarray:
+    """
+    Galileo-friendly hybrid:
+      1) prefer PAST
+      2) fallback FUTURE
+      3) fallback NEAREST
+    """
+    valid_h = 14400.0 if system == 'E' else 7200.0
+    if hold_sec is None:
+        hold_sec = 10800.0 if system == 'E' else 3600.0
+    if nearest_h is None:
+        nearest_h = valid_h
+
+    toe, trans, quality, orig_iloc = _prep_nav_arrays(system, nav_block)
+
+    N = len(toc_vec)
+    choice = np.full(N, -1, dtype=int)
+    if len(toe) == 0:
+        return choice
+
+    age = _wrap_signed(toc_vec[:, None] - toe[None, :])  # [N, M]
+
+    past_mask   = (age >= 0.0) & (age <=  valid_h)
+    future_mask = (age <= 0.0) & (age >= -valid_h)
+    near_mask   = (np.abs(age) <= nearest_h)
+
+    def _tiebreak(idxs: np.ndarray):
+        if len(idxs) == 1 or trans is None:
+            return idxs[0]
+        latest_t = trans.iloc[idxs].values
+        tmax = latest_t.max()
+        idxs2 = idxs[latest_t == tmax]
+        if len(idxs2) == 1:
+            return idxs2[0]
+        q = quality[idxs2]
+        return idxs2[np.argmin(q)]
+
+    def pick_best(i: int):
+        # 1) past: freshest past (min age)
+        m = past_mask[i]
+        if m.any():
+            best_age = np.min(age[i, m])
+            idxs = np.flatnonzero(m & (np.abs(age[i] - best_age) < 1e-9))
+            return _tiebreak(idxs), 'past'
+
+        # 2) future: closest future (max age)
+        m = future_mask[i]
+        if m.any():
+            best_age = np.max(age[i, m])
+            idxs = np.flatnonzero(m & (np.abs(age[i] - best_age) < 1e-9))
+            return _tiebreak(idxs), 'future'
+
+        # 3) nearest: minimal |age|
+        m = near_mask[i]
+        if not m.any():
+            m = np.ones(age.shape[1], dtype=bool)
+        best_abs = np.min(np.abs(age[i, m]))
+        idxs = np.flatnonzero(m & (np.abs(np.abs(age[i]) - best_abs) < 1e-9))
+        return _tiebreak(idxs), 'nearest'
+
+    f0, _ = pick_best(0)
+    if f0 < 0:
+        return choice
+    cur_fidx = f0
+    cur_toe = toe[cur_fidx]
+    cur_start_toc = toc_vec[0]
+    choice[0] = orig_iloc[cur_fidx]
+
+    for i in range(1, N):
+        if cur_fidx < 0:
+            fidx, _ = pick_best(i)
+            cur_fidx = fidx
+            if cur_fidx >= 0:
+                cur_toe = toe[cur_fidx]
+                cur_start_toc = toc_vec[i]
+                choice[i] = orig_iloc[cur_fidx]
+            continue
+
+        cur_age = _wrap_signed(toc_vec[i] - cur_toe)
+        still_valid = (np.abs(cur_age) <= valid_h)
+        if not still_valid:
+            fidx, _ = pick_best(i)
+            cur_fidx = fidx
+            if cur_fidx >= 0:
+                cur_toe = toe[cur_fidx]
+                cur_start_toc = toc_vec[i]
+                choice[i] = orig_iloc[cur_fidx]
+            continue
+
+        elapsed_hold = _wrap_signed(toc_vec[i] - cur_start_toc)
+        if elapsed_hold < hold_sec:
+            choice[i] = orig_iloc[cur_fidx]
+            continue
+
+        cand_fidx, _ = pick_best(i)
+        if cand_fidx < 0:
+            choice[i] = orig_iloc[cur_fidx]
+            continue
+
+        cand_age = age[i, cand_fidx]
+        gain = (abs(cur_age) - abs(cand_age))
+        if gain >= switch_thresh_sec:
+            cur_fidx = cand_fidx
+            cur_toe = toe[cur_fidx]
+            cur_start_toc = toc_vec[i]
+            choice[i] = orig_iloc[cur_fidx]
+        else:
+            choice[i] = orig_iloc[cur_fidx]
+
+    return choice
+
+
+def _select_by_toe_for_sat(system, obs_sv, nav_sv, picker='_gps_pref_future'):
+    toc_vec = obs_sv['toc'].to_numpy(float)
+
+    if picker == '_gps_pref_future':
+        choice = _pick_nav_rows_pref_future_else_past_with_hold(
+            system=system,
+            toc_vec=toc_vec,
+            nav_block=nav_sv,
+            hold_sec=(30 * 60),
+            switch_thresh_sec=900.0,
+            nearest_h=None,
+        )
+    elif picker == '_gal_pref_past':
+        choice = _pick_nav_rows_pref_past_else_future_with_hold(
+            system=system,
+            toc_vec=toc_vec,
+            nav_block=nav_sv,
+            hold_sec=(30 * 60),
+            switch_thresh_sec=900.0,
+            nearest_h=None,
+        )
+    else:
+        raise ValueError(f"Unknown picker: {picker}")
+
+    keep = choice >= 0
+    if not keep.any():
+        return pd.DataFrame()
+
+    nav_sel = nav_sv.iloc[choice[keep]].copy()
+    obs_sel = obs_sv.loc[keep].copy()
+
+    nav_sel['sv'] = obs_sel['sv'].values
+    nav_sel['time'] = obs_sel['time'].values
+
+    merged = pd.concat(
+        [obs_sel.reset_index(drop=True),
+         nav_sel.reset_index(drop=True)], axis=1
+    )
+    return merged
+
+class BrdcGenerator:
+    mes_cols = [
+        'SVclockBias', 'SVclockDrift', 'SVclockDriftRate', 'IODE', 'Crs', 'DeltaN', 'M0',
+        'Cuc', 'Eccentricity', 'Cus', 'sqrtA', 'Toe', 'Cic', 'Omega0', 'Cis',
+        'Io', 'Crc', 'omega', 'OmegaDot', 'IDOT', 'CodesL2', 'GPSWeek',
+        'L2Pflag', 'SVacc', 'health', 'TGD', 'IODC', 'TransTime'
+    ]
+    gal_mes_cols = ['SVclockBias', 'SVclockDrift', 'SVclockDriftRate', 'IODnav', 'Crs',
+                    'DeltaN', 'M0', 'Cuc', 'Eccentricity', 'Cus', 'sqrtA', 'Toe', 'Cic',
+                    'Omega0', 'Cis', 'Io', 'Crc', 'omega', 'OmegaDot', 'IDOT', 'DataSrc',
+                    'GALWeek', 'SISA', 'health', 'BGDe5a', 'BGDe5b', 'TransTime']
+
+    def __init__(self, system, interval, mode, nav, tolerance ='1H'):
+        self.sys = system
+        self.interval = interval
+        self.mode = mode
+        self.nav = nav
+        self.SEC_TO_FREQ = {
+            1: "1s",
+            2: "2s",
+            5: "5s",
+            10: "10s",
+            15: "15s",
+            30: "30s",
+            60: "1T",  # 1 minuta
+            120: "2T",
+            300: "5T",
+            600: "10T",
+            900: "15T",
+            1800: "30T",
+            3600: "1H",  # 1 godzina
+            7200: "2H",
+            10800: "3H",
+            21600: "6H",
+            43200: "12H",
+            86400: "1D"  # 1 doba
+        }
+        self.table = None
+        self.tolerance = tolerance
+
+    def _add_obs_toc(self):
+        obs_toc = gnx_py.time.datetime2toc(t=self.table.index.get_level_values('time').tolist())
+        self.table['toc'] = obs_toc
+
+    def _add_nav_toc(self):
+        nav_toc = gnx_py.time.datetime2toc(t=self.nav.index.get_level_values('time').tolist())
+        self.nav['nav_toc'] = nav_toc
+
+    def _clear_suffixes(self, df):
+        df = df.reset_index().copy()
+        df['prn'] = df.apply(lambda row: row['sv'][:3], axis=1)
+        df = df.drop(columns='sv')
+        df.set_index(['prn', 'time'], inplace=True)
+        df.index.names = ['sv', 'time']
+        return df
+
+    def select_messages(self, df_obs: pd.DataFrame, df_orb: pd.DataFrame) -> pd.DataFrame:
+        """
+                New broadcast selection:
+                - operates via satellite,
+                - selects based on minimum |toc_obs - Toe| (SOW) with wrapping,
+                - applies RTKLIB validity windows (GPS=2h, GAL=4h) validity windows and health filters,
+                - resolves ties by TransTime and quality (SISA/SVacc).
+                Returns a DataFrame joined 1:1 with epochs, but only for those for which
+                we found a valid ephemeris; no "forward/nearest" after 'time'.
+                """
+        # Upewnij się, że mamy 'toc' w df_obs i 'nav_toc' w df_orb (dodajesz je wyżej w pipeline)
+        if 'toc' not in df_obs.columns:
+            raise ValueError("df_obs must contain 'toc' (seconds-of-week); call _add_obs_toc() first.")
+        if 'nav_toc' not in df_orb.columns:
+            raise ValueError("df_orb must contain 'nav_toc' (seconds-of-week); call _add_nav_toc() first.")
+        if 'Toe' not in df_orb.columns:
+            raise ValueError("df_orb must contain 'Toe' (seconds-of-week).")
+
+        out_list = []
+        for sv, obs_sv in df_obs.groupby('sv', sort=False):
+            try:
+                nav_sv = df_orb[df_orb['sv'] == sv]
+                if nav_sv.empty:
+                    continue
+                if self.sys == 'G':
+                    picker = '_gps_pref_future'  # prefer future, fallback past (np. po 22), fallback nearest
+                else:
+                    picker = '_gal_pref_past'  # prefer past, fallback future, fallback nearest
+                sel = _select_by_toe_for_sat(self.sys, obs_sv, nav_sv, picker)
+
+                if not sel.empty:
+                    out_list.append(sel)
+            except Exception as e:
+                print(f"[select_messages] {sv}: {e}")
+                continue
+        if not out_list:
+            return pd.DataFrame()
+        merged = pd.concat(out_list, ignore_index=False)
+        if '__rank__' in merged.columns:
+            merged = merged.drop(columns='__rank__')
+        return merged
+
+    def prepare_table(self):
+        freq = self.SEC_TO_FREQ[self.interval]
+        if self.sys == 'G':
+            sats_av = self.nav.index.get_level_values('sv').unique().tolist()
+        elif self.sys == 'E':
+            self.nav = self._clear_suffixes(df=self.nav)
+
+            if self.mode == 'E1':
+                war =(self.nav['I/NAV_E1-B']==True)& (self.nav['dt_E5b_E1'] == True)
+                self.nav = self.nav[war]
+
+            elif self.mode == 'E5b':
+                war = (self.nav['I/NAV_E1-B'] == True) & (self.nav['dt_E5b_E1'] == True) & (
+                            self.nav['E5b_SHS'].isin([0, 2]) & (self.nav['E5b_DVS'] == 0))
+                self.nav = self.nav[war]
+            elif self.mode == 'E1E5b':
+                war = (self.nav['I/NAV_E1-B'] == True) & (self.nav['dt_E5b_E1'] == True) & (
+                        self.nav['E5b_SHS'].isin([0, 2]) & (self.nav['E5b_DVS'] == 0))
+                self.nav = self.nav[war]
+            elif self.mode in ['E5a','E1E5a']:
+                war = (self.nav['F/NAV_E5a-I']==True)& (self.nav['dt_E5a_E1'] == True) & (
+                        self.nav['E5a_SHS'].isin([0, 2]) & (self.nav['E5a_DVS'] == 0))
+                self.nav = self.nav[war]
+            sats_av = self.nav.index.get_level_values('sv').unique().tolist()
+        t0 = sorted(self.nav.index.get_level_values('time').unique().tolist())[0].floor(freq='min')
+        t1 = sorted(self.nav.index.get_level_values('time').unique().tolist())[-1].floor(freq='min')
+        idx = pd.MultiIndex.from_product(
+            [sats_av, pd.date_range(t0, t1, freq=freq)],
+            names=["sv", "time"])
+        self.table = pd.DataFrame(index=idx)
+
+    def get_coordinates(self):
+        output = []
+        for sv, df_obs_grp in self.table.groupby('sv'):
+            try:
+                # OBS
+                df_obs_block = _ensure_obs_block(df_obs_grp, sv_hint=sv)
+
+                # NAV
+                df_orb_sv = self.nav.loc[sv]
+                df_orb_block = _ensure_nav_block(df_orb_sv, sv_hint=sv)
+
+                merged = self.select_messages(df_obs_block, df_orb_block)
+                if merged is None or merged.empty:
+                    try:
+                        toe = _ensure_nav_block(df_orb_sv, sv_hint=sv)['Toe'].to_numpy(float)
+                        toc = _ensure_obs_block(df_obs_grp, sv_hint=sv)['toc'].to_numpy(float)
+                        D = _wrap_dist_sow(toc, toe) if toe.size and toc.size else None
+                        min_d = np.min(D, axis=1) if D is not None else np.array([])
+                        within = np.sum(min_d <= (7200.0 if self.sys == 'G' else 14400.0)) if min_d.size else 0
+                        print(f"[diag] {sv}: epochs={len(toc)}, NAV={len(toe)}, in_window={within}")
+                    except Exception:
+                        pass
+                    continue
+
+                if merged is None or merged.empty:
+                    continue
+
+                # Przygotowanie do interpolacji
+                mes_toc = merged['nav_toc'].to_numpy(dtype=float)
+                obs_toc = merged['toc'].to_numpy(dtype=float)
+
+                if self.sys == 'E':
+                    needed = self.gal_mes_cols
+                    interp_fun = gal_numpy_broadcast_interpolation
+                elif self.sys == 'G':
+                    needed = self.mes_cols
+                    interp_fun = numpy_broadcast_interpolation
+                else:
+                    raise ValueError(f"Unknown sys: {self.sys}")
+
+                # Na wszelki wypadek: sprawdź, czy wszystkie kolumny istnieją
+                missing = [c for c in needed if c not in merged.columns]
+                if missing:
+                    raise ValueError(f"NAV columns are missing in merged: {missing}")
+
+                # Wymuś float i kształt (N, K)
+                messages = merged[needed].to_numpy(dtype=float, copy=True)
+                if messages.ndim != 2:
+                    raise ValueError(f"messages has the wrong dimension: {messages.ndim}")
+
+                rows = []
+                bad_rows = 0
+                for mt, ot, msg in zip(mes_toc, obs_toc, messages):
+                    try:
+                        res = interp_fun(mt, ot, msg)
+
+                        if isinstance(res, (tuple, list)):
+                            a = np.atleast_1d(res[0]).astype(float).ravel()
+                            b = np.atleast_1d(res[1]).astype(float).ravel()
+                            row = np.concatenate([a, b], axis=0)
+                        else:
+                            row = np.atleast_1d(res).astype(float).ravel()
+
+                        rows.append(row)
+                    except Exception:
+                        bad_rows += 1
+                        rows.append(None)
+                        continue
+
+                if any(r is None for r in rows):
+                    keep_mask = np.array([r is not None for r in rows])
+                    rows = [r for r in rows if r is not None]
+                    merged = merged.loc[keep_mask].copy()
+                    mes_toc = mes_toc[keep_mask]
+                    obs_toc = obs_toc[keep_mask]
+
+                if not rows:
+                    continue
+
+                unique_lengths = {len(r) for r in rows}
+                if len(unique_lengths) != 1:
+                    # jeżeli masz mieszankę 8/9 itp. – dopełnij do maksymalnej długości zerami
+                    maxlen = max(unique_lengths)
+                    rows = [np.pad(r, (0, maxlen - len(r)), mode='constant') for r in rows]
+
+                crd = np.vstack(rows)
+
+                cols8 = ['x', 'y', 'z', 'clk', 'vx', 'vy', 'vz', 'clk_dot']
+                cols9 = ['x', 'y', 'z', 'clk', 'clk_rel', 'vx', 'vy', 'vz', 'clk_dot']
+                cols = cols8 if crd.shape[1] == 8 else (
+                    cols9 if crd.shape[1] == 9 else [f'c{i}' for i in range(crd.shape[1])])
+
+                merged = merged.loc[:,~merged.columns.duplicated()]
+                merged = merged.set_index(['sv', 'time'])
+
+                crd = pd.DataFrame(crd, index=merged.index, columns=cols)
+
+                output.append(merged.join(crd))
+
+
+
+
+            except Exception as e:
+                try:
+                    print(
+                        f"For sv: {sv} | obs_cols={list(df_obs_grp.columns) if hasattr(df_obs_grp, 'columns') else 'n/a'} "
+                        f"| nav_cols={list(self.nav.columns) if hasattr(self.nav, 'columns') else 'n/a'}")
+                except Exception:
+                    pass
+                print('For sv: ', sv, e)
+                continue
+
+        if not output:
+            raise ValueError("No ephemeris selected for all SVs (check validity windows, health and 'nav_toc').")
+        return pd.concat(output)
+
+    def generate(self):
+        self.prepare_table()
+        self._add_obs_toc()
+        self._add_nav_toc()
+        crd = self.get_coordinates()
+        return crd
+
+
 class BroadcastInterp:
     mes_cols = [
         'SVclockBias', 'SVclockDrift', 'SVclockDriftRate', 'IODE', 'Crs', 'DeltaN', 'M0',
@@ -1163,15 +1808,15 @@ class BroadcastInterp:
 
     def _add_obs_toc(self, emission=False):
         if emission:
-            obs_toc = gps_lib.time.datetime2toc(t=self.obs['em_epoch'].tolist())
+            obs_toc = gnx_py.time.datetime2toc(t=self.obs['em_epoch'].tolist())
             self.obs['toc'] = obs_toc
         else:
-            obs_toc = gps_lib.time.datetime2toc(t=self.obs.index.get_level_values('time').tolist())
+            obs_toc = gnx_py.time.datetime2toc(t=self.obs.index.get_level_values('time').tolist())
             self.obs['toc'] = obs_toc
         return self.obs
 
     def _add_nav_toc(self):
-        nav_toc = gps_lib.time.datetime2toc(t=self.nav.index.get_level_values('time').tolist())
+        nav_toc = gnx_py.time.datetime2toc(t=self.nav.index.get_level_values('time').tolist())
         self.nav['nav_toc'] = nav_toc
         return self.nav
 
@@ -1201,10 +1846,11 @@ class BroadcastInterp:
                 if nav_sv.empty:
                     continue
                 if self.sys == 'G':
-                    picker = '_future_hold'
+                    picker = '_gps_pref_future'  # prefer future, fallback past (np. po 22), fallback nearest
                 else:
-                    picker = '_past_hold'
+                    picker = '_gal_pref_past'  # prefer past, fallback future, fallback nearest
                 sel = _select_by_toe_for_sat(self.sys, obs_sv, nav_sv, picker)
+
                 if not sel.empty:
                     out_list.append(sel)
             except Exception as e:
@@ -1255,7 +1901,7 @@ class BroadcastInterp:
                     needed = self.mes_cols
                     interp_fun = numpy_broadcast_interpolation
                 else:
-                    raise ValueError(f"Unknown system: {self.sys}")
+                    raise ValueError(f"Unknown sys: {self.sys}")
 
                 missing = [c for c in needed if c not in merged.columns]
                 if missing:
@@ -1398,578 +2044,6 @@ class BroadcastInterp:
         return output
 
 
-
-
-def _wrap_dist_sow(a_sow: np.ndarray, b_sow: np.ndarray) -> np.ndarray:
-    d = np.abs(a_sow[:, None] - b_sow[None, :])
-    return np.minimum(d, WEEK - d)
-
-def _wrap_signed(t):
-    return (t + WEEK/2) % WEEK - WEEK/2
-
-
-
-
-def _pick_nav_rows_past_with_hold(
-    system: str,
-    toc_vec: np.ndarray,
-    nav_block: pd.DataFrame,
-    hold_sec: float = None,
-    switch_thresh_sec: float = 900.0
-) -> np.ndarray:
-    """
-        Selection of GAL/GPS messages with preference 'from the past' + stickiness (hold).
-        - We do not switch messages more often than every hold_sec,
-        - We switch earlier only if the new message gives a visible benefit: age_gain >= switch_thresh_sec,
-        - We always switch when the old message goes out of the validity window.
-
-        Good values:
-            GPS:  valid_h =  7200 s,  hold_sec ~ 3600–5400 s,  switch_thresh_sec ~ 600–900 s
-            GAL:  valid_h = 14400 s,  hold_sec ~ 7200–10800 s, switch_thresh_sec ~ 900–1800 s
-    """
-    # GAL 14400 10800
-    valid_h = 14400.0 if system == 'E' else 2*3600 # 7200
-    if hold_sec is None:
-        hold_sec = 10800.0 if system == 'E' else 3600  # sensowne domyślne
-
-    toe = nav_block['Toe'].to_numpy(float)                    # [M]
-    trans = pd.to_datetime(nav_block['TransTime']) if 'TransTime' in nav_block.columns else None
-    if 'SISA' in nav_block.columns:
-        quality = nav_block['SISA'].to_numpy(float)
-    elif 'SVacc' in nav_block.columns:
-        quality = nav_block['SVacc'].to_numpy(float)
-
-    else:
-        quality = np.zeros_like(toe, dtype=float)
-    if system=='G' and 'health' in nav_block.columns:
-        quality=nav_block[nav_block['health']==0]
-    # signed age: ile czasu minęło od Toe do toc
-    age = _wrap_signed(toc_vec[:, None] - toe[None, :])       # [N, M]
-    valid = (age >= 0.0) & (age <= valid_h)
-
-    N, M = age.shape
-    choice = np.full(N, -1, dtype=int)
-
-    def pick_freshest(i_mask, i):
-        if not i_mask.any():
-            return -1
-        min_age = np.min(age[i, i_mask])
-        mask_age = i_mask & (np.abs(age[i] - min_age) < 1e-9)
-        if mask_age.sum() == 1 or trans is None:
-            return np.flatnonzero(mask_age)[0]
-        idxs = np.flatnonzero(mask_age)
-        latest_t = trans.iloc[idxs].values
-        tmax = latest_t.max()
-        idxs = idxs[latest_t == tmax]
-        if len(idxs) == 1:
-            return idxs[0]
-        q = quality[idxs]
-        return idxs[np.argmin(q)]
-
-    i = 0
-    mask0 = valid[0]
-    cur_idx = pick_freshest(mask0, 0)
-    choice[0] = cur_idx
-    if cur_idx < 0:
-        pass
-    else:
-        cur_toe = toe[cur_idx]
-        cur_start_toc = toc_vec[0]
-
-    for i in range(1, N):
-        i_mask = valid[i]
-        if cur_idx < 0:
-            cur_idx = pick_freshest(i_mask, i)
-            choice[i] = cur_idx
-            if cur_idx >= 0:
-                cur_toe = toe[cur_idx]
-                cur_start_toc = toc_vec[i]
-            continue
-
-        cur_age = _wrap_signed(toc_vec[i] - cur_toe)
-        still_valid = (cur_age >= 0.0) & (cur_age <= valid_h)
-
-        if not still_valid:
-            cur_idx = pick_freshest(i_mask, i)
-            choice[i] = cur_idx
-            if cur_idx >= 0:
-                cur_toe = toe[cur_idx]
-                cur_start_toc = toc_vec[i]
-            continue
-
-        elapsed_hold = _wrap_signed(toc_vec[i] - cur_start_toc)
-        if elapsed_hold < hold_sec:
-            # Trzymamy niezależnie od potencjalnych zysków
-            choice[i] = cur_idx
-            continue
-
-        cand_idx = pick_freshest(i_mask, i)
-        if cand_idx < 0:
-            choice[i] = cur_idx
-            continue
-
-        cand_age = age[i, cand_idx]
-        age_gain = cur_age - cand_age
-        if age_gain >= switch_thresh_sec:
-            # warto przełączyć
-            cur_idx = cand_idx
-            cur_toe = toe[cur_idx]
-            cur_start_toc = toc_vec[i]
-            choice[i] = cur_idx
-        else:
-            # zysk zbyt mały — trzymaj starą
-            choice[i] = cur_idx
-
-    return choice
-
-
-def _pick_nav_rows_future_with_hold(
-    system: str,
-    toc_vec: np.ndarray,
-    nav_block: pd.DataFrame,
-    hold_sec: float = None,
-    switch_thresh_sec: float = 900.0
-) -> np.ndarray:
-    """
-        Selection of messages ONLY from the FUTURE (Toe >= toc) relative to the observation epoch.
-        A validity window and stickiness (hold) apply to avoid message 'flashing'.
-
-        Note: we assume that 'age' = wrap_signed(toc - Toe), i.e.:
-          - age < 0  -> Toe is in the FUTURE relative to toc,
-          - age > 0  -> Toe is in the PAST.
-
-        For GPS: valid_h = 7200 s (2 h). For Galileo, we do not usually use future-only.
-    """
-    valid_h = 14400.0 if system == 'E' else 7200.0
-    if hold_sec is None:
-        hold_sec = 3600.0 if system == 'G' else 7200.0
-
-    toe = nav_block['Toe'].to_numpy(float)                 # [M]
-    trans = pd.to_datetime(nav_block['TransTime']) if 'TransTime' in nav_block.columns else None
-
-    if 'SISA' in nav_block.columns:
-        quality = nav_block['SISA'].to_numpy(float)
-    elif 'SVacc' in nav_block.columns:
-        quality = nav_block['SVacc'].to_numpy(float)
-    else:
-        quality = np.zeros_like(toe, dtype=float)
-
-    if system == 'G' and 'health' in nav_block.columns:
-        good = (nav_block['health'].to_numpy() == 0)
-        toe, quality = toe[good], quality[good]
-        if trans is not None:
-            trans = trans.iloc[good].reset_index(drop=True)
-
-
-    age = _wrap_signed(toc_vec[:, None] - toe[None, :])    # [N, M]
-
-
-    future_mask = (age <= 0.0) & (age >= -valid_h)
-
-    N, M = age.shape
-    choice = np.full(N, -1, dtype=int)
-
-    def pick_closest_future(i_mask, i):
-        if not i_mask.any():
-            return -1
-        best_age = np.max(age[i, i_mask])
-        mask_age = i_mask & (np.abs(age[i] - best_age) < 1e-9)
-
-        if mask_age.sum() == 1 or trans is None:
-            return np.flatnonzero(mask_age)[0]
-
-        idxs = np.flatnonzero(mask_age)
-        latest_t = trans.iloc[idxs].values
-        tmax = latest_t.max()
-        idxs = idxs[latest_t == tmax]
-        if len(idxs) == 1:
-            return idxs[0]
-        q = quality[idxs]
-        return idxs[np.argmin(q)]
-
-    i = 0
-    cur_idx = pick_closest_future(future_mask[0], 0)
-    choice[0] = cur_idx
-    if cur_idx >= 0:
-        cur_toe = toe[cur_idx]
-        cur_start_toc = toc_vec[0]
-
-    for i in range(1, N):
-        i_mask = future_mask[i]
-
-        if cur_idx < 0:
-            cur_idx = pick_closest_future(i_mask, i)
-            choice[i] = cur_idx
-            if cur_idx >= 0:
-                cur_toe = toe[cur_idx]
-                cur_start_toc = toc_vec[i]
-            continue
-
-        cur_age = _wrap_signed(toc_vec[i] - cur_toe)  # ≤ 0, bo „przyszłość”
-        still_valid = (cur_age <= 0.0) and (cur_age >= -valid_h)
-
-        if not still_valid:
-            cur_idx = pick_closest_future(i_mask, i)
-            choice[i] = cur_idx
-            if cur_idx >= 0:
-                cur_toe = toe[cur_idx]
-                cur_start_toc = toc_vec[i]
-            continue
-
-        elapsed_hold = _wrap_signed(toc_vec[i] - cur_start_toc)
-        if elapsed_hold < hold_sec:
-            choice[i] = cur_idx
-            continue
-
-        cand_idx = pick_closest_future(i_mask, i)
-        if cand_idx < 0:
-            choice[i] = cur_idx
-            continue
-
-        cand_age = age[i, cand_idx]      # ≤ 0
-
-        gain = (abs(cur_age) - abs(cand_age))
-        if gain >= switch_thresh_sec:
-            cur_idx = cand_idx
-            cur_toe = toe[cur_idx]
-            cur_start_toc = toc_vec[i]
-            choice[i] = cur_idx
-        else:
-            choice[i] = cur_idx
-
-    return choice
-
-def _select_by_toe_for_sat(system, obs_sv, nav_sv,picker='_past_hold'):
-    """
-        Returns a DataFrame with merged ephemerides for a single SV,
-        with a selection of 'past' dispatches (0 ≤ toc - Toe ≤ validity window)
-        and tie-breaking by TransTime/SISA.
-        """
-    toc_vec = obs_sv['toc'].to_numpy(float)
-    #choice = _pick_nav_rows_past_only(system, toc_vec, nav_sv)
-    if picker == '_future_hold':
-        choice = _pick_nav_rows_future_with_hold(
-        system=system,
-        toc_vec=toc_vec,
-        nav_block=nav_sv,
-        hold_sec=(30*60 if system == 'E' else 30*60),
-        switch_thresh_sec=(900 if system == 'E' else 900)
-    )
-    else:
-        choice = _pick_nav_rows_past_with_hold(
-        system=system,
-        toc_vec=toc_vec,
-        nav_block=nav_sv,
-        hold_sec=(30*60 if system == 'E' else 30*60),
-        switch_thresh_sec=(900 if system == 'E' else 900)
-    )
-
-
-    keep = choice >= 0
-    if not keep.any():
-        return pd.DataFrame()
-
-    nav_sel = nav_sv.iloc[choice[keep]].copy()
-    obs_sel = obs_sv.loc[keep].copy()
-
-    nav_sel['sv'] = obs_sel['sv'].values
-    nav_sel['time'] = obs_sel['time'].values
-
-    merged = pd.concat(
-        [obs_sel.reset_index(drop=True),
-         nav_sel.reset_index(drop=True)], axis=1
-    )
-    return merged
-
-def _ensure_obs_block(df_obs, sv_hint=None):
-    """
-        Returns df with columns 'sv','time','toc' (without messing with df.columns!).
-        Accepts both MultiIndex (sv,time) and regular index.
-        """
-    if not isinstance(df_obs, pd.DataFrame):
-        df_obs = pd.DataFrame(df_obs)
-
-    if ('sv' not in df_obs.columns) or ('time' not in df_obs.columns):
-        df_obs = df_obs.reset_index()
-    if 'sv' not in df_obs.columns and sv_hint is not None:
-        df_obs['sv'] = sv_hint
-    if 'toc' not in df_obs.columns:
-        raise ValueError("df_obs must have 'toc' column.")
-
-    return df_obs[['sv','time','toc']].copy()
-
-
-def _ensure_nav_block(df_orb, sv_hint=None):
-    """
-        Returns df with columns NAV + 'sv','time','Toe','nav_toc' (without messing with df.columns!).
-        """
-    if not isinstance(df_orb, pd.DataFrame):
-        df_orb = pd.DataFrame(df_orb)
-
-    if ('sv' not in df_orb.columns) or ('time' not in df_orb.columns):
-        df_orb = df_orb.reset_index()
-    if 'sv' not in df_orb.columns and sv_hint is not None:
-        df_orb['sv'] = sv_hint
-
-    need = ['sv','time','Toe','nav_toc']
-    miss = [c for c in need if c not in df_orb.columns]
-    if miss:
-        raise ValueError(f"df_orb missing columns: {miss} (make sure _add_nav_toc() was already there).")
-
-    return df_orb.copy()
-
-class BrdcGenerator:
-    mes_cols = [
-        'SVclockBias', 'SVclockDrift', 'SVclockDriftRate', 'IODE', 'Crs', 'DeltaN', 'M0',
-        'Cuc', 'Eccentricity', 'Cus', 'sqrtA', 'Toe', 'Cic', 'Omega0', 'Cis',
-        'Io', 'Crc', 'omega', 'OmegaDot', 'IDOT', 'CodesL2', 'GPSWeek',
-        'L2Pflag', 'SVacc', 'health', 'TGD', 'IODC', 'TransTime'
-    ]
-    gal_mes_cols = ['SVclockBias', 'SVclockDrift', 'SVclockDriftRate', 'IODnav', 'Crs',
-                    'DeltaN', 'M0', 'Cuc', 'Eccentricity', 'Cus', 'sqrtA', 'Toe', 'Cic',
-                    'Omega0', 'Cis', 'Io', 'Crc', 'omega', 'OmegaDot', 'IDOT', 'DataSrc',
-                    'GALWeek', 'SISA', 'health', 'BGDe5a', 'BGDe5b', 'TransTime']
-
-    def __init__(self, system, interval, mode, nav, tolerance ='1H'):
-        self.system = system
-        self.interval = interval
-        self.mode = mode
-        self.nav = nav
-        self.SEC_TO_FREQ = {
-            1: "1s",
-            2: "2s",
-            5: "5s",
-            10: "10s",
-            15: "15s",
-            30: "30s",
-            60: "1T",  # 1 minuta
-            120: "2T",
-            300: "5T",
-            600: "10T",
-            900: "15T",
-            1800: "30T",
-            3600: "1H",  # 1 godzina
-            7200: "2H",
-            10800: "3H",
-            21600: "6H",
-            43200: "12H",
-            86400: "1D"  # 1 doba
-        }
-        self.table = None
-        self.tolerance = tolerance
-
-    def _add_obs_toc(self):
-        obs_toc = gps_lib.time.datetime2toc(t=self.table.index.get_level_values('time').tolist())
-        self.table['toc'] = obs_toc
-
-    def _add_nav_toc(self):
-        nav_toc = gps_lib.time.datetime2toc(t=self.nav.index.get_level_values('time').tolist())
-        self.nav['nav_toc'] = nav_toc
-
-    def _clear_suffixes(self, df):
-        df = df.reset_index().copy()
-        df['prn'] = df.apply(lambda row: row['sv'][:3], axis=1)
-        df = df.drop(columns='sv')
-        df.set_index(['prn', 'time'], inplace=True)
-        df.index.names = ['sv', 'time']
-        return df
-
-    def select_messages(self, df_obs: pd.DataFrame, df_orb: pd.DataFrame) -> pd.DataFrame:
-        """
-                New broadcast selection:
-                - operates via satellite,
-                - selects based on minimum |toc_obs - Toe| (SOW) with wrapping,
-                - applies RTKLIB validity windows (GPS=2h, GAL=4h) validity windows and health filters,
-                - resolves ties by TransTime and quality (SISA/SVacc).
-                Returns a DataFrame joined 1:1 with epochs, but only for those for which
-                we found a valid ephemeris; no "forward/nearest" after 'time'.
-                """
-        # Upewnij się, że mamy 'toc' w df_obs i 'nav_toc' w df_orb (dodajesz je wyżej w pipeline)
-        if 'toc' not in df_obs.columns:
-            raise ValueError("df_obs must contain 'toc' (seconds-of-week); call _add_obs_toc() first.")
-        if 'nav_toc' not in df_orb.columns:
-            raise ValueError("df_orb must contain 'nav_toc' (seconds-of-week); call _add_nav_toc() first.")
-        if 'Toe' not in df_orb.columns:
-            raise ValueError("df_orb must contain 'Toe' (seconds-of-week).")
-
-        out_list = []
-        for sv, obs_sv in df_obs.groupby('sv', sort=False):
-            try:
-                nav_sv = df_orb[df_orb['sv'] == sv]
-                if nav_sv.empty:
-                    continue
-                if self.system =='G':
-                    picker='_future_hold'
-                else:
-                    picker='_past_hold'
-                sel = _select_by_toe_for_sat(self.system, obs_sv, nav_sv,picker)
-                if not sel.empty:
-                    out_list.append(sel)
-            except Exception as e:
-                print(f"[select_messages] {sv}: {e}")
-                continue
-        if not out_list:
-            return pd.DataFrame()
-        merged = pd.concat(out_list, ignore_index=False)
-        if '__rank__' in merged.columns:
-            merged = merged.drop(columns='__rank__')
-        return merged
-
-    def prepare_table(self):
-        freq = self.SEC_TO_FREQ[self.interval]
-        if self.system == 'G':
-            sats_av = self.nav.index.get_level_values('sv').unique().tolist()
-        elif self.system == 'E':
-            self.nav = self._clear_suffixes(df=self.nav)
-
-            if self.mode == 'E1':
-                war =(self.nav['I/NAV_E1-B']==True)& (self.nav['dt_E5b_E1'] == True)
-                self.nav = self.nav[war]
-
-            elif self.mode == 'E5b':
-                war = (self.nav['I/NAV_E1-B'] == True) & (self.nav['dt_E5b_E1'] == True) & (
-                            self.nav['E5b_SHS'].isin([0, 2]) & (self.nav['E5b_DVS'] == 0))
-                self.nav = self.nav[war]
-            elif self.mode == 'E1E5b':
-                war = (self.nav['I/NAV_E1-B'] == True) & (self.nav['dt_E5b_E1'] == True) & (
-                        self.nav['E5b_SHS'].isin([0, 2]) & (self.nav['E5b_DVS'] == 0))
-                self.nav = self.nav[war]
-            elif self.mode in ['E5a','E1E5a']:
-                war = (self.nav['F/NAV_E5a-I']==True)& (self.nav['dt_E5a_E1'] == True) & (
-                        self.nav['E5a_SHS'].isin([0, 2]) & (self.nav['E5a_DVS'] == 0))
-                self.nav = self.nav[war]
-            sats_av = self.nav.index.get_level_values('sv').unique().tolist()
-        t0 = sorted(self.nav.index.get_level_values('time').unique().tolist())[0].floor(freq='min')
-        t1 = sorted(self.nav.index.get_level_values('time').unique().tolist())[-1].floor(freq='min')
-        idx = pd.MultiIndex.from_product(
-            [sats_av, pd.date_range(t0, t1, freq=freq)],
-            names=["sv", "time"])
-        self.table = pd.DataFrame(index=idx)
-
-    def get_coordinates(self):
-        output = []
-        for sv, df_obs_grp in self.table.groupby('sv'):
-            try:
-                # OBS
-                df_obs_block = _ensure_obs_block(df_obs_grp, sv_hint=sv)
-
-                # NAV
-                df_orb_sv = self.nav.loc[sv]
-                df_orb_block = _ensure_nav_block(df_orb_sv, sv_hint=sv)
-
-                merged = self.select_messages(df_obs_block, df_orb_block)
-                if merged is None or merged.empty:
-                    try:
-                        toe = _ensure_nav_block(df_orb_sv, sv_hint=sv)['Toe'].to_numpy(float)
-                        toc = _ensure_obs_block(df_obs_grp, sv_hint=sv)['toc'].to_numpy(float)
-                        D = _wrap_dist_sow(toc, toe) if toe.size and toc.size else None
-                        min_d = np.min(D, axis=1) if D is not None else np.array([])
-                        within = np.sum(min_d <= (7200.0 if self.system == 'G' else 14400.0)) if min_d.size else 0
-                        print(f"[diag] {sv}: epochs={len(toc)}, NAV={len(toe)}, in_window={within}")
-                    except Exception:
-                        pass
-                    continue
-
-                if merged is None or merged.empty:
-                    continue
-
-                # Przygotowanie do interpolacji
-                mes_toc = merged['nav_toc'].to_numpy(dtype=float)
-                obs_toc = merged['toc'].to_numpy(dtype=float)
-
-                if self.system == 'E':
-                    needed = self.gal_mes_cols
-                    interp_fun = gal_numpy_broadcast_interpolation
-                elif self.system == 'G':
-                    needed = self.mes_cols
-                    interp_fun = numpy_broadcast_interpolation
-                else:
-                    raise ValueError(f"Unknown system: {self.system}")
-
-                # Na wszelki wypadek: sprawdź, czy wszystkie kolumny istnieją
-                missing = [c for c in needed if c not in merged.columns]
-                if missing:
-                    raise ValueError(f"NAV columns are missing in merged: {missing}")
-
-                # Wymuś float i kształt (N, K)
-                messages = merged[needed].to_numpy(dtype=float, copy=True)
-                if messages.ndim != 2:
-                    raise ValueError(f"messages has the wrong dimension: {messages.ndim}")
-
-                rows = []
-                bad_rows = 0
-                for mt, ot, msg in zip(mes_toc, obs_toc, messages):
-                    try:
-                        res = interp_fun(mt, ot, msg)
-
-                        if isinstance(res, (tuple, list)):
-                            a = np.atleast_1d(res[0]).astype(float).ravel()
-                            b = np.atleast_1d(res[1]).astype(float).ravel()
-                            row = np.concatenate([a, b], axis=0)
-                        else:
-                            row = np.atleast_1d(res).astype(float).ravel()
-
-                        rows.append(row)
-                    except Exception:
-                        bad_rows += 1
-                        rows.append(None)
-                        continue
-
-                if any(r is None for r in rows):
-                    keep_mask = np.array([r is not None for r in rows])
-                    rows = [r for r in rows if r is not None]
-                    merged = merged.loc[keep_mask].copy()
-                    mes_toc = mes_toc[keep_mask]
-                    obs_toc = obs_toc[keep_mask]
-
-                if not rows:
-                    continue
-
-                unique_lengths = {len(r) for r in rows}
-                if len(unique_lengths) != 1:
-                    # jeżeli masz mieszankę 8/9 itp. – dopełnij do maksymalnej długości zerami
-                    maxlen = max(unique_lengths)
-                    rows = [np.pad(r, (0, maxlen - len(r)), mode='constant') for r in rows]
-
-                crd = np.vstack(rows)
-
-                cols8 = ['x', 'y', 'z', 'clk', 'vx', 'vy', 'vz', 'clk_dot']
-                cols9 = ['x', 'y', 'z', 'clk', 'clk_rel', 'vx', 'vy', 'vz', 'clk_dot']
-                cols = cols8 if crd.shape[1] == 8 else (
-                    cols9 if crd.shape[1] == 9 else [f'c{i}' for i in range(crd.shape[1])])
-
-                merged = merged.loc[:,~merged.columns.duplicated()]
-                merged = merged.set_index(['sv', 'time'])
-
-                crd = pd.DataFrame(crd, index=merged.index, columns=cols)
-
-                output.append(merged.join(crd))
-
-
-
-
-            except Exception as e:
-                try:
-                    print(
-                        f"For sv: {sv} | obs_cols={list(df_obs_grp.columns) if hasattr(df_obs_grp, 'columns') else 'n/a'} "
-                        f"| nav_cols={list(self.nav.columns) if hasattr(self.nav, 'columns') else 'n/a'}")
-                except Exception:
-                    pass
-                print('For sv: ', sv, e)
-                continue
-
-        if not output:
-            raise ValueError("No ephemeris selected for all SVs (check validity windows, health and 'nav_toc').")
-        return pd.concat(output)
-
-    def generate(self):
-        self.prepare_table()
-        self._add_obs_toc()
-        self._add_nav_toc()
-        crd = self.get_coordinates()
-        return crd
-
-
 def correct_sat_coordinates(xyz_s, xyz_a):
     """
     Correction of satellite coordinates with respect to earth rotation during signal travel
@@ -2021,7 +2095,7 @@ def _bary_weights(xw):
         w[j] = 1.0 / s
     return w
 
-@njit(cache=False, fastmath=False)
+@njit(cache=True, fastmath=True)
 def _bary_eval_vec(xw, w, Yw, xq):
     m, D = Yw.shape
     for j in range(m):
@@ -2049,7 +2123,7 @@ def _bary_eval_vec(xw, w, Yw, xq):
         out[d] = num[d] * inv
     return out
 
-@njit(parallel=False, cache=False, fastmath=False)
+@njit(parallel=True, cache=True, fastmath=True)
 def lagrange_local_vec(x, Y, xq, m=12, max_gap=np.inf):
     N = x.size
     D = Y.shape[1]
@@ -2085,7 +2159,7 @@ def lagrange_local_vec(x, Y, xq, m=12, max_gap=np.inf):
         w  = _bary_weights(xw)
         out[i, :] = _bary_eval_vec(xw, w, Yw, xi)
     return out
-@njit(cache=False, fastmath=False)
+@njit(cache=True, fastmath=True)
 def lin_interp1d_vec(x, y, xq, max_gap=np.inf):
     """
         Linear 1D interpolation (x,y)->y(xq) for sorted x.
@@ -2125,7 +2199,7 @@ def lin_interp1d_vec(x, y, xq, max_gap=np.inf):
         out[i] = (1.0 - t) * y[i0] + t * y[i1]
     return out
 
-@njit(cache=False, fastmath=False)
+@njit(cache=True, fastmath=True)
 def lin_interp1d_vec(x, y, xq, max_gap=np.inf):
     """
         Linear 1D interpolation (x,y)->y(xq) for sorted x.
@@ -2181,7 +2255,14 @@ def lagrange_interp(
             x, y, z, clk, vx, vy, vz, clk_rel
         """
     obs = obs.copy(); sp3 = sp3.copy()
-    obs.index = obs.index.set_names(['time', 'sv'])
+    # obs.index = obs.index.set_names(['time', 'sv'])
+    obs.index = (
+        obs.index
+        .set_names(['time', 'sv'])
+        if isinstance(obs.index.levels[0][0], pd.Timestamp)
+        else obs.index.reorder_levels([1, 0]).set_names(['time', 'sv'])
+    )
+
     sp3.index = sp3.index.set_names(['time', 'sv'])
 
     obs_sorted = obs.sort_index()
@@ -2210,7 +2291,6 @@ def lagrange_interp(
         # tylko potrzebne kolumny; odfiltruj NaNy
         cols = ['time','x','y','z'] + (['clk'] if 'clk' in g.columns else [])
         g = g[cols].dropna(subset=['time','x','y','z'])
-
         # g = g.groupby('time', as_index=False).mean(numeric_only=True)
         g = g.loc[~g['time'].duplicated(keep='first')]
 
@@ -2306,7 +2386,7 @@ def lagrange_emission_interp(obs:pd.DataFrame, positions:pd.DataFrame, sp3_df:pd
     if 'P3' in obs_crd.columns:
         obs_crd['t_em'] = (obs_crd['P3'] / C_LIGHT) + (obs_crd['clk'])
     else:
-        col = [c for c in obs_crd.columns if c.startswith('C1')][0]
+        col = [c for c in obs_crd.columns if c.startswith(('C1','C2','C5','C7'))][0]
         obs_crd['t_em'] = (obs_crd[col] / C_LIGHT) + (obs_crd['clk'])
     obs_crd['time_em'] = obs_crd['time'] - pd.to_timedelta(obs_crd['t_em'].values, unit='s')
     obs_crd['time_rec'] = obs_crd['time'].copy()

@@ -12,7 +12,10 @@ Notes:
 - Where multiple model variants exist, prefer a single entry point with a
   parameter switch while keeping mathematical equivalence clear in the docs.
 """
-
+import os
+from typing import Optional, Iterable, Tuple, List, Dict
+from pathlib import Path
+import pandas as pd
 import numpy as np
 C = 299792458
 PI = 3.1415296535898
@@ -140,3 +143,175 @@ def stec_mf(ev, ish=450e03, R=6371e03, no=1):
         mf = 1 / np.cos(np.pi / 2 - ev)
 
     return mf
+
+def load_stec_folder(
+    folder: os.PathLike | str,
+    *,
+    file_suffix: str = "STEC.parquet.gzip",
+    min_elev_deg: float = 10.0,
+    station_name_len: int = 6,
+    unique_id_len: int = 4,
+    network_filter: Optional[Iterable[str]] = None,
+    required_columns: Tuple[str, str, str, str] = ("lat_ipp", "lon_ipp", "leveled_tec", "ev","sv","time"),
+    quiet: bool = False,
+    skip_negative:bool=True
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """
+    Load and validate STEC parquet files from a folder, filtering by elevation
+    and rejecting files that contain negative leveled TEC values.
+
+    The function iterates over files ending with ``file_suffix`` inside ``folder``.
+    For each file:
+      1) Extracts a station name (first ``station_name_len`` characters of the filename)
+         and a short unique ID (first ``unique_id_len`` characters).
+      2) Reads the parquet into a DataFrame.
+      3) Keeps only rows with elevation ``ev > min_elev_deg`` and only the columns
+         specified by ``required_columns``.
+      4) Rejects the entire file if any ``leveled_tec`` is negative.
+      5) Appends an extra column ``name`` with the station name and collects results.
+
+    Parameters
+    ----------
+    folder : os.PathLike | str
+        Path to the directory containing STEC parquet files.
+    file_suffix : str, optional
+        File name suffix to match (default: ``"STEC.parquet.gzip"``).
+    min_elev_deg : float, optional
+        Minimum elevation threshold in degrees; rows with ``ev <= min_elev_deg`` are dropped.
+    station_name_len : int, optional
+        Number of leading characters used as the station name (default: 6).
+        Assumes filenames begin with a station identifier (e.g., ``"ABCD01…"``).
+    unique_id_len : int, optional
+        Number of leading characters used as the short unique station ID (default: 4).
+    network_filter : Iterable[str] | None, optional
+        If provided, keep only files whose short unique ID is in this set/list.
+        (Comparison is case-sensitive.)
+    required_columns : tuple[str, str, str, str], optional
+        Columns expected in each parquet file in order: (lat, lon, tec, elevation).
+        Default: ``("lat_ipp", "lon_ipp", "leveled_tec", "ev")``.
+    quiet : bool, optional
+        If True, suppress per-file log messages.
+
+    Returns
+    -------
+    df_all : pandas.DataFrame
+        Concatenated DataFrame of accepted files with columns:
+        ``lat_ipp, lon_ipp, leveled_tec, ev, name``.
+        If no files are accepted, an empty DataFrame with those columns is returned.
+    summary : dict
+        A dictionary with processing metadata:
+        - ``files_scanned`` (int): total files that matched the suffix
+        - ``files_accepted`` (int): files included in the final DataFrame
+        - ``files_rejected`` (int): files rejected (negative TEC or errors)
+        - ``stations_unique`` (List[str]): unique short IDs encountered (accepted or rejected)
+        - ``stations_accepted`` (List[str]): unique short IDs among accepted files
+        - ``stations_rejected`` (List[str]): unique short IDs among rejected files
+        - ``rejected_files`` (List[str]): basenames of rejected files
+        - ``errors`` (List[Tuple[str, str]]): (filename, error message) pairs for exceptions
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``folder`` does not exist or is not a directory.
+
+    Notes
+    -----
+    * Behavior mirrors the reference snippet: any file with *any* negative
+      ``leveled_tec`` is fully skipped.
+    * Unlike the original code, this function **does not** divide counters by two.
+      Instead, it reports counts directly and also lists unique short IDs so you
+      can infer pairing at the station level without guessing.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Folder not found or not a directory: {folder}")
+
+    lat_col, lon_col, tec_col, ev_col, sv_col, time_col = required_columns
+    dfs: List[pd.DataFrame] = []
+
+    files = sorted(p for p in folder.iterdir() if p.name.endswith(file_suffix))
+    files_scanned = len(files)
+
+    stations_unique: set[str] = set()
+    stations_accepted: set[str] = set()
+    stations_rejected: set[str] = set()
+
+    rejected_files: List[str] = []
+    errors: List[Tuple[str, str]] = []
+
+    for fpath in files:
+        try:
+            # Names as in your original logic
+            name = fpath.name[:station_name_len]
+            unique_id = name[:unique_id_len]
+            stations_unique.add(unique_id)
+
+            if network_filter is not None and unique_id not in network_filter:
+                if not quiet:
+                    print(f"[SKIP-NET] {fpath.name} (unique_id {unique_id} not in network_filter)")
+                continue
+
+            df = pd.read_parquet(fpath)
+
+            # Validate required columns early
+            missing = [c for c in (lat_col, lon_col, tec_col, ev_col) if c not in df.columns]
+            if missing:
+                raise KeyError(f"Missing required columns {missing} in {fpath.name}")
+
+            # Elevation filtering and column selection
+            df = df[df[ev_col] > float(min_elev_deg)]#[[lat_col, lon_col, tec_col, ev_col]]
+
+            # Reject entire file if any negative TEC
+            if skip_negative:
+                if (df[tec_col] < 0).any():
+                    if not quiet:
+                        print(f"[REJECT-NEG] {fpath.name} — negative TEC detected")
+                    rejected_files.append(fpath.name)
+                    stations_rejected.add(unique_id)
+                    continue
+
+            if df.empty:
+                if not quiet:
+                    print(f"[SKIP-EMPTY] {fpath.name} — no rows after filtering")
+                # Treat as rejected but without negative TEC
+                rejected_files.append(fpath.name)
+                stations_rejected.add(unique_id)
+                continue
+            df[tec_col]/=1e16
+            # Add station name column and collect
+            df = df.copy()
+            df["name"] = name
+
+            dfs.append(df)
+            stations_accepted.add(unique_id)
+            if not quiet:
+                print(f"[ACCEPT] {fpath.name} → rows: {len(df)}")
+
+        except Exception as e:
+            errors.append((fpath.name, str(e)))
+            rejected_files.append(fpath.name)
+            stations_rejected.add(fpath.name[:unique_id_len])
+            if not quiet:
+                print(f"[ERROR] {fpath.name}: {e}")
+
+    # Build final DataFrame
+    if dfs:
+        df_all = pd.concat(dfs, axis=0)
+        #df_all = df_all[[lat_col, lon_col, tec_col, ev_col, "name"]]
+        df_all = df_all.reset_index()
+        df_all['time'] = pd.to_datetime(df_all['time'])
+        df_all.set_index(['sv', 'time'], inplace=True)
+    # else:
+    #     df_all = pd.DataFrame(columns=[lat_col, lon_col, tec_col, ev_col, "name"])
+
+    summary = {
+        "files_scanned": files_scanned,
+        "files_accepted": len(dfs),
+        "files_rejected": len(rejected_files),
+        "stations_unique": sorted(stations_unique),
+        "stations_accepted": sorted(stations_accepted),
+        "stations_rejected": sorted(stations_rejected),
+        "rejected_files": rejected_files,
+        "errors": errors,
+    }
+    return df_all, summary

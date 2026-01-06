@@ -267,7 +267,7 @@ class _DCBEntry:
     Attributes
     ----------
     system : str
-        GNSS system identifier (e.g., 'G', 'E', 'R', etc.).
+        GNSS sys identifier (e.g., 'G', 'E', 'R', etc.).
     prn_or_site : str
         Satellite PRN or ground site/station identifier.
     bias : float
@@ -441,7 +441,7 @@ class GIMReader:
                 Returns
                 -------
                 pd.DataFrame
-                    Parsed DCB records with system, identifier, bias and optional RMS.
+                    Parsed DCB records with sys, identifier, bias and optional RMS.
 
                 Raises
                 ------

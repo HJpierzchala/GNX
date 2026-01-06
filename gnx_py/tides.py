@@ -22,20 +22,9 @@ mass_moon = M_moon.to('kg')
 RE = 6378136.6
 
 
-def to_ecef(coord):
-    """Transformation of coordinates from the GCRS system to the ITRS (ECEF)."""
-    gcrs = coord.transform_to('gcrs')
-    itrs = gcrs.transform_to('itrs')
-
-    # Konwersja na metry
-    ecef_x = itrs.x.to(u.m).value
-    ecef_y = itrs.y.to(u.m).value
-    ecef_z = itrs.z.to(u.m).value
-    return ecef_x, ecef_y, ecef_z
-
-
+# ------------------- END OF TEST ---------------------
 def get_sun_ecef(datetimes):
-    """Downloading the position of the Sun in the ECEF coordinate system for multiple epochs."""
+    """Downloading the position of the Sun in the ECEF coordinate sys for multiple epochs."""
     times = Time(datetimes)
     sun_coord = get_sun(times)
     itrs = sun_coord.transform_to(ITRS(obstime=times))
@@ -48,9 +37,8 @@ def get_sun_ecef(datetimes):
     sun_df.index.name = 'time'
     return sun_df
 
-
 def get_moon_ecef(datetimes):
-    """Downloading the Moon's position in the ECEF coordinate system for multiple epochs"""
+    """Downloading the Moon's position in the ECEF coordinate sys for multiple epochs"""
     times = Time(datetimes)
     moon = get_body('moon', times)
     moon_itrs = moon.transform_to(ITRS(obstime=times))
@@ -97,68 +85,63 @@ def tidal_displacement(vec, unit_station, h2, l2):
 
 
 def get_sun_tides(sun_df, xyz):
-    """
-        Calculates the tidal effect of the Sun on the station.
-        Uses an improved version of the calculation, in which element-by-element multiplication is replaced by scalar multiplication.
-        """
     h2, l2, unit_station = adjust_tidal_parameters(xyz)
-    sun_df = calculate_unit_vectors_and_magnitude(sun_df)
-    sun_df['a'] = sun_df['magnitude'].apply(lambda r: (GM_sun.value * RE ** 4) / (GM_earth.value * r ** 3))
 
-    def compute_tide(row):
-        vec = np.array([row['unit_x'], row['unit_y'], row['unit_z']])
-        return tidal_displacement(vec, unit_station, h2, l2)
+    # numpy arrays
+    r = np.sqrt(sun_df["x"].to_numpy()**2 + sun_df["y"].to_numpy()**2 + sun_df["z"].to_numpy()**2)
+    ux = sun_df["x"].to_numpy() / r
+    uy = sun_df["y"].to_numpy() / r
+    uz = sun_df["z"].to_numpy() / r
+    U = np.column_stack((ux, uy, uz))           # (N,3)
 
-    sun_df['tidal_vector'] = sun_df.apply(compute_tide, axis=1)
-    sun_df['tidal_vector'] = sun_df.apply(lambda row: row['a'] * row['tidal_vector'], axis=1)
-    tidal_vectors = np.vstack(sun_df['tidal_vector'].values)
-    sun_tidal = pd.DataFrame(tidal_vectors, columns=['unit_x', 'unit_y', 'unit_z'], index=sun_df.index)
-    return sun_tidal
+    # a(N) vectorized
+    a = (GM_sun.value * RE**4) / (GM_earth.value * r**3)  # (N,)
 
+    # dot = U · unit_station  (N,)
+    dot = U @ unit_station
+
+    # term1, term2 vectorized
+    term1 = h2 * ((1.5 * dot**2 - 0.5)[:, None]) * unit_station[None, :]
+    term2 = 3.0 * l2 * (dot[:, None]) * (U - dot[:, None] * unit_station[None, :])
+
+    tide = (term1 + term2) * a[:, None]  # (N,3)
+
+    return pd.DataFrame(tide, columns=["sx", "sy", "sz"], index=sun_df.index)
 
 def get_moon_tides(moon_df, xyz):
-    """
-        Calculates the tidal effect of the Moon on the station.
-        Similar to get_sun_tides, it uses improved scalar product calculations.
-        """
     h2, l2, unit_station = adjust_tidal_parameters(xyz)
-    moon_df = calculate_unit_vectors_and_magnitude(moon_df)
-    moon_df['a'] = moon_df['magnitude'].apply(lambda r: (GM_moon.value * RE ** 4) / (GM_earth.value * r ** 3))
 
-    def compute_tide(row):
-        vec = np.array([row['unit_x'], row['unit_y'], row['unit_z']])
-        return tidal_displacement(vec, unit_station, h2, l2)
+    r = np.sqrt(moon_df["x"].to_numpy()**2 + moon_df["y"].to_numpy()**2 + moon_df["z"].to_numpy()**2)
+    U = np.column_stack((moon_df["x"].to_numpy()/r, moon_df["y"].to_numpy()/r, moon_df["z"].to_numpy()/r))
 
-    moon_df['tidal_vector'] = moon_df.apply(compute_tide, axis=1)
-    moon_df['tidal_vector'] = moon_df.apply(lambda row: row['a'] * row['tidal_vector'], axis=1)
-    tidal_vectors = np.vstack(moon_df['tidal_vector'].values)
-    moon_tidal = pd.DataFrame(tidal_vectors, columns=['unit_x', 'unit_y', 'unit_z'], index=moon_df.index)
-    return moon_tidal
+    a = (GM_moon.value * RE**4) / (GM_earth.value * r**3)
 
+    dot = U @ unit_station
+    term1 = h2 * ((1.5 * dot**2 - 0.5)[:, None]) * unit_station[None, :]
+    term2 = 3.0 * l2 * (dot[:, None]) * (U - dot[:, None] * unit_station[None, :])
+
+    tide = (term1 + term2) * a[:, None]
+
+    return pd.DataFrame(tide, columns=["mx", "my", "mz"], index=moon_df.index)
 
 def get_tides(xyz, datetimes):
-    """
-        Combines tidal effects from the Sun and Moon for a given station position (xyz) and list of epochs (datetimes).
-        We use the ecef2geodetic function to obtain the geodetic latitude.
-        """
-    geodetic = ecef2geodetic(xyz)
-    fi, lam, alt = geodetic
+    fi, lam, alt = ecef2geodetic(xyz)
 
     sun_df = get_sun_ecef(datetimes)
     moon_df = get_moon_ecef(datetimes)
-    moon_tidal = get_moon_tides(moon_df, xyz)
-    sun_tidal = get_sun_tides(sun_df, xyz)
 
-    moon_tidal = moon_tidal.rename(columns={'unit_x': 'mx', 'unit_y': 'my', 'unit_z': 'mz'})
-    sun_tidal = sun_tidal.rename(columns={'unit_x': 'sx', 'unit_y': 'sy', 'unit_z': 'sz'})
+    sun_tidal = get_sun_tides(sun_df, xyz)      # sx,sy,sz
+    moon_tidal = get_moon_tides(moon_df, xyz)   # mx,my,mz
 
-    tidals = pd.concat([moon_tidal, sun_tidal], axis=1)
-    tidals['dx'] = tidals['mx'] + tidals['sx']
-    tidals['dy'] = tidals['my'] + tidals['sy']
-    tidals['dz'] = tidals['mz'] + tidals['sz']
-    rsol = tidals[['dx', 'dy', 'dz']]
+    rsol = pd.DataFrame({
+        "dx": sun_tidal["sx"].to_numpy() + moon_tidal["mx"].to_numpy(),
+        "dy": sun_tidal["sy"].to_numpy() + moon_tidal["my"].to_numpy(),
+        "dz": sun_tidal["sz"].to_numpy() + moon_tidal["mz"].to_numpy(),
+    }, index=sun_df.index)
 
     P2 = (3 * np.sin(np.deg2rad(fi)) ** 2 - 1) / 2
     radial = (-0.1206 + 0.0001 * P2) * P2
     north = (-0.0252 + 0.0001 * P2) * np.sin(2 * np.deg2rad(fi))
+
     return rsol, radial, north, sun_tidal, moon_tidal
+

@@ -466,23 +466,23 @@ class GNSSDataProcessor2:
         if self.mode in ['L1L2','L1','L2']:
             selected_columns = [
                 col for col in dataframe.columns
-                if (("1" in col or "2" in col)) and not (col.startswith('D') or col.endswith('li'))
+                if ("1" in col or "2" in col) and not (col.startswith('D') or col.endswith('li'))
             ]
         elif self.mode in ['L1L5','L5']:
             selected_columns = [
                 col for col in dataframe.columns
-                if (("1" in col or "5" in col)) and not (col.startswith('D') or col.endswith('li'))
+                if ("1" in col or "5" in col) and not (col.startswith('D') or col.endswith('li'))
             ]
         elif self.mode in ['L2L5']:
             selected_columns = [
                 col for col in dataframe.columns
-                if (("2" in col or "5" in col)) and not (col.startswith('D') or col.endswith('li'))
+                if ("2" in col or "5" in col) and not (col.startswith('D') or col.endswith('li'))
             ]
         else:
             selected_columns = []
 
         selected_columns = sorted(selected_columns,reverse=True)
-        priority_order = ["W", "C", "P", "Y", "L", "X"]
+        priority_order = ["W", "C", "P", "Y", "L", "X","Q"]
         selected_types: list[str] = []
         chosen_suffixes: list[str] = []
 
@@ -564,6 +564,38 @@ class GNSSDataProcessor2:
             priority_order_e5a = ['Q', 'I', 'X']
             selected_columns_E1 = [col for col in dataframe.columns if
                                    len(col) >= 3 and col[1] == '1' and not col.startswith('D')]
+            selected_columns_E5a = [col for col in dataframe.columns if
+                                    len(col) >= 3 and col[1] == '7' and not col.startswith('D')]
+
+            def select_best(columns, priority_order):
+                best = []
+                kinds = {col[:-1] for col in columns}
+                for kind in kinds:
+                    kind_columns = [col for col in columns if col.startswith(kind)]
+                    satellite_count = dataframe[kind_columns].sum(axis=0)
+                    max_sat = satellite_count.max()
+                    max_cols = satellite_count[satellite_count == max_sat].index
+
+                    def get_priority(column):
+                        try:
+                            return priority_order.index(column[-1])
+                        except ValueError:
+                            return float('inf')
+
+                    sorted_cols = sorted(max_cols, key=get_priority)
+                    if sorted_cols:
+                        best.append(sorted_cols[0])
+                return best
+
+            best_E1 = select_best(selected_columns_E1, priority_order_e1) if selected_columns_E1 else []
+            best_E5a = select_best(selected_columns_E5a, priority_order_e5a) if selected_columns_E5a else []
+            selected_types.extend(best_E1)
+            selected_types.extend(best_E5a)
+        if mode in ['E5aE5b']:
+            priority_order_e1 = ['Q', 'I', 'X']
+            priority_order_e5a = ['Q', 'I', 'X']
+            selected_columns_E1 = [col for col in dataframe.columns if
+                                   len(col) >= 3 and col[1] == '5' and not col.startswith('D')]
             selected_columns_E5a = [col for col in dataframe.columns if
                                     len(col) >= 3 and col[1] == '7' and not col.startswith('D')]
 
@@ -1041,7 +1073,7 @@ class GNSSDataProcessor2:
                 or 'faulty'.
 
                 broadcast_df – MultiIndex (time, sv) + columns E5a_DVS, E5a_SHS, E5b_DVS, E5b_SHS
-                system       – 'G' (GPS) or 'E' (Galileo)
+                sys       – 'G' (GPS) or 'E' (Galileo)
                 """
         if system == 'G': # GPS
             unhealthy = []
@@ -1146,7 +1178,7 @@ class GNSSDataProcessor2:
             return obs_df
 
         # ------------------------------------------------------------
-        raise ValueError(f"Unknown system: {system}")
+        raise ValueError(f"Unknown sys: {system}")
 
 
 def parse_sinex(sinex_path):

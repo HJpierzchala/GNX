@@ -64,35 +64,67 @@ _LEAP_TABLE = [
 _GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
 
 
+# def _to_timestamp_utc(t) -> datetime:
+#     """Convert various time types to datetime in UTC."""
+#     # pandas.Timestamp
+#     if pd is not None and isinstance(t, pd.Timestamp):
+#         if t.tzinfo is None:
+#             t = t.tz_localize("UTC")
+#         else:
+#             t = t.tz_convert("UTC")
+#         t = t.round("us")
+#         return t.to_pydatetime()
+#     # numpy.datetime64
+#     if np is not None and isinstance(t, np.datetime64):
+#         if pd is not None:
+#             ts = pd.Timestamp(t)
+#             if ts.tzinfo is None:
+#                 ts = ts.tz_localize("UTC")
+#             else:
+#                 ts = ts.tz_convert("UTC")
+#             return ts.to_pydatetime()
+#         epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+#         ns = int(str(t).split('[')[0])
+#         return epoch + timedelta(microseconds=ns / 1000.0)
+#
+#     if isinstance(t, datetime):
+#         if t.tzinfo is None:
+#             return t.replace(tzinfo=timezone.utc)
+#         return t.astimezone(timezone.utc)
+#
+#     raise TypeError(f"Unsupported time type: {type(t)!r}")
+
+
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+from functools import lru_cache
+
+@lru_cache(maxsize=200_000)
+def _to_timestamp_utc_cached_key(ns_or_us: int, scale: str) -> datetime:
+    # scale: "us" or "ns"
+    if scale == "ns":
+        us = (ns_or_us + 500) // 1000
+    else:
+        us = ns_or_us
+    return _EPOCH_UTC + timedelta(microseconds=us)
+
 def _to_timestamp_utc(t) -> datetime:
-    """Convert various time types to datetime in UTC."""
-    # pandas.Timestamp
     if pd is not None and isinstance(t, pd.Timestamp):
-        if t.tzinfo is None:
-            t = t.tz_localize("UTC")
-        else:
-            t = t.tz_convert("UTC")
-        t = t.round("us")
-        return t.to_pydatetime()
-    # numpy.datetime64
+        ts = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+        return _to_timestamp_utc_cached_key(int(ts.value), "ns")
+
     if np is not None and isinstance(t, np.datetime64):
-        if pd is not None:
-            ts = pd.Timestamp(t)
-            if ts.tzinfo is None:
-                ts = ts.tz_localize("UTC")
-            else:
-                ts = ts.tz_convert("UTC")
-            return ts.to_pydatetime()
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        ns = int(str(t).split('[')[0])
-        return epoch + timedelta(microseconds=ns / 1000.0)
+        us = int(t.astype("datetime64[us]").astype("int64"))
+        return _to_timestamp_utc_cached_key(us, "us")
 
     if isinstance(t, datetime):
         if t.tzinfo is None:
+            # datetime bez tz -> może się powtarzać; cache po "microseconds since epoch" byłby trudniejszy
             return t.replace(tzinfo=timezone.utc)
         return t.astimezone(timezone.utc)
 
     raise TypeError(f"Unsupported time type: {type(t)!r}")
+
+
 
 
 def _gps_utc_offset_seconds(dt_utc: datetime) -> int:

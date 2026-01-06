@@ -84,7 +84,7 @@ def sunmoonpos(time):
 #########################################
 # Wektorowa wersja obliczenia efektu windup
 
-def process_windup_correction_vectorized(times, satellite_positions, receiver_position):
+def process_windup_correction_vectorized(times, satellite_positions, receiver_position,rsun_all):
     """
     Wektorowo oblicza korekcję efektu windup dla wielu epok.
 
@@ -95,9 +95,8 @@ def process_windup_correction_vectorized(times, satellite_positions, receiver_po
     Zwraca: np.array windup_corrections o długości n (typ float32).
     """
     n = len(times)
-    # Wektorowo pobieramy pozycje Słońca dla wszystkich epok
-    # get_sun_ecef jest wektoryzowaną funkcją, zwracającą DataFrame z kolumnami ['x', 'y', 'z']
-    rsun_all = get_sun_ecef(times).to_numpy()  # shape (n, 3)
+    if rsun_all is None:
+        rsun_all = get_sun_ecef(times)[["x", "y", "z"]].to_numpy()
 
     # Obliczamy wektor od odbiornika do satelity
     r = receiver_position - satellite_positions  # shape (n, 3)

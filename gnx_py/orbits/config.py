@@ -27,7 +27,7 @@ import pandas as pd
 
 from ..io import GNSSDataProcessor2, read_sp3
 from ..time import arange_datetime
-from ..ppp.preprocessing import DDPreprocessing, DefaultConfig
+from ..tools import DDPreprocessing, DefaultConfig
 from ..coordinates import BrdcGenerator, SP3InterpolatorOptimized
 
 
@@ -117,7 +117,7 @@ class SISController:
 
         Responsibilities:
             - Classify inputs and route them to broadcast or precise-orbit handlers.
-            - Process orbits (interpolation, alignment, system selection).
+            - Process orbits (interpolation, alignment, sys selection).
             - Detect eclipse periods and optionally extend masks.
             - Apply satellite antenna PCO/PCV when enabled by configuration.
             - Ingest DCB/OSB, convert to appropriate group delays (e.g., TGD) when needed,
@@ -126,7 +126,7 @@ class SISController:
 
         Attributes:
             config: Configuration object controlling file paths, modes, and flags.
-            system: GNSS system code processed by this controller instance.
+            system: GNSS sys code processed by this controller instance.
             clight: Speed of light in vacuum [m/s].
             output_cols: Expected output columns of the final table, if defined.
 
@@ -157,7 +157,7 @@ class SISController:
         Returns:
             dict: A lightweight descriptor with keys such as:
                 - "type": e.g., "broadcast", "precise_orbit", "dcb", "atx".
-                - "system": GNSS system code, if determinable.
+                - "sys": GNSS sys code, if determinable.
                 - Additional fields required by downstream steps.
 
         Raises:
@@ -490,7 +490,7 @@ class SISController:
                 orbit_0 = self._merge_gal_tgd_with_orbit(orbit_0, dcb_0_out, type_dcb_0)
                 orbit_1 = self._merge_gal_tgd_with_orbit(orbit_1, dcb_1_out, type_dcb_1)
             else:
-                raise ValueError(f"Unsupported system: {self.system}")
+                raise ValueError(f"Unsupported sys: {self.system}")
         return orbit_0, orbit_1
 
     # --- POMOCNICZE METODY DLA GPS ---
