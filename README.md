@@ -1,4 +1,8 @@
 # GNX-py
+<p align="center">
+  <img src="assets/GNX-py-logo.png" width="180"/>
+</p>
+
 *A modular GNSS analysis library for PPP, SISRE/URE evaluation, and ionospheric modelling*
 
 ---
