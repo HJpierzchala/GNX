@@ -15,12 +15,14 @@ This project is designed for researchers, engineers, and students requiring high
 
 ---
 ## Use of sample data
-In the repository, you will find a folder called sample data, which contains observational data along with several GNSS products. To test the program, use them in the prepared scripts: PPP, SPP, STEC, and SIS Session. This will allow you to quickly test the basic functions of the program. In the scripts, you only need to substitute the appropriate paths to the sample data.
+
+In the repository, you will find a folder called sample data, which contains observation RINEX file along with several GNSS products. To test the program, use them in the prepared scripts: PPP, SPP, STEC, and SIS Session. This will allow you to quickly test the basic functions of the program. In the scripts, you only need to substitute the appropriate paths to the sample data.
+
 ---
 ## Features
 
 ### Precise Point Positioning (PPP)
-- Code-based, phase-based and uncombined PPP
+- PPP with GPS and Galileo 
 - Kalman filter framework (EKF)
 - Satellite and receiver corrections (PCO/PCV, tides, troposphere, relativity)
 
@@ -34,7 +36,7 @@ In the repository, you will find a folder called sample data, which contains obs
 - STEC computation
 - VTEC estimation
 - Kriging 
-- Ionospheric activity monitoring tools
+- Ionospheric activity indexes (SIDX, GIX, ROTI) 
 
 ---
 
@@ -54,6 +56,8 @@ GNX/
 
 **Large files such as full tutorial bundles (ZIP > 100 MB)** are stored as *Release Assets* under GitHub Releases.
 
+To take full advantage of the interactive notebooks that make up the GNX-py manual, download the files from *Release Assets*.
+
 ---
 
 ## Installation
@@ -72,7 +76,7 @@ pip install -e .
 import gnx_py as gnx 
 from gnx_py.ppp import PPPConfig, PPPSession
 from gnx_py.ionosphere import TECConfig STECSession
-from gnx_py.orbits import SISConfig, SISEngine
+from gnx_py.orbits import SISConfig, SISController
 ```
 
 ---
@@ -101,7 +105,7 @@ cd GNX
 pip install -e ".[dev]"
 ```
 
-Recommended Python version: **3.10+**
+Recommended Python version: **3.12+**
 
 ---
 
@@ -109,12 +113,11 @@ Recommended Python version: **3.10+**
 
 Planned features:
 - PPP-AR full pipeline
-- Real-time PPP
 - Global/regional GIM estimation (SH + KF)
-- Advanced ionospheric indices (ROTI, SIDX, GIX)
 - Cython & parallel acceleration
+- Processing of other GNSS systems, especially BeiDou and GLONASS
 
-Contributions and suggestions are welcome.
+Contributions and suggestions are welcome. It would be really cool if GNX-py became an easy-to-use, enjoyable tool for research and learning. If you have any ideas, suggestions, or comments, let us know on GitHub. 
 
 ---
 
@@ -138,12 +141,6 @@ See `LICENSE` for full terms.
 ---
 
 ## Citation
-
-If you use GNX-py in academic work, please cite:
-
-```
-Pierzchała, H. (2025). GNX-py: A Python toolbox for PPP, SISRE and ionospheric modelling.
-```
 
 A `CITATION.cff` file will be added in a future release.
 
