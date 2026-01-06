@@ -14,7 +14,9 @@
 This project is designed for researchers, engineers, and students requiring high-accuracy GNSS tools in pure Python.
 
 ---
-
+## Use of sample data
+In the repository, you will find a folder called sample data, which contains observational data along with several GNSS products. To test the program, use them in the prepared scripts: PPP, SPP, STEC, and SIS Session. This will allow you to quickly test the basic functions of the program. In the scripts, you only need to substitute the appropriate paths to the sample data.
+---
 ## Features
 
 ### Precise Point Positioning (PPP)
