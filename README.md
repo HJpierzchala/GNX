@@ -79,7 +79,7 @@ pip install -e .
 ```python
 import gnx_py as gnx 
 from gnx_py.ppp import PPPConfig, PPPSession
-from gnx_py.ionosphere import TECConfig STECSession
+from gnx_py.ionosphere import TECConfig TECSession
 from gnx_py.orbits import SISConfig, SISController
 ```
 
