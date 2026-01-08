@@ -23,7 +23,7 @@ readme = ROOT / "README.md"
 long_description = readme.read_text(encoding="utf-8") if readme.exists() else ""
 
 setup(
-    name="gps_lib",  # dowolna nazwa (nie musi być unikalna na PyPI)
+    name="gnx_py",  
     version="0.1.0",
     description="GNSS processing library (GitHub-only)",
     long_description=long_description,
