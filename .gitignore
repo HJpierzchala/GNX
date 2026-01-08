@@ -18,3 +18,13 @@ data/
 *.rnx
 *.nc
 *.zip
+
+.venv/
+venv/
+env/
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
