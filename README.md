@@ -58,7 +58,7 @@ GNX/
 │   ├─ ionosphere/
 │   ├─ orbits/
 │   └─ core modules
-├─ tutorials/     # Lightweight example notebooks
+├─ tutorial/     # Lightweight example notebooks
 ├─ setup.py       # Package installer
 └─ README.md
 ```
