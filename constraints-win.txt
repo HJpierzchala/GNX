@@ -17,3 +17,4 @@ xarray==2025.9.0
 
 filterpy==1.4.5
 georinex==1.16.2
+pyarrow
