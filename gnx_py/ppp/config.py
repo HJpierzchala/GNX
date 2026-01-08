@@ -188,9 +188,7 @@ class PPPSession:  # noqa: D101 – docstring below
             merged = merged.set_index(df.index)
             merged = merged.drop(columns='sv')
             df=merged.copy()
-            # df = df.join(sat_dcb, on='sv')
-            # print(df[['bias']])
-            # if self.config.station_name is not None:
+
             name = self.config.station_name
             station = (data.dcb[(data.dcb['entry_type'] == 'station') &
                                 (data.dcb['prn_or_site'].str.startswith(name))])
@@ -298,7 +296,6 @@ class PPPSession:  # noqa: D101 – docstring below
         has_gal = isinstance(obs_gal_crd, pd.DataFrame) and not obs_gal_crd.empty
 
         if has_gps and has_gal:
-            print('GPS + GAL')
             # Multi-GNSS (GPS + Galileo)
             return PPPDualFreqMultiGNSS(
                 gps_obs=obs_gps_crd.copy(),
@@ -311,7 +308,6 @@ class PPPSession:  # noqa: D101 – docstring below
                 config=self.config,
             )
         elif has_gps:
-            print('GPS')
             # Single-GNSS / GPS
             return PPPDualFreqSingleGNSS(
                 gps_obs=obs_gps_crd.copy(),
@@ -322,7 +318,6 @@ class PPPSession:  # noqa: D101 – docstring below
                 config=self.config,
             )
         elif has_gal:
-            print('GAL')
             # Single-GNSS na Galileo (we pass the GAL mode as gps_mode)
             return PPPDualFreqSingleGNSS(
                 gps_obs=obs_gal_crd.copy(),
@@ -343,22 +338,18 @@ class PPPSession:  # noqa: D101 – docstring below
         has_gal = isinstance(obs_gal_crd, pd.DataFrame) and not obs_gal_crd.empty
 
         if self.config.use_iono_constr and (has_gps and has_gal):
-            print('GPS + GAL Constrained')
             return  PPPFilterMultiGNSSIonConst(gps_obs=obs_gps_crd,gps_mode=gps_mode,
                                               gal_obs=obs_gal_crd,gal_mode=gal_mode,
                                               ekf=ekf,pos0=pos0,tro=True,est_dcb=True,interval=interval,use_iono_rms=self.config.use_iono_rms,
                                                config=self.config)
         else:
             if has_gps and has_gal:
-                print('GPS + GAL Unconstrained')
                 return  PPPUdMultiGNSS(gps_obs=obs_gps_crd,gps_mode=gps_mode,
                                               gal_obs=obs_gal_crd,gal_mode=gal_mode,
                                               ekf=ekf,pos0=pos0,tro=True, interval=interval,config=self.config)
             elif has_gps:
-                print('GPS')
                 return  PPPUdSingleGNSS(obs=obs_gps_crd,mode=self.config.gps_freq,ekf=ekf,pos0=pos0,tro=True,interval=interval,config=self.config)
             elif has_gal:
-                print('GAL')
                 return  PPPUdSingleGNSS(obs=obs_gal_crd,mode=self.config.gal_freq,ekf=ekf,pos0=pos0,tro=True,interval=interval,config=self.config)
     def create_sf_filter(self, obs_gps_crd, obs_gal_crd, ekf, pos0, interval):
         gps_mode = self.config.gps_freq
@@ -367,18 +358,15 @@ class PPPSession:  # noqa: D101 – docstring below
         has_gps = isinstance(obs_gps_crd, pd.DataFrame) and not obs_gps_crd.empty
         has_gal = isinstance(obs_gal_crd, pd.DataFrame) and not obs_gal_crd.empty
         if has_gps and has_gal:
-            print('GPS + GAL')
             return PPPUducSFMultiGNSS(gps_obs=obs_gps_crd,gps_mode=gps_mode,
                                               gal_obs=obs_gal_crd,gal_mode=gal_mode,
                                               ekf=ekf,pos0=pos0,tro=True,interval=interval,
                                       config=self.config)
         else:
             if has_gps:
-                print('GPS')
                 obs = obs_gps_crd
                 mode = gps_mode
             elif has_gal:
-                print('GAL')
                 obs = obs_gal_crd
                 mode = gal_mode
             return PPPSingleFreqSingleGNSS(obs=obs,mode=mode,ekf=ekf,pos0=pos0,interval=interval,config=self.config)
@@ -390,13 +378,10 @@ class PPPSession:  # noqa: D101 – docstring below
         pos0=obs_data.meta[4]
 
         if self.config.positioning_mode == 'combined':
-            print('Creating IF filter')
             ppp_filter = self.create_if_filter(obs_gps_crd, obs_gal_crd, ekf, pos0, interval)
         elif self.config.positioning_mode == 'uncombined':
-            print('Creating UDUC filter')
             ppp_filter = self.create_uduc_filter(obs_gps_crd, obs_gal_crd, ekf, pos0, interval)
         elif self.config.positioning_mode == 'single':
-            print('Creating Single filter')
             ppp_filter = self.create_sf_filter(obs_gps_crd, obs_gal_crd, ekf, pos0, interval)
 
 

@@ -633,7 +633,6 @@ class SISController:
             )
             orbit = orbit.set_index(['sv', 'time'])
         else:
-            print('DCB OUT is None')
             if type_dcb != 'brdc':
                 orbit['TGD'] = 0.0
         return orbit

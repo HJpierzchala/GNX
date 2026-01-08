@@ -544,7 +544,6 @@ class DDPreprocessing:
 
         def process_frequency(freq, unique_sv, ps,k_df, i_df, j_df, e_df, xyz_sat):
             if freq == 'L1':
-                print('processing', freq)
                 pco_dict = {}
                 for ind in unique_sv:
                     pco_dict[ind] = np.array(self.pco[(ind, f'{ind[0]}01')]) / 1000
@@ -793,8 +792,8 @@ class DDPreprocessing:
 
         # Jeśli brak danych PCO, ustawiamy korekcję na 0 i kończymy funkcję
         if not any(self.rec_pco.items()):
-            print('Nie znaleziono pco odbiornika !')
-            print('REC PCO to: ', self.rec_pco)
+            print('Reciever PCO not found in Antex file!')
+            print('Reciever PCO applied: ', self.rec_pco)
             self.df['pco_los'] = 0.0
             return
 
@@ -1166,7 +1165,7 @@ class DDPreprocessing:
             self.phase2meters()
             self.apply_phase_shift()
         else:
-            print("Brak obserwacji fazowych – krok pominięty")
+            print("No phase observations")
         if self.configuration.sat_pco=='los':
             self.sat_pco_los()
         elif self.configuration.sat_pco=='crd':

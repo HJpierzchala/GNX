@@ -704,13 +704,11 @@ class TECSession:
     def _load_obs_data(self, processor):
         """Load dual‑frequency observations via backend."""
 
-        self.log.debug("Loading dual frequency observations from %s", self.config.obs_path)
         obs = processor.load_obs_data()
         return obs
 
     def _load_nav_data(self, processor):
         """Load broadcast navigation messages for screening."""
-        self.log.debug("Loading navigation message  %s", self.config.nav_path)
         broadcast = processor.load_broadcast_orbit()
         return broadcast
 
@@ -796,7 +794,6 @@ class TECSession:
         """
         if self.config.skip_sat:
             obs = obs[~obs.index.get_level_values('sv').isin(self.config.skip_sat)]
-        self.log.debug("Preprocessing observations")
         if broadcast is None:
             gpsa, gpsb, gala = None, None, None
         else:
@@ -820,7 +817,6 @@ class TECSession:
             pd.DataFrame: DataFrame indexed by ['sv','time'] with arc segmentation.
         """
 
-        self.log.debug("Detecting cycle slips with arc max = %s min", self.config.min_arc_len)
 
 
         detector =  CSDetector(obs=obs_df,phase_shift_dict=None,dcb=None,sys=system,mode=mode,

@@ -733,7 +733,7 @@ def plot_roti_snapshot(
         res_deg=res_deg, min_points=min_points, agg=agg, coord_mode=coord_mode
     )
     if grid.empty:
-        print("Brak punktów w oknie – pomijam rysowanie.")
+        print("No points in the window – I'm skipping drawing.")
         return
 
     # skala kolorów
@@ -887,7 +887,7 @@ def make_roti_snapshots(
     - global_scale=True → stała skala kolorów (percentyle z całego zbioru).
     """
     if roti_df.empty:
-        print("Brak danych ROTI."); return
+        print("Lack of ROTI data."); return
 
     # lista epok
     if epochs is None:
