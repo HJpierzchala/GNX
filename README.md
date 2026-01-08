@@ -23,6 +23,11 @@ This project is designed for researchers, engineers, and students requiring high
 In the repository, you will find a folder called sample data, which contains observation RINEX file along with several GNSS products. To test the program, use them in the prepared scripts: PPP, SPP, STEC, and SIS Session. This will allow you to quickly test the basic functions of the program. In the scripts, you only need to substitute the appropriate paths to the sample data.
 
 ---
+
+## Interactive tutorials
+The $tutorial$ folder contains Jupyter Notebooks with a guide to the software. Due to space limitations in the main repository, the data for the tutorials can be found in the Releases section. There you will find the **tutorial_data.zip** file containing the data needed to run the tutorial. 
+
+---
 ## Features
 
 ### Precise Point Positioning (PPP)
