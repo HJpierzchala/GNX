@@ -31,6 +31,6 @@ setup(
     author="Hubert Pierzchała",
     packages=find_packages(exclude=("tests", "docs", "tutorials", "examples")),
     include_package_data=True,
-    python_requires=">=3.10",
-    install_requires=read_requirements(),
+    python_requires=">=3.12,<3.13",
+    install_requires=read_requirements("requirements-runtime.txt"),
 )

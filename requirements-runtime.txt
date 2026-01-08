@@ -1,0 +1,18 @@
+# Runtime dependencies for GNX (pip / Windows / Python 3.12)
+# Keep these as COMPATIBILITY RANGES, not hard pins.
+# For reproducible dev installs, use constraints-win.txt with `pip install -e . -c constraints-win.txt`.
+
+numpy>=2.2,<2.4
+numba==0.63.1  # required; NumPy 2.4 not supported yet
+# (llvmlite is pulled in by numba, but pinning helps reproducibility)
+llvmlite==0.44.0
+
+astropy==7.0.0
+Cartopy==0.24.1
+matplotlib>=3.10,<3.11
+pandas>=2.3,<2.4
+scipy>=1.12,<2.0
+xarray>=2025.1,<2026.0
+
+filterpy==1.4.5
+georinex==1.16.2

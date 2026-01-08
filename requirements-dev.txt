@@ -1,0 +1,10 @@
+# Developer requirements (linters/tests/notebooks)
+-r requirements-runtime.txt
+
+pytest>=8,<9
+pytest-cov>=5,<7
+ruff>=0.6,<1
+black>=24.0,<26
+mypy>=1.10,<2
+ipykernel>=6,<7
+jupyterlab>=4,<5

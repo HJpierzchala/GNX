@@ -1,0 +1,19 @@
+# Reproducible dev install on Windows (Python 3.12, x86_64)
+# Usage:
+#   pip install -U pip
+#   pip install -e . -c constraints-win.txt
+
+numpy==2.2.6
+numba==0.63.1
+llvmlite==0.44.0
+
+astropy==7.0.0
+Cartopy==0.24.1
+matplotlib==3.10.6
+pandas==2.3.3
+# SciPy pin left flexible; uncomment if you want to freeze:
+# scipy==<SET_ME>
+xarray==2025.9.0
+
+filterpy==1.4.5
+georinex==1.16.2
