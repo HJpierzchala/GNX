@@ -145,7 +145,7 @@ Recommended Python version: **3.12+**
 
 Planned features:
 - PPP-AR full pipeline
-- Global/regional GIM estimation (SH + KF)
+- Regional GIM estimation with Spherical Harmonics + KF 
 - Cython & parallel acceleration
 - Processing of other GNSS systems, especially BeiDou and GLONASS
 
