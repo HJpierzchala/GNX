@@ -76,6 +76,29 @@ To take full advantage of the interactive notebooks that make up the GNX-py manu
 ```
 git clone https://github.com/HJpierzchala/GNX.git
 cd GNX
+
+
+
+# Windows
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+python -m pip install -U pip
+
+Option A (recommended, reproducible)
+pip install -e . -c constraints-win.txt
+
+Option B (lets pip choose versions inside allowed ranges)
+pip install -e .
+
+# MacOS
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+
+Option A (recommended, reproducible)
+pip install -e . -c constraints-macos.txt
+
+Option B (lets pip choose versions inside allowed ranges)
 pip install -e .
 ```
 
