@@ -12,7 +12,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 np.set_printoptions(threshold=np.inf, linewidth=200, suppress=True, precision=3)
 
 
-"""High‑level Precise Point Positioning (PPP) framework.
+"""High‑level Single Point Positioning (PPP) framework.
 
 """
 
@@ -71,7 +71,7 @@ if __name__ =='__main__':
                     gim_path=GIM,
                     sys=SYS,
                     sp3_path=SP3_LIST,
-                    gps_freq='L1',
+                    gps_freq='L1', 
                     gal_freq='E1',
                     orbit_type='precise',
                     ionosphere_model='gim',
