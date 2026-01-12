@@ -58,7 +58,6 @@ GNX/
 │   ├─ ionosphere/
 │   ├─ orbits/
 │   └─ core modules
-├─ tutorial/     # Lightweight example notebooks
 ├─ setup.py       # Package installer
 └─ README.md
 ```
@@ -117,15 +116,13 @@ from gnx_py.orbits import SISConfig, SISController
 
 A complete tutorial bundle is available under:
 
-👉 **Releases → Latest → tutorials.zip**
+👉 **Releases → Latest → tutorial_data.zip**
 
 This includes:
 - PPP workflows
 - Orbit comparison & SISRE analysis
 - Ionospheric modelling (STEC → VTEC → Kriging, Calibration & Activity indices)
 - Visualization tools
-
-Lightweight example notebooks are also available in the `tutorials/` directory.
 
 ---
 
@@ -142,7 +139,7 @@ Recommended Python version: **3.12+**
 ---
 
 ## Roadmap
-
+Currently, the program has many bottlenecks that slow down processing. Not everything has been successfully vectorized. Some elements will be improved in the coming months. 
 Planned features:
 - PPP-AR full pipeline
 - Regional GIM estimation with Spherical Harmonics + KF 
