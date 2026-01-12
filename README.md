@@ -184,7 +184,7 @@ GNX-py aligns with standards and products from:
 - IGS (SP3, CLK, RINEX)
 - CODE, JPL, WHU
 - Classical PPP & ionospheric modelling literature
-
+- **Currently, only RINEX 3 is supported. RINEX 4 & 2 support will be integrated soon**
 ---
 
 ### ⭐ If this project is useful, consider giving it a star on GitHub!
