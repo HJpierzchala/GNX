@@ -71,7 +71,7 @@ To take full advantage of the interactive notebooks that make up the GNX-py manu
 ## Installation
 
 ### Install in development mode
-
+Recommended Python version: **3.12+**
 ```
 git clone https://github.com/HJpierzchala/GNX.git
 cd GNX
@@ -124,17 +124,8 @@ This includes:
 - Ionospheric modelling (STEC → VTEC → Kriging, Calibration & Activity indices)
 - Visualization tools
 
----
 
-## Development Setup
 
-```
-git clone https://github.com/HJpierzchala/GNX.git
-cd GNX
-pip install -e ".[dev]"
-```
-
-Recommended Python version: **3.12+**
 
 ---
 
@@ -156,7 +147,7 @@ Pull requests are welcome. You may contribute:
 - new modules
 - improved algorithms
 - documentation & notebooks
-- SISRE & ionosphere tools
+- positioning & analysis tools
 
 For ideas or issues, open a GitHub Issue.
 
