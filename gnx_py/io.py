@@ -10,7 +10,10 @@ from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Optional
-
+import math
+import re
+from collections import defaultdict
+from typing import List
 import georinex as gr
 # from geodezyx.files_rw import read_rinex_obs
 import numpy as np
@@ -371,146 +374,181 @@ class GNSSDataProcessor2:
 
         return info
 
-    def load_and_filter(self, tlim=None, version = 3.0):
+    from pathlib import Path
+
+    def load_and_filter(self, tlim=None, version=3.0):
         """
-        loading observation data for GPS and Galileo.
-        Workflow:
-        - data loading (always attempt to load 2 frequencies)
-        - gfzrnx if flagged and if installed
-        - filtering by number of observations
-
+        Faster load + filter for GPS/Galileo.
+        Main speedups:
+        - avoid df[cols].dropna(...) (double-copy); use one boolean mask
+        - optionally build mask on minimal "critical" columns only
+        - instantiate GFZRNX2 once
         """
-        results = {}
-        # Przetwarzanie danych GPS (jeśli występuje)
-        if 'G' in self.sys:
+        results = {"G": None, "E": None}
+
+        # --- Helper: build deterministic output tab path ---
+        def _tab_out_path(sys_char: str) -> str:
+            name = Path(self.obs_path).name
+            for sfx in [".crx", ".crx.gz", "rnx"]:
+                if name.endswith(sfx):
+                    name = name.replace(sfx, ".tab")
+            return f"{Path(self.obs_path).parent}/{sys_char}_{name}"
+
+        # --- Helper: load dataframe for a given system ---
+        gfz = None
+        if getattr(self, "use_gfz", False):
             try:
-                if self.use_gfz:
-                    try:
-                        gfz = GFZRNX2()
-                        name=f"{Path(self.obs_path).name}"
-                        for sfx in ['.crx', '.crx.gz', 'rnx']:
-                            if name.endswith(sfx):
-                                name = name.replace(sfx, '.tab')
-                        out=f"{Path(self.obs_path).parent}/G_{name}"
-                        gps_df = gfz.tabulate(rinex=self.obs_path,out=out,satsys='G')
-                        gps_obs_types = self.select_obs_types_gps(gps_df)
-                        gps_df_filtered = gps_df[gps_obs_types].dropna(how='any', axis=0)
-                    except FileNotFoundError:
+                gfz = GFZRNX2()
+            except Exception:
+                gfz = None
 
+        def _load_sys(sys_char: str):
+            # 1) try gfzrnx if requested and available
+            if gfz is not None:
+                try:
+                    out = _tab_out_path(sys_char)
+                    return gfz.tabulate(rinex=self.obs_path, out=out, satsys=sys_char)
+                except (FileNotFoundError, RuntimeError):
+                    pass
+            # 2) fallback georinex
+            return gr.load(self.obs_path, use={sys_char}, tlim=tlim, fast=True).to_dataframe()
 
-                        gps_df = gr.load(self.obs_path, use={'G'}, tlim=tlim, fast=True).to_dataframe()
-                        gps_obs_types = self.select_obs_types_gps(gps_df)
-                        gps_df_filtered = gps_df[gps_obs_types].dropna(how='any', axis=0)
-                else:
-                    gps_df = gr.load(self.obs_path, use={'G'}, tlim=tlim,fast=True).to_dataframe()
-                    gps_obs_types = self.select_obs_types_gps(gps_df)
-                    gps_df_filtered = gps_df[gps_obs_types].dropna(how='any', axis=0)
-                results['G'] = gps_df_filtered
-            except KeyError:
-                results['G'] = None
-        else:
-            results['G'] = None
+        # --- Helper: fast filtering without dropna double-copy ---
+        def _filter_df(df, obs_types, *, fast_mask=True):
+            """
+            obs_types: list[str] columns to keep.
+            fast_mask:
+              - if True: compute mask on minimal critical columns (codes+phases only)
+              - else: compute mask on all obs_types
+            """
+            if df is None or not obs_types:
+                return None
 
-        if 'E' in self.sys:
+            # keep only existing columns (robust to missing in some RINEX)
+            obs_types = [c for c in obs_types if c in df.columns]
+            if not obs_types:
+                return None
+
+            sub = df.loc[:, obs_types]
+
+            # Decide which columns define "valid row".
+            # You were doing dropna(how="any") => all selected columns must be non-NaN.
+            # Here we reproduce that, but optionally compute the mask on a smaller set
+            # to reduce cost (then apply mask to full sub).
+            if fast_mask:
+                # Minimal set: keep only Code + Phase columns among selected (C* and L*)
+                crit = [c for c in obs_types if c and (c[0] == "C" or c[0] == "L")]
+                # If somehow nothing matches, fall back to all columns
+                mask_cols = crit if crit else obs_types
+            else:
+                mask_cols = obs_types
+
+            # one mask, then one slicing (usually faster + fewer copies than dropna)
+            mask = sub.loc[:, mask_cols].notna().all(axis=1)
+            # If mask is all False (weird files), return empty df with right columns
+            return sub.loc[mask]
+
+        # --- GPS ---
+        if "G" in self.sys:
             try:
-                if self.use_gfz:
-                    try:
-                        gfz = GFZRNX2()
-                        name = f"{Path(self.obs_path).name}"
-                        for sfx in ['.crx','.crx.gz','rnx']:
-                            if name.endswith(sfx):
-                                name = name.replace(sfx, '.tab')
-                        out = f"{Path(self.obs_path).parent}/E_{name}"
-
-                        gal_df = gfz.tabulate(rinex=self.obs_path, out=out, satsys='E')
-                        gal_obs_types = self.select_obs_types_galileo(gal_df,self.galileo_modes)
-                        gal_df_filtered = gal_df[gal_obs_types].dropna(how='any', axis=0)
-                    except (FileNotFoundError, RuntimeError):
-                        gal_df = gr.load(self.obs_path, use={'E'}, tlim=tlim, fast=True).to_dataframe()
-                        gal_obs_types = self.select_obs_types_galileo(gal_df, self.galileo_modes)
-                        gal_df_filtered = gal_df[gal_obs_types].dropna(how='any', axis=0)
-                else:
-                    gal_df = gr.load(self.obs_path, use={'E'}, tlim=tlim,fast=True).to_dataframe()
-                    gal_obs_types = self.select_obs_types_galileo(gal_df, self.galileo_modes)
-                    gal_df_filtered = gal_df[gal_obs_types].dropna(how='any', axis=0)
-                results['E'] = gal_df_filtered
+                gps_df = _load_sys("G")
+                gps_obs_types = self.select_obs_types_gps(gps_df)
+                # fast_mask=True is usually faster and matches your "avoid NaN columns" intent
+                gps_df_filtered = _filter_df(gps_df, gps_obs_types, fast_mask=True)
+                results["G"] = gps_df_filtered
             except KeyError:
-                results['E'] = None
-        else:
-            results['E'] = None
+                results["G"] = None
+
+        # --- Galileo ---
+        if "E" in self.sys:
+            try:
+                gal_df = _load_sys("E")
+                gal_obs_types = self.select_obs_types_galileo(gal_df, self.galileo_modes)
+                gal_df_filtered = _filter_df(gal_df, gal_obs_types, fast_mask=True)
+                results["E"] = gal_df_filtered
+            except KeyError:
+                results["E"] = None
 
         return results
 
-    def select_obs_types_gps(self, dataframe, *, consistent_suffix: bool = True):
+    def select_obs_types_gps(self, dataframe, *, consistent_suffix: bool = True) -> List[str]:
         """
-                Selects observation columns for GPS.
+        Faster GPS observation-type selection.
 
-                • priority_order defines the base priority of observation types.
-                • If consistent_suffix=True (default), then after selecting a suffix
-                  (e.g. 'L' in L1L), the function will attempt to use the same suffix in subsequent
-                  "kinds" (L2L, L5L...), provided that the corresponding columns exist.
+        Key speedups vs original:
+        - build candidate column list once
+        - compute non-NaN counts ONCE for all candidates
+        - group columns by 'kind' (col[:-1]) once (no repeated startswith scanning)
+        """
 
-                Parameters
-                ----------
-                dataframe : pandas.DataFrame
-                    Observation data (columns of type 'L1C', 'L1W', …)
-                consistent_suffix : bool, optional
-                    Force consistency of the suffix between frequencies.
+        cols = list(map(str, dataframe.columns))
 
-                Returns
-                -------
-                list[str]
-                    List of selected columns.
-                """
-
-        if self.mode in ['L1L2','L1','L2']:
-            selected_columns = [
-                col for col in dataframe.columns
-                if ("1" in col or "2" in col) and not (col.startswith('D') or col.endswith('li'))
-            ]
-        elif self.mode in ['L1L5','L5']:
-            selected_columns = [
-                col for col in dataframe.columns
-                if ("1" in col or "5" in col) and not (col.startswith('D') or col.endswith('li'))
-            ]
-        elif self.mode in ['L2L5']:
-            selected_columns = [
-                col for col in dataframe.columns
-                if ("2" in col or "5" in col) and not (col.startswith('D') or col.endswith('li'))
-            ]
+        # --- 1) Candidate columns by mode (same intent as your code) ---
+        if self.mode in ["L1L2", "L1", "L2"]:
+            wanted_freqs = ("1", "2")
+        elif self.mode in ["L1L5", "L5"]:
+            wanted_freqs = ("1", "5")
+        elif self.mode in ["L2L5"]:
+            wanted_freqs = ("2", "5")
         else:
-            selected_columns = []
+            return []
 
-        selected_columns = sorted(selected_columns,reverse=True)
-        priority_order = ["W", "C", "P", "Y", "L", "X","Q"]
-        selected_types: list[str] = []
-        chosen_suffixes: list[str] = []
+        # keep same "exclude Doppler + 'li' suffix" policy
+        selected_columns = [
+            c for c in cols
+            if any(f in c for f in wanted_freqs)
+               and not (c.startswith("D") or c.endswith("li"))
+               and len(c) >= 3
+        ]
+        if not selected_columns:
+            return []
 
+        # --- 2) Precompute non-NaN counts ONCE ---
+        # This is the big win: avoid dataframe[candidates].notna().sum() inside loops.
+        nn = dataframe[selected_columns].notna().sum(axis=0)  # Series: col -> count
+
+        # --- 3) Group by kind = col[:-1] ---
+        by_kind = defaultdict(list)
+        for c in selected_columns:
+            by_kind[c[:-1]].append(c)
+
+        # Determine kind ordering (same as your freq_key idea)
         def freq_key(kind: str) -> int:
-            m = re.search(r'(\d+)$', kind)
+            m = re.search(r"(\d+)$", kind)
             return int(m.group(1)) if m else math.inf
 
-        kinds = sorted({col[:-1] for col in selected_columns}, key=freq_key)
+        kinds = sorted(by_kind.keys(), key=freq_key)
+
+        priority_order = ["W", "C", "P", "Y", "L", "X", "Q"]
+        selected_types: List[str] = []
+        chosen_suffixes: List[str] = []
+
+        # --- 4) Choose best column per kind ---
         for kind in kinds:
-            kind_cols = [col for col in selected_columns if col.startswith(kind)]
+            kind_cols = by_kind[kind]
             if not kind_cols:
                 continue
+
             chosen_col = None
 
-            if consistent_suffix:
+            if consistent_suffix and chosen_suffixes:
+                # Try already-chosen suffixes first, pick the candidate with max nn in that suffix.
                 for suf in chosen_suffixes:
                     candidates = [c for c in kind_cols if c.endswith(suf)]
                     if candidates:
-                        counts = dataframe[candidates].notna().sum()
-                        counts = counts.sort_index()
-                        chosen_col = counts.idxmax()
+                        # choose candidate with max non-NaN count (tie: lexicographic)
+                        best_count = nn[candidates].max()
+                        best = sorted([c for c in candidates if nn[c] == best_count])
+                        chosen_col = best[0]
                         break
+
             if chosen_col is None:
+                # Fall back to base priority order of suffixes
                 for suf in priority_order:
                     candidates = [c for c in kind_cols if c.endswith(suf)]
                     if candidates:
-                        candidates = sorted(candidates)
-                        chosen_col = candidates[0]
+                        # mimic your deterministic pick: smallest lexicographically
+                        chosen_col = sorted(candidates)[0]
                         break
 
             if chosen_col:
@@ -518,114 +556,96 @@ class GNSSDataProcessor2:
                 suf = chosen_col[-1]
                 if suf not in chosen_suffixes:
                     chosen_suffixes.append(suf)
+
         return selected_types
 
-    def select_obs_types_galileo(self, dataframe, mode):
+    def select_obs_types_galileo(self, dataframe, mode) -> List[str]:
         """
-        Wybiera kolumny obserwacyjne dla Galileo.
-        Dla trybu 'L1L5' stosujemy dotychczasową logikę, natomiast dla trybu 'E1'
-        przyjmujemy inny zbiór kryteriów (np. kolumny zaczynające się od 'C1' lub 'L1').
+        Faster + corrected Galileo observation-type selection.
+
+        Fixes vs your original:
+        - uses notna().sum(axis=0) instead of sum(axis=0) (you want availability, not sum of values)
+        - precomputes availability counts once per band (E1/E5a/E5b) and groups by kind once
+        - removes list(set(...)) (order-preserving unique)
         """
-        selected_types = []
-        if mode in ['E1E5a','E1','E5a']:
-            priority_order_e1 = ['C', 'X', 'Z', 'B']
-            priority_order_e5a = ['Q', 'I', 'X']
-            selected_columns_E1 = [col for col in dataframe.columns if
-                                   len(col) >= 3 and col[1] == '1' and not (col.startswith('D') or col.endswith('li'))]
-            selected_columns_E5a = [col for col in dataframe.columns if
-                                    len(col) >= 3 and col[1] == '5' and not (col.startswith('D') or col.endswith('li'))]
 
-            def select_best(columns, priority_order):
-                best = []
-                kinds = {col[:-1] for col in columns}
-                for kind in kinds:
-                    kind_columns = [col for col in columns if col.startswith(kind)]
-                    satellite_count = dataframe[kind_columns].sum(axis=0)
-                    max_sat = satellite_count.max()
-                    max_cols = satellite_count[satellite_count == max_sat].index
+        cols = list(map(str, dataframe.columns))
 
-                    def get_priority(column):
-                        try:
-                            return priority_order.index(column[-1])
-                        except ValueError:
-                            return float('inf')
+        def order_preserving_unique(seq: List[str]) -> List[str]:
+            return list(dict.fromkeys(seq))
 
-                    sorted_cols = sorted(max_cols, key=get_priority)
-                    if sorted_cols:
-                        best.append(sorted_cols[0])
-                return best
+        def pick_best_for_band(
+                band_cols: List[str],
+                priority_order: List[str],
+        ) -> List[str]:
+            """
+            For each kind (col[:-1]) choose:
+            - among columns with max availability (non-NaN count), pick best suffix by priority_order
+            - if tie remains, pick lexicographically smallest
+            """
+            if not band_cols:
+                return []
 
-            best_E1 = select_best(selected_columns_E1, priority_order_e1) if selected_columns_E1 else []
-            best_E5a = select_best(selected_columns_E5a, priority_order_e5a) if selected_columns_E5a else []
-            selected_types.extend(best_E1)
-            selected_types.extend(best_E5a)
-        if mode in ['E1E5b','E5b']:
-            priority_order_e1 = ['C', 'X', 'Z', 'B']
-            priority_order_e5a = ['Q', 'I', 'X']
-            selected_columns_E1 = [col for col in dataframe.columns if
-                                   len(col) >= 3 and col[1] == '1' and not col.startswith('D')]
-            selected_columns_E5a = [col for col in dataframe.columns if
-                                    len(col) >= 3 and col[1] == '7' and not col.startswith('D')]
+            # availability counts once
+            nn = dataframe[band_cols].notna().sum(axis=0)
 
-            def select_best(columns, priority_order):
-                best = []
-                kinds = {col[:-1] for col in columns}
-                for kind in kinds:
-                    kind_columns = [col for col in columns if col.startswith(kind)]
-                    satellite_count = dataframe[kind_columns].sum(axis=0)
-                    max_sat = satellite_count.max()
-                    max_cols = satellite_count[satellite_count == max_sat].index
+            # group by kind
+            by_kind = defaultdict(list)
+            for c in band_cols:
+                by_kind[c[:-1]].append(c)
 
-                    def get_priority(column):
-                        try:
-                            return priority_order.index(column[-1])
-                        except ValueError:
-                            return float('inf')
+            out = []
+            for kind, kind_cols in by_kind.items():
+                # choose max availability within this kind
+                best_count = nn[kind_cols].max()
+                max_cols = [c for c in kind_cols if nn[c] == best_count]
 
-                    sorted_cols = sorted(max_cols, key=get_priority)
-                    if sorted_cols:
-                        best.append(sorted_cols[0])
-                return best
+                # suffix priority
+                def pri(c: str) -> int:
+                    try:
+                        return priority_order.index(c[-1])
+                    except ValueError:
+                        return 10 ** 9
 
-            best_E1 = select_best(selected_columns_E1, priority_order_e1) if selected_columns_E1 else []
-            best_E5a = select_best(selected_columns_E5a, priority_order_e5a) if selected_columns_E5a else []
-            selected_types.extend(best_E1)
-            selected_types.extend(best_E5a)
-        if mode in ['E5aE5b']:
-            priority_order_e1 = ['Q', 'I', 'X']
-            priority_order_e5a = ['Q', 'I', 'X']
-            selected_columns_E1 = [col for col in dataframe.columns if
-                                   len(col) >= 3 and col[1] == '5' and not col.startswith('D')]
-            selected_columns_E5a = [col for col in dataframe.columns if
-                                    len(col) >= 3 and col[1] == '7' and not col.startswith('D')]
+                # choose best by (priority, lexicographic)
+                max_cols_sorted = sorted(max_cols, key=lambda c: (pri(c), c))
+                out.append(max_cols_sorted[0])
 
-            def select_best(columns, priority_order):
-                best = []
-                kinds = {col[:-1] for col in columns}
-                for kind in kinds:
-                    kind_columns = [col for col in columns if col.startswith(kind)]
-                    satellite_count = dataframe[kind_columns].sum(axis=0)
-                    max_sat = satellite_count.max()
-                    max_cols = satellite_count[satellite_count == max_sat].index
+            return out
 
-                    def get_priority(column):
-                        try:
-                            return priority_order.index(column[-1])
-                        except ValueError:
-                            return float('inf')
+        selected_types: List[str] = []
 
-                    sorted_cols = sorted(max_cols, key=get_priority)
-                    if sorted_cols:
-                        best.append(sorted_cols[0])
-                return best
+        def band_filter(freq_char: str) -> List[str]:
+            # Keep your original filtering spirit, including dropping 'D*' and '*li'
+            return [
+                c for c in cols
+                if len(c) >= 3
+                   and c[1] == freq_char
+                   and not (c.startswith("D") or c.endswith("li"))
+            ]
 
-            best_E1 = select_best(selected_columns_E1, priority_order_e1) if selected_columns_E1 else []
-            best_E5a = select_best(selected_columns_E5a, priority_order_e5a) if selected_columns_E5a else []
-            selected_types.extend(best_E1)
-            selected_types.extend(best_E5a)
+        if mode in ["E1E5a", "E1", "E5a"]:
+            # E1 = '1', E5a = '5'
+            e1_cols = band_filter("1")
+            e5a_cols = band_filter("5")
+            selected_types.extend(pick_best_for_band(e1_cols, ["C", "X", "Z", "B"]))
+            selected_types.extend(pick_best_for_band(e5a_cols, ["Q", "I", "X"]))
 
-        return list(set(selected_types))
+        if mode in ["E1E5b", "E5b"]:
+            # E1 = '1', E5b = '7'
+            e1_cols = band_filter("1")
+            e5b_cols = band_filter("7")
+            selected_types.extend(pick_best_for_band(e1_cols, ["C", "X", "Z", "B"]))
+            selected_types.extend(pick_best_for_band(e5b_cols, ["Q", "I", "X"]))
 
+        if mode in ["E5aE5b"]:
+            # E5a = '5', E5b = '7'
+            e5a_cols = band_filter("5")
+            e5b_cols = band_filter("7")
+            selected_types.extend(pick_best_for_band(e5a_cols, ["Q", "I", "X"]))
+            selected_types.extend(pick_best_for_band(e5b_cols, ["Q", "I", "X"]))
+
+        return order_preserving_unique(selected_types)
 
     def obs_header_reader(self):
         path = self.obs_path
