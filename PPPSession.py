@@ -80,7 +80,6 @@ if __name__ =='__main__':
                 controller = PPPSession(config)
                 logging.getLogger("PPP").setLevel(logging.DEBUG)
                 results = controller.run()
-                print('Convergence <5mm time: ')
                 print(results.convergence)
                 print(f'Solution for {NAME}: ')
                 print(results.solution.tail())
