@@ -736,11 +736,6 @@ class SinglePointPositioning:
                 row.update({"de": float(denu[0]), "dn": float(denu[1]), "du": float(denu[2])})
                 if getattr(self.config, "trace_filter", False):
                     print(f"Epoch: {t} error de: {denu[0]} dn: {denu[1]} du: {denu[2]}")
-                    if n_gps > 0:
-                        print(V_all[:n_gps])
-                    if n_gal > 0:
-                        print(V_all[n_gps:n_gps + n_gal])
-                    print("====" * 30, "\n")
 
             results_rows.append(row)
 
