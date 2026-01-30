@@ -1002,29 +1002,20 @@ class PPPDualFreqMultiGNSS:
             old_sats = curr_sats
             gps_sta_pco1, gps_sta_pco2 = self.gps_mode[:2], self.gps_mode[2:]
             gal_sta_pco1, gal_sta_pco2 = self.gal_mode[:2], self.gal_mode[2:]
-            gps_clk, gps_tro, gps_ah_los,  gps_dprel, gps_pco1, gps_pco2, sat_pco_L1, sat_pco_L2 = [np.asarray(gps_epoch.get(col,0.0))
+            gps_clk, gps_tro, gps_ah_los,  gps_dprel, gps_pco1, gps_pco2, sat_pco_L1, sat_pco_L2,gps_tides_los = [np.asarray(gps_epoch.get(col,0.0))
                                                                                             for col in
                                                                                             ['clk', 'tro', 'ah_los',
                                                                                              'dprel', 'pco_los_l1',
                                                                                              'pco_los_l2',f'sat_pco_los_{gps_sta_pco1}',
-                                                                                             f'sat_pco_los_{gps_sta_pco2}']]
-            gal_clk, gal_tro, gal_ah_los,  gal_dprel, gal_pco1, gal_pco2,sat_pco_E1, sat_pco_E5a  = [np.asarray(gal_epoch.get(col,0.0))
+                                                                                             f'sat_pco_los_{gps_sta_pco2}','tides_los']]
+            gal_clk, gal_tro, gal_ah_los,  gal_dprel, gal_pco1, gal_pco2,sat_pco_E1, sat_pco_E5a, gal_tides_los  = [np.asarray(gal_epoch.get(col,0.0))
                                                                                             for col in
                                                                                             ['clk', 'tro', 'ah_los',
                                                                                              'dprel', 'pco_los_l1',
-                                                                                             'pco_los_l5',f'sat_pco_los_{gal_sta_pco1}',
-                                                                                        f'sat_pco_los_{gal_sta_pco2}']]
-
-            los_gps = gps_epoch[['LOS1', 'LOS2', 'LOS3']].to_numpy()
-            gps_tides = gps_epoch[['dx', 'dy', 'dz']].to_numpy()
-            gps_tides_los = np.sum(los_gps * gps_tides, axis=1)
-            gps_epoch['tides_los'] = gps_tides_los
+                                                                                             'pco_los_l2',f'sat_pco_los_{gal_sta_pco1}',
+                                                                                        f'sat_pco_los_{gal_sta_pco2}','tides_los']]
 
 
-            los_gal = gal_epoch[['LOS1', 'LOS2', 'LOS3']].to_numpy()
-            gal_tides = gal_epoch[['dx', 'dy', 'dz']].to_numpy()
-            gal_tides_los = np.sum(los_gal * gal_tides, axis=1)
-            gal_epoch['tides_los'] = gal_tides_los
 
             # gal_tides_los += np.sum(los_gal * dR_gal, axis=1)
             gps_p1_c1 = np.asarray(gps_epoch.get(f'OSB_{gps_c1}',0.0)) * 1e-09 * self.CLIGHT
