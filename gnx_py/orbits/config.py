@@ -273,6 +273,8 @@ class SISController:
 
         sp3 = read_sp3(path=path, sys=self.system)
         sp3[['x', 'y', 'z']] = sp3[['x', 'y', 'z']].apply(lambda x: x * 1000)
+        sp3['clk'] = sp3['clk'] * 1e-6
+
         if self.config.tlim is not None:
 
             epochs = arange_datetime(start_datetime=self.config.tlim[0], end_datetime=self.config.tlim[1],
