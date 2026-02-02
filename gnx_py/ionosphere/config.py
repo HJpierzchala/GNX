@@ -35,7 +35,7 @@ import numpy as np
 from scipy.signal import savgol_filter
 from scipy.signal import cheby1, filtfilt
 from ..io import GNSSDataProcessor2, read_sp3
-from ..coordinates import make_ionofree, emission_interp, BroadcastInterp
+from ..coordinates import make_ionofree, BroadcastInterp
 from ..tools import CSDetector
 from ..tools import DDPreprocessing
 
@@ -764,27 +764,7 @@ class TECSession:
         obs_crd = wrapper.run()
         return obs_crd
 
-    def _interpolate_emission(self, obs_df,xyz, flh,sys,mode, positions, sp3):
-        """Interpolate satellite positions at emission times and add geometry.
 
-        Returns:
-            pd.DataFrame: Observations with emission coordinates and geometric angles.
-        """
-
-
-        make_ionofree(obs_df,sys,mode)
-        obs_crd = emission_interp(
-            obs=obs_df,
-            crd=positions,
-            prev_sp3_df=sp3[0],
-            next_sp3_df=sp3[-1],
-            sp3_df=sp3[1]
-        )
-
-        wrapper =  CustomWrapper(obs=obs_crd,epochs=None,flh=flh.copy(),xyz_a=xyz.copy(),
-                                          mode=mode)
-        obs_crd = wrapper.run()
-        return obs_crd
     def _preprocess(self, obs, flh, xyz,
                     broadcast,phase_shift,sat_pco, rec_pco, antenna_h, system):
         """Apply preprocessing: PCO/PCV, wind‑up, path corrections, and model terms.

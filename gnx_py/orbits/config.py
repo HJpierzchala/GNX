@@ -79,7 +79,6 @@ class SISConfig:
                     ValueError: If mutually incompatible options are provided.
                     FileNotFoundError: If a required resource is missing (when validated here).
                 """
-
         self.orb_path_0:Union[str,Path] = orb_path_0
         self.orb_path_1: Union[str, Path] = orb_path_1
 
