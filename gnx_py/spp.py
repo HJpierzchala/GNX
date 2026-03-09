@@ -11,6 +11,7 @@ from .conversion import ecef_to_enu, ecef2geodetic
 from .coordinates import BroadcastInterp, lagrange_emission_interp, lagrange_reception_interp, CustomWrapper, make_ionofree
 from .io import GNSSDataProcessor2, read_sp3, parse_sinex
 from . import DDPreprocessing
+from .session_errors import guarded_session_run
 
 
 @dataclass(slots=True)
@@ -48,6 +49,211 @@ class SinglePointPositioning:
                           'L2': 1227.60e06, 'E5a': 1176.45e06,
                           'L5': 1176.450e06, 'E5b': 1207.14e06}
         self.xyz_apr = xyz_apr
+        self._if_coeff = {
+            'L1L2': self._iono_free_coeff('L1', 'L2'),
+            'L1L5': self._iono_free_coeff('L1', 'L5'),
+            'L2L5': self._iono_free_coeff('L2', 'L5'),
+            'E1E5a': self._iono_free_coeff('E1', 'E5a'),
+            'E1E5b': self._iono_free_coeff('E1', 'E5b'),
+            'E5aE5b': self._iono_free_coeff('E5a', 'E5b'),
+        }
+
+    def _iono_free_coeff(self, f1_name: str, f2_name: str) -> Tuple[float, float]:
+        f1 = self.FREQ_DICT[f1_name]
+        f2 = self.FREQ_DICT[f2_name]
+        den = (f1 ** 2 - f2 ** 2)
+        return (f1 ** 2) / den, (f2 ** 2) / den
+
+    @staticmethod
+    def _first_matching_col(columns: pd.Index, prefixes: List[str]) -> Optional[str]:
+        for p in prefixes:
+            for c in columns:
+                if c.startswith(p):
+                    return c
+        return None
+
+    @staticmethod
+    def _series_or_zeros(df: pd.DataFrame, name: str, n: int) -> np.ndarray:
+        if name in df.columns:
+            return df[name].to_numpy(dtype='float64', copy=False)
+        return np.zeros(n, dtype='float64')
+
+    @staticmethod
+    def _first_existing_or_zeros(df: pd.DataFrame, names: List[str], n: int) -> np.ndarray:
+        for ncol in names:
+            if ncol in df.columns:
+                return df[ncol].to_numpy(dtype='float64', copy=False)
+        return np.zeros(n, dtype='float64')
+
+    def _build_obs_base(self, epoch: Optional[pd.DataFrame], system: str, mode: Optional[str]) -> Optional[np.ndarray]:
+        if epoch is None or len(epoch) == 0 or mode is None:
+            return None
+
+        C = 299_792_458.0
+        n = len(epoch)
+        cols = epoch.columns
+
+        if system == 'G':
+            if mode == 'L1':
+                c1 = self._first_matching_col(cols, ['C1C', 'C1W', 'C1', 'C1P'])
+                if c1 is None:
+                    raise ValueError("GPS L1: column C1* missing in gps_epoch.")
+                P = epoch[c1].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                ion = self._first_existing_or_zeros(epoch, ['ion'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                TGD_s = self._first_existing_or_zeros(epoch, ['TGD'], n)
+                pco_l1 = self._first_existing_or_zeros(epoch, ['pco_los_l1'], n)
+                return P - tro - ion - dprel + C * (clk_s - TGD_s) + pco_l1
+            if mode == 'L2':
+                c1 = self._first_matching_col(cols, ['C2W', 'C2X', 'C2', 'C2P'])
+                if c1 is None:
+                    raise ValueError("GPS L2: column C2* missing in gps_epoch.")
+                P = epoch[c1].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                ion = self._first_existing_or_zeros(epoch, ['ion'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                TGD_s = self._first_existing_or_zeros(epoch, ['TGD'], n)
+                pco_l2 = self._first_existing_or_zeros(epoch, ['pco_los_l2'], n)
+                return P - tro - ion - dprel + C * (clk_s - TGD_s) + pco_l2
+            if mode == 'L5':
+                c1 = self._first_matching_col(cols, ['C5X', 'C5'])
+                if c1 is None:
+                    raise ValueError("GPS L5: column C5* missing in gps_epoch.")
+                P = epoch[c1].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                ion = self._first_existing_or_zeros(epoch, ['ion'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                TGD_s = self._first_existing_or_zeros(epoch, ['TGD'], n)
+                pco_l5 = self._first_existing_or_zeros(epoch, ['pco_los_l5'], n)
+                return P - tro - ion - dprel + C * (clk_s - TGD_s) + pco_l5
+            if mode == 'L1L2':
+                c1 = self._first_matching_col(cols, ['C1C', 'C1W', 'C1', 'C1P'])
+                c2 = self._first_matching_col(cols, ['C2W', 'C2L', 'C2P', 'C2'])
+                if c1 is None or c2 is None:
+                    raise ValueError("GPS L1L2: no C1* or C2* columns in gps_epoch.")
+                k1, k2 = self._if_coeff['L1L2']
+                P1 = epoch[c1].to_numpy(dtype='float64', copy=False)
+                P2 = epoch[c2].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                pco_l1 = self._first_existing_or_zeros(epoch, ['pco_los_l1'], n)
+                pco_l2 = self._first_existing_or_zeros(epoch, ['pco_los_l2'], n)
+                pco = (k1 * pco_l1 - k2 * pco_l2)
+                return (k1 * P1 - k2 * P2) + C * clk_s - tro - dprel + pco
+            if mode == 'L1L5':
+                c1 = self._first_matching_col(cols, ['C1'])
+                c2 = self._first_matching_col(cols, ['C5'])
+                if c1 is None or c2 is None:
+                    raise ValueError("GPS L1L5: no C1* or C5* columns in gps_epoch.")
+                k1, k2 = self._if_coeff['L1L5']
+                P1 = epoch[c1].to_numpy(dtype='float64', copy=False)
+                P2 = epoch[c2].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                pco_l1 = self._first_existing_or_zeros(epoch, ['pco_los_l1'], n)
+                pco_l5 = self._first_existing_or_zeros(epoch, ['pco_los_l5'], n)
+                pco = (k1 * pco_l1 - k2 * pco_l5)
+                return (k1 * P1 - k2 * P2) + C * clk_s - tro - dprel + pco
+            if mode == 'L2L5':
+                c1 = self._first_matching_col(cols, ['C2'])
+                c2 = self._first_matching_col(cols, ['C5'])
+                if c1 is None or c2 is None:
+                    raise ValueError("GPS L2L5: no C2* or C5* columns in gps_epoch.")
+                k1, k2 = self._if_coeff['L2L5']
+                P1 = epoch[c1].to_numpy(dtype='float64', copy=False)
+                P2 = epoch[c2].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                pco_l2 = self._first_existing_or_zeros(epoch, ['pco_los_l2'], n)
+                pco_l5 = self._first_existing_or_zeros(epoch, ['pco_los_l5'], n)
+                pco = (k1 * pco_l2 - k2 * pco_l5)
+                return (k1 * P1 - k2 * P2) + C * clk_s - tro - dprel + pco
+            raise ValueError(f"Unknown gps_mode: {mode}")
+
+        if system == 'E':
+            if mode == 'E1':
+                c1 = self._first_matching_col(cols, ['C1C', 'C1X', 'C1A', 'C1'])
+                if c1 is None:
+                    c1 = self._first_matching_col(cols, ['C1B'])
+                if c1 is None:
+                    raise ValueError("GAL E1: column C1* missing in gal_epoch.")
+                P = epoch[c1].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                ion = self._first_existing_or_zeros(epoch, ['ion'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                BGD_s = self._first_existing_or_zeros(
+                    epoch, ['BGD', 'BGDe5a', 'BGDe5b', 'BGD_E1E5a', 'BGD_E1E5b'], n
+                )
+                return P - tro - ion - dprel + C * (clk_s - BGD_s)
+            if mode == 'E5a':
+                c1 = self._first_matching_col(cols, ['C5Q', 'C5X', 'C5'])
+                if c1 is None:
+                    raise ValueError("GAL E5a: column C5* missing in gal_epoch.")
+                P = epoch[c1].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                ion = self._first_existing_or_zeros(epoch, ['ion'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                BGD_s = self._first_existing_or_zeros(epoch, ['BGDe5a'], n)
+                return P - tro - ion - dprel + C * (clk_s - BGD_s)
+            if mode == 'E5b':
+                c1 = self._first_matching_col(cols, ['C7'])
+                if c1 is None:
+                    raise ValueError("GAL E5b: column C7* missing in gal_epoch.")
+                P = epoch[c1].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                ion = self._first_existing_or_zeros(epoch, ['ion'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                BGD_s = self._first_existing_or_zeros(epoch, ['BGDe5b'], n)
+                return P - tro - ion - dprel + C * (clk_s - BGD_s)
+            if mode == 'E1E5a':
+                c1 = self._first_matching_col(cols, ['C1C', 'C1X', 'C1W', 'C1'])
+                c5 = self._first_matching_col(cols, ['C5Q', 'C5X', 'C5', 'C5A'])
+                if c1 is None or c5 is None:
+                    raise ValueError("GAL E1E5a: columns C1* or C5* are missing in gal_epoch.")
+                k1, k2 = self._if_coeff['E1E5a']
+                P1 = epoch[c1].to_numpy(dtype='float64', copy=False)
+                P5 = epoch[c5].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                return (k1 * P1 - k2 * P5) + C * clk_s - tro - dprel
+            if mode == 'E1E5b':
+                c1 = self._first_matching_col(cols, ['C1C', 'C1X', 'C1W', 'C1'])
+                c5 = self._first_matching_col(cols, ['C7Q', 'C7X', 'C7'])
+                if c1 is None or c5 is None:
+                    raise ValueError("GAL E1E5b: columns C1* or C7* are missing in gal_epoch.")
+                k1, k2 = self._if_coeff['E1E5b']
+                P1 = epoch[c1].to_numpy(dtype='float64', copy=False)
+                P5 = epoch[c5].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                return (k1 * P1 - k2 * P5) + C * clk_s - tro - dprel
+            if mode == 'E5aE5b':
+                c1 = self._first_matching_col(cols, ['C5'])
+                c5 = self._first_matching_col(cols, ['C7'])
+                if c1 is None or c5 is None:
+                    raise ValueError("GAL E5aE5b: columns C5* or C7* are missing in gal_epoch.")
+                k1, k2 = self._if_coeff['E5aE5b']
+                P1 = epoch[c1].to_numpy(dtype='float64', copy=False)
+                P5 = epoch[c5].to_numpy(dtype='float64', copy=False)
+                tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+                dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+                clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+                return (k1 * P1 - k2 * P5) + C * clk_s - tro - dprel
+            raise ValueError(f"Unknown gal_mode: {mode}")
+
+        raise ValueError(f"Unknown system: {system}")
 
 
     def hjacobian(self, x, gps_sats=None, gal_sats=None):
@@ -149,6 +355,31 @@ class SinglePointPositioning:
             out.append(dist)
 
         return np.concatenate(out) if len(out) > 1 else out[0]
+
+    @staticmethod
+    def _weighted_lsq_solution(A: np.ndarray, L: np.ndarray, err: np.ndarray) -> np.ndarray:
+        """
+        Weighted least squares solution with diagonal weights stored as variances in err.
+        Returns X for the system (A^T W A) X = A^T W L without forming W.
+        """
+        if A.size == 0:
+            return np.zeros(0)
+        w_sqrt = 1.0 / np.sqrt(err)
+        Aw = A * w_sqrt[:, None]
+        Lw = L * w_sqrt
+        return np.linalg.lstsq(Aw, Lw, rcond=None)[0]
+
+    @staticmethod
+    def _weighted_lsq_covariance(A: np.ndarray, err: np.ndarray) -> np.ndarray:
+        """
+        Weighted least squares covariance for diagonal weights stored as variances in err.
+        Returns Q = (A^T W A)^-1 without forming W.
+        """
+        if A.size == 0:
+            return np.zeros((0, 0))
+        w_sqrt = 1.0 / np.sqrt(err)
+        Aw = A * w_sqrt[:, None]
+        return np.linalg.pinv(Aw.T @ Aw)
 
     def code_screening(self, omc, err, n_sigma=2):
         md = np.median(omc)
@@ -501,12 +732,18 @@ class SinglePointPositioning:
             raise ValueError("No observations: both gps_obs and gal_obs are None.")
 
         # --- epochs: UNION (nie intersection)
-        times = []
+        gps_epochs = {}
+        gal_epochs = {}
+        epoch_index = None
         if has_gps:
-            times.append(self.gps_obs.index.get_level_values("time").unique())
+            gps_times = self.gps_obs.index.get_level_values("time").unique()
+            epoch_index = gps_times if epoch_index is None else epoch_index.union(gps_times)
+            gps_epochs = {t: df for t, df in self.gps_obs.groupby(level="time", sort=False)}
         if has_gal:
-            times.append(self.gal_obs.index.get_level_values("time").unique())
-        epochs = sorted(set().union(*[t.to_pydatetime() for t in times]))
+            gal_times = self.gal_obs.index.get_level_values("time").unique()
+            epoch_index = gal_times if epoch_index is None else epoch_index.union(gal_times)
+            gal_epochs = {t: df for t, df in self.gal_obs.groupby(level="time", sort=False)}
+        epochs = epoch_index.sort_values() if epoch_index is not None else []
 
 
         tol = 1e-2
@@ -519,17 +756,17 @@ class SinglePointPositioning:
             gps_sats = None
             gal_sats = None
 
-            if has_gps and (t in self.gps_obs.index.get_level_values("time")):
-                gps_epoch = self.select_epoch(self.gps_obs, t)
+            if has_gps:
+                gps_epoch = gps_epochs.get(t)
 
-                if len(gps_epoch) > 0:
-                    gps_sats = gps_epoch[["xe", "ye", "ze"]].to_numpy()
+                if gps_epoch is not None and len(gps_epoch) > 0:
+                    gps_sats = gps_epoch[["xe", "ye", "ze"]].to_numpy(copy=False)
 
-            if has_gal and (t in self.gal_obs.index.get_level_values("time")):
-                gal_epoch = self.select_epoch(self.gal_obs, t)
+            if has_gal:
+                gal_epoch = gal_epochs.get(t)
 
-                if len(gal_epoch) > 0:
-                    gal_sats = gal_epoch[["xe", "ye", "ze"]].to_numpy()
+                if gal_epoch is not None and len(gal_epoch) > 0:
+                    gal_sats = gal_epoch[["xe", "ye", "ze"]].to_numpy(copy=False)
 
             n_gps = 0 if gps_sats is None else len(gps_sats)
             n_gal = 0 if gal_sats is None else len(gal_sats)
@@ -550,8 +787,9 @@ class SinglePointPositioning:
             A = self.hjacobian(x=xyz_apr, gps_sats=gps_sats, gal_sats=gal_sats)
 
             # --- observed vectors
-            observed_all, observed_gps, observed_gal = self.observed(gps_epoch=gps_epoch, gal_epoch=gal_epoch)
-            if observed_all is None:
+            gps_base = self._build_obs_base(gps_epoch, 'G', self.gps_mode) if n_gps > 0 else None
+            gal_base = self._build_obs_base(gal_epoch, 'E', self.gal_mode) if n_gal > 0 else None
+            if gps_base is None and gal_base is None:
                 continue
 
             # --- computed distances + L
@@ -559,22 +797,37 @@ class SinglePointPositioning:
             err_parts = []
 
             if n_gps > 0:
+                gps_clock_init = (
+                    gps_epoch["dtr"].to_numpy(dtype='float64', copy=False)
+                    if "dtr" in gps_epoch.columns else 0.0
+                )
+                observed_gps = gps_base - gps_clock_init
                 computed_gps = calculate_distance(gps_sats, xyz_apr[:3])
                 L_gps = observed_gps - computed_gps
                 L_parts.append(L_gps)
 
-                err_gps = 0.5 / (np.sin(np.deg2rad(gps_epoch["ev"])) ** 2)
+                ev_gps = gps_epoch["ev"].to_numpy(copy=False)
+                sin_el_gps = np.sin(np.deg2rad(ev_gps))
+                err_gps = 0.5 / (sin_el_gps ** 2)
                 err_gps = self.code_screening(L_gps, err_gps)
                 err_parts.append(err_gps)
             else:
                 L_gps = None
 
             if n_gal > 0:
+                gal_clock_init = (
+                    gal_epoch["dtr_gal"].to_numpy(dtype='float64', copy=False)
+                    if "dtr_gal" in gal_epoch.columns else 0.0
+                )
+                observed_gal = gal_base - gal_clock_init
                 computed_gal = calculate_distance(gal_sats, xyz_apr[:3])
                 L_gal = observed_gal - computed_gal
                 L_parts.append(L_gal)
 
-                err_gal = 0.5 / (np.sin(np.deg2rad(gal_epoch["ev"])) ** 2)
+                ev_gal = gal_epoch["ev"].to_numpy(copy=False)
+                sin_el_gal = np.sin(np.deg2rad(ev_gal))
+                err_gal = 0.5 / (sin_el_gal ** 2)
+                base_err_gal = err_gal.copy()
                 err_gal = self.code_screening(L_gal, err_gal)
                 err_parts.append(err_gal)
             else:
@@ -584,29 +837,23 @@ class SinglePointPositioning:
             err = np.concatenate(err_parts) if len(err_parts) > 1 else err_parts[0]
 
             # --- LSQ
-            W = np.linalg.pinv(np.diag(err))
-            Q = np.linalg.pinv(A.T @ W @ A)
-            X = Q @ (A.T @ W @ L_all)
+            X = self._weighted_lsq_solution(A, L_all, err)
 
             # --- init update
             obl = xyz_apr[:3] + X[:3]
-
-            # --- set initial clocks into epoch dfs (so observed() can subtract them)
-            gps_epoch_local = None if gps_epoch is None else gps_epoch.copy()
-            gal_epoch_local = None if gal_epoch is None else gal_epoch.copy()
+            gps_clock = 0.0
+            gal_clock = 0.0
 
             # indeksy zegarów w wektorze X:
             # single-system: X[3] = dtr (dla tego systemu)
             # dual-system:   X[3] = dtr_gps, X[4] = dtr_gal
             if n_gps > 0 and n_gal > 0:
-                if gps_epoch_local is not None:
-                    gps_epoch_local.loc[:, "dtr"] = X[3]
-                if gal_epoch_local is not None:
-                    gal_epoch_local.loc[:, "dtr_gal"] = X[4]
+                gps_clock = float(X[3])
+                gal_clock = float(X[4])
             elif n_gps > 0:
-                gps_epoch_local.loc[:, "dtr"] = X[3]
+                gps_clock = float(X[3])
             elif n_gal > 0:
-                gal_epoch_local.loc[:, "dtr_gal"] = X[3]
+                gal_clock = float(X[3])
 
             # --- iterations
             it = 0
@@ -614,14 +861,12 @@ class SinglePointPositioning:
                 x_prev = X.copy()
 
                 A = self.hjacobian(x=obl, gps_sats=gps_sats, gal_sats=gal_sats)
-                observed_all, observed_gps, observed_gal = self.observed(
-                    gps_epoch=gps_epoch_local, gal_epoch=gal_epoch_local
-                )
 
                 L_parts = []
                 err_parts = []
 
                 if n_gps > 0:
+                    observed_gps = gps_base - gps_clock
                     computed_gps = calculate_distance(gps_sats, obl)
                     L_gps = observed_gps - computed_gps
                     err_gps = self.code_screening(L_gps, err_gps)
@@ -629,9 +874,10 @@ class SinglePointPositioning:
                     err_parts.append(err_gps)
 
                 if n_gal > 0:
+                    observed_gal = gal_base - gal_clock
                     computed_gal = calculate_distance(gal_sats, obl)
                     L_gal = observed_gal - computed_gal
-                    err_gal = 0.5 / (np.sin(np.deg2rad(gal_epoch_local["ev"])) ** 2)
+                    err_gal = base_err_gal.copy()
                     err_gal = self.code_screening(L_gal, err_gal)
                     L_parts.append(L_gal)
                     err_parts.append(err_gal)
@@ -639,22 +885,18 @@ class SinglePointPositioning:
                 L_all = np.concatenate(L_parts) if len(L_parts) > 1 else L_parts[0]
                 err = np.concatenate(err_parts) if len(err_parts) > 1 else err_parts[0]
 
-                W = np.linalg.pinv(np.diag(err))
-                Q = np.linalg.pinv(A.T @ W @ A)
-                X = Q @ (A.T @ W @ L_all)
+                X = self._weighted_lsq_solution(A, L_all, err)
 
                 obl = obl + X[:3]
 
                 # update clocks
                 if n_gps > 0 and n_gal > 0:
-                    if gps_epoch_local is not None:
-                        gps_epoch_local.loc[:, "dtr"] = X[3]
-                    if gal_epoch_local is not None:
-                        gal_epoch_local.loc[:, "dtr_gal"] = X[4]
+                    gps_clock = float(X[3])
+                    gal_clock = float(X[4])
                 elif n_gps > 0:
-                    gps_epoch_local.loc[:, "dtr"] = X[3]
+                    gps_clock = float(X[3])
                 elif n_gal > 0:
-                    gal_epoch_local.loc[:, "dtr_gal"] = X[3]
+                    gal_clock = float(X[3])
 
                 it += 1
                 if np.max(np.abs(X - x_prev)) < tol:
@@ -665,14 +907,15 @@ class SinglePointPositioning:
             # --- residuals
             # zbuduj L_all jeszcze raz w końcowym punkcie (obl i zegary już aktualne)
             A = self.hjacobian(x=obl, gps_sats=gps_sats, gal_sats=gal_sats)
-            observed_all, observed_gps, observed_gal = self.observed(gps_epoch_local, gal_epoch_local)
 
             L_parts = []
             if n_gps > 0:
+                observed_gps = gps_base - gps_clock
                 computed_gps = calculate_distance(gps_sats, obl)
                 L_gps = observed_gps - computed_gps
                 L_parts.append(L_gps)
             if n_gal > 0:
+                observed_gal = gal_base - gal_clock
                 computed_gal = calculate_distance(gal_sats, obl)
                 L_gal = observed_gal - computed_gal
                 L_parts.append(L_gal)
@@ -695,6 +938,7 @@ class SinglePointPositioning:
                         None))), "V"] = V_all[cursor:cursor + n_gal]
                 cursor += n_gal
 
+            Q = self._weighted_lsq_covariance(A, err)
             sig = np.sqrt(np.clip(np.diag(Q), 0.0, np.inf))
             sig_x, sig_y, sig_z = sig[0], sig[1], sig[2]
             sig_dtr = sig[3] if len(sig) > 3 else np.nan
@@ -736,6 +980,11 @@ class SinglePointPositioning:
                 row.update({"de": float(denu[0]), "dn": float(denu[1]), "du": float(denu[2])})
                 if getattr(self.config, "trace_filter", False):
                     print(f"Epoch: {t} error de: {denu[0]} dn: {denu[1]} du: {denu[2]}")
+                    if n_gps > 0:
+                        print(V_all[:n_gps])
+                    if n_gal > 0:
+                        print(V_all[n_gps:n_gps + n_gal])
+                    print("====" * 30, "\n")
 
             results_rows.append(row)
 
@@ -764,6 +1013,7 @@ class SPPSession:  # noqa: D101 – docstring below
 
 
     # ‑‑‑ public API ---------------------------------------------------------
+    @guarded_session_run("SPPSession")
     def run(self) -> SPPResult:  # noqa: C901 – orchestration, acceptable
         processor = GNSSDataProcessor2(
             atx_path=self.config.atx_path,
@@ -958,6 +1208,3 @@ class SPPSession:  # noqa: D101 – docstring below
                                   antenna_h=antenna_h, system=system)
         obs_preprocessed = prc.run()
         return obs_preprocessed
-
-
-

@@ -8,15 +8,22 @@ import pandas as pd
 
 from .ppp_gnss import PPPDualFreqMultiGNSS
 from .ppp_single import PPPDualFreqSingleGNSS,PPPSingleFreqSingleGNSS
-from .ppp_uduc import PPPUdMultiGNSS, PPPUdSingleGNSS,PPPUducSFMultiGNSS, PPPFilterMultiGNSSIonConst
+from .ppp_uduc import (
+    PPPUdMultiGNSS,
+    PPPUdSingleGNSS,
+    PPPUducSFMultiGNSS,
+    PPPUducSFSingleGNSS,
+    PPPFilterMultiGNSSIonConst,
+)
 from ..conversion import ecef2geodetic
-from ..coordinates import make_ionofree, CustomWrapper, BroadcastInterp, lagrange_reception_interp, lagrange_emission_interp
+from ..coordinates import SP3InterpolatorOptimized, make_ionofree, emission_interp, CustomWrapper, BroadcastInterp, lagrange_reception_interp, lagrange_emission_interp
 from ..io import read_sp3, parse_sinex, GNSSDataProcessor2
 from ..ionosphere.config import TECConfig, STECMonitor
 from ..ionosphere.ionex import GIMReader
 from ..time import arange_datetime
 from ..tools import CSDetector, DDPreprocessing
 from ..configuration import PPPConfig
+from ..session_errors import guarded_session_run
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
@@ -52,6 +59,7 @@ class PPPSession:  # noqa: D101 – docstring below
         self.FREQ_DICT = {'L1': 1575.42e06, 'L2': 1227.60e06,
                           'E1': 1575.42e06, 'E5a': 1176.45e06}
 
+    @guarded_session_run("PPPSession")
     def run(self):
 
         processor = GNSSDataProcessor2(
@@ -70,7 +78,6 @@ class PPPSession:  # noqa: D101 – docstring below
         unknown = selected - allowed
         if unknown:
             raise ValueError(f"Unsupported systems in config.sys: {unknown}. Allowed: {allowed}")
-
         obs_data = self._load_obs_data(processor)
         xyz, flh = obs_data.meta[4], obs_data.meta[5]
 
@@ -81,13 +88,13 @@ class PPPSession:  # noqa: D101 – docstring below
             raise ValueError(f"Selected systems {missing} but no observations found in {self.config.obs_path}")
 
         broadcast = None
+
         if self.config.nav_path:
             broadcast = self._load_nav_data(processor)
 
         if self.config.nav_path and self.config.screen:
             gps_obs, gal_obs = self._screen_data(processor, obs_by_sys['G'], obs_by_sys['E'], broadcast)
             obs_by_sys['G'], obs_by_sys['E'] = gps_obs, gal_obs
-
         # sp3_df tylko gdy potrzebny
         sp3_df = None
         if self.config.orbit_type == "precise":
@@ -97,7 +104,6 @@ class PPPSession:  # noqa: D101 – docstring below
                       .set_index(['time', 'sv']))
             sp3_df[['x', 'y', 'z']] = sp3_df[['x', 'y', 'z']].values * 1e3
             sp3_df['clk'] = sp3_df['clk'].values * 1e-6
-
         mode_by_sys = {'G': self.config.gps_freq, 'E': self.config.gal_freq}
 
         crd_by_sys = {}
@@ -160,7 +166,6 @@ class PPPSession:  # noqa: D101 – docstring below
 
         obs_gps_crd = crd_by_sys.get('G')
         obs_gal_crd = crd_by_sys.get('E')
-
         result = self._run_filter(
             obs_data=obs_data,
             obs_gps_crd=obs_gps_crd,
@@ -357,6 +362,7 @@ class PPPSession:  # noqa: D101 – docstring below
 
         has_gps = isinstance(obs_gps_crd, pd.DataFrame) and not obs_gps_crd.empty
         has_gal = isinstance(obs_gal_crd, pd.DataFrame) and not obs_gal_crd.empty
+        single_modes = {'L1', 'L2', 'L5', 'E1', 'E5a', 'E5b'}
         if has_gps and has_gal:
             return PPPUducSFMultiGNSS(gps_obs=obs_gps_crd,gps_mode=gps_mode,
                                               gal_obs=obs_gal_crd,gal_mode=gal_mode,
@@ -369,6 +375,20 @@ class PPPSession:  # noqa: D101 – docstring below
             elif has_gal:
                 obs = obs_gal_crd
                 mode = gal_mode
+            if mode in single_modes:
+                return PPPUducSFSingleGNSS(
+                    obs=obs,
+                    mode=mode,
+                    ekf=ekf,
+                    pos0=pos0,
+                    tro=True,
+                    interval=interval,
+                    use_iono_rms=self.config.use_iono_rms,
+                    sigma_iono_0=self.config.sigma_iono_0,
+                    sigma_iono_end=self.config.sigma_iono_end,
+                    t_end=self.config.t_end,
+                    config=self.config,
+                )
             return PPPSingleFreqSingleGNSS(obs=obs,mode=mode,ekf=ekf,pos0=pos0,interval=interval,config=self.config)
 
     def _run_filter(self, obs_data, obs_gps_crd, obs_gal_crd, interval) -> PPPResult:  # noqa: D401 – simple phrase
@@ -407,4 +427,3 @@ class PPPSession:  # noqa: D101 – docstring below
 
 
         return PPPResult(solution=ppp_result,residuals_gps=ppp_gps, residuals_gal=ppp_gal, convergence=conv_time)
-

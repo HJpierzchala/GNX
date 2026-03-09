@@ -4,6 +4,7 @@ from datetime import datetime
 import os
 import numpy as np
 from gnx_py.spp import SPPSession, SPPConfig
+from gnx_py.session_errors import SessionExecutionError
 import warnings
 import matplotlib.pyplot as plt
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -79,6 +80,9 @@ if __name__ =='__main__':
                 # for num, col in enumerate(['de','dn','du','dtr_gps']):
                 #     ax[num].plot(sol['time'], sol[col])
                 plt.show()
+        except SessionExecutionError as e:
+            print(f"Session error for {RNX}: {e}")
+            continue
         except Exception as e:
             print('Error with: ', RNX)
             traceback.print_exc()

@@ -1077,11 +1077,18 @@ class DDPreprocessing:
         self.df.loc[:, 'me_wet'] = me_wet
 
     def compute_collins(self):
-        self.df['tro_co'] = self.df.apply(lambda row: tropospheric_delay(f=self.flh[0],
-                                                                         h=self.flh[2],
-                                                                         elevation=row['ev'],
-                                                                         doy=self.doy),
-                                          axis=1)
+        ev = self.df['ev'].to_numpy()
+        tro_co = np.fromiter(
+            (
+                tropospheric_delay(
+                    f=self.flh[0], h=self.flh[2], elevation=el, doy=self.doy
+                )
+                for el in ev
+            ),
+            dtype=float,
+            count=ev.size,
+        )
+        self.df['tro_co'] = tro_co
 
 
     def compute_tides(self):
@@ -1194,5 +1201,4 @@ class DDPreprocessing:
         if self.configuration.solid_tides:
             self.compute_tides()
         return self.df
-
 

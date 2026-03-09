@@ -35,9 +35,10 @@ import numpy as np
 from scipy.signal import savgol_filter
 from scipy.signal import cheby1, filtfilt
 from ..io import GNSSDataProcessor2, read_sp3
-from ..coordinates import make_ionofree, BroadcastInterp
+from ..coordinates import make_ionofree, emission_interp, BroadcastInterp
 from ..tools import CSDetector
 from ..tools import DDPreprocessing
+from ..session_errors import guarded_session_run
 
 
 def apply_savgol_filter_1d(
@@ -590,6 +591,16 @@ class TECSession:
     cycle‑slip detection, and TEC computation via STECMonitor.
     """
 
+    CLIGHT: float = 299792458.0
+    FREQ_DICT: dict[str, float] = {
+        "L1": 1575.42e06,
+        "L2": 1227.60e06,
+        "L5": 1176.45e06,
+        "E1": 1575.42e06,
+        "E5a": 1176.45e06,
+        "E5b": 1207.14e06,
+    }
+
 
     def __init__(self,
                  config: TECConfig,
@@ -612,6 +623,7 @@ class TECSession:
         self.use_sys = self.config.sys
 
 
+    @guarded_session_run("TECSession")
     def run(self):
         """Execute the TEC pipeline using provided positions/SP3 inputs.
 
@@ -673,6 +685,11 @@ class TECSession:
                                        rec_pco=obs_data.rec_pco,
                                        antenna_h=obs_data.meta[3],
                                        system=self.use_sys)
+        obs_gps_crd = self._apply_observation_corrections(
+            obs_df=obs_gps_crd,
+            mode=mode,
+            system=self.use_sys,
+        )
 
         obs_gps_crd = self._detect_cycle_slips(obs_df=obs_gps_crd,
                                                mode=mode,
@@ -764,7 +781,27 @@ class TECSession:
         obs_crd = wrapper.run()
         return obs_crd
 
+    def _interpolate_emission(self, obs_df,xyz, flh,sys,mode, positions, sp3):
+        """Interpolate satellite positions at emission times and add geometry.
 
+        Returns:
+            pd.DataFrame: Observations with emission coordinates and geometric angles.
+        """
+
+
+        make_ionofree(obs_df,sys,mode)
+        obs_crd = emission_interp(
+            obs=obs_df,
+            crd=positions,
+            prev_sp3_df=sp3[0],
+            next_sp3_df=sp3[-1],
+            sp3_df=sp3[1]
+        )
+
+        wrapper =  CustomWrapper(obs=obs_crd,epochs=None,flh=flh.copy(),xyz_a=xyz.copy(),
+                                          mode=mode)
+        obs_crd = wrapper.run()
+        return obs_crd
     def _preprocess(self, obs, flh, xyz,
                     broadcast,phase_shift,sat_pco, rec_pco, antenna_h, system):
         """Apply preprocessing: PCO/PCV, wind‑up, path corrections, and model terms.
@@ -806,6 +843,91 @@ class TECSession:
         obs_df = obs_df.set_index(['arc', 'time'])
         obs_df.index.names = ['sv', 'time']
         obs_df = obs_df.drop(columns=['sv'])
+        return obs_df
+
+    def _mode_layout(self, mode: str, system: str) -> list[dict[str, str]]:
+        if system == "G":
+            layouts = {
+                "L1": [{"code": "C1", "phase": "L1", "freq": "L1", "rec_pco_col": "pco_los"}],
+                "L2": [{"code": "C2", "phase": "L2", "freq": "L2", "rec_pco_col": "pco_los"}],
+                "L5": [{"code": "C5", "phase": "L5", "freq": "L5", "rec_pco_col": "pco_los"}],
+                "L1L2": [
+                    {"code": "C1", "phase": "L1", "freq": "L1", "rec_pco_col": "pco_los_l1"},
+                    {"code": "C2", "phase": "L2", "freq": "L2", "rec_pco_col": "pco_los_l2"},
+                ],
+                "L1L5": [
+                    {"code": "C1", "phase": "L1", "freq": "L1", "rec_pco_col": "pco_los_l1"},
+                    {"code": "C5", "phase": "L5", "freq": "L5", "rec_pco_col": "pco_los_l2"},
+                ],
+                "L2L5": [
+                    {"code": "C2", "phase": "L2", "freq": "L2", "rec_pco_col": "pco_los_l1"},
+                    {"code": "C5", "phase": "L5", "freq": "L5", "rec_pco_col": "pco_los_l2"},
+                ],
+            }
+        else:
+            layouts = {
+                "E1": [{"code": "C1", "phase": "L1", "freq": "E1", "rec_pco_col": "pco_los"}],
+                "E5a": [{"code": "C5", "phase": "L5", "freq": "E5a", "rec_pco_col": "pco_los"}],
+                "E5b": [{"code": "C7", "phase": "L7", "freq": "E5b", "rec_pco_col": "pco_los"}],
+                "E1E5a": [
+                    {"code": "C1", "phase": "L1", "freq": "E1", "rec_pco_col": "pco_los_l1"},
+                    {"code": "C5", "phase": "L5", "freq": "E5a", "rec_pco_col": "pco_los_l2"},
+                ],
+                "E1E5b": [
+                    {"code": "C1", "phase": "L1", "freq": "E1", "rec_pco_col": "pco_los_l1"},
+                    {"code": "C7", "phase": "L7", "freq": "E5b", "rec_pco_col": "pco_los_l5"},
+                ],
+                "E5aE5b": [
+                    {"code": "C5", "phase": "L5", "freq": "E5a", "rec_pco_col": "pco_los_l1"},
+                    {"code": "C7", "phase": "L7", "freq": "E5b", "rec_pco_col": "pco_los_l5"},
+                ],
+            }
+        if mode not in layouts:
+            raise ValueError(f"Unsupported mode '{mode}' for system '{system}'.")
+        return layouts[mode]
+
+    def _get_corr(self, obs_df: pd.DataFrame, enabled: bool, column: str) -> np.ndarray:
+        if enabled and column in obs_df.columns:
+            return obs_df[column].to_numpy(copy=False)
+        return np.zeros(len(obs_df), dtype=float)
+
+    def _apply_observation_corrections(self, obs_df: pd.DataFrame, mode: str, system: str) -> pd.DataFrame:
+        """Apply sat/rec PCO and phase windup to raw code/phase observations.
+
+        Convention is aligned with PPP UDUC:
+        - code:  C <- C - rec_pco + sat_pco
+        - phase: L <- L - rec_pco + sat_pco - lambda * phw
+        If a correction is disabled or missing, zeros are applied.
+        """
+        obs_df = obs_df.copy()
+        layout = self._mode_layout(mode=mode, system=system)
+        sat_enabled = bool(self.config.sat_pco)
+        rec_enabled = bool(self.config.rec_pco)
+        windup_enabled = bool(self.config.windup)
+
+        for band in layout:
+            code_cols = [c for c in obs_df.columns if c.startswith(band["code"])]
+            phase_cols = [c for c in obs_df.columns if c.startswith(band["phase"])]
+            if not code_cols and not phase_cols:
+                continue
+
+            rec = self._get_corr(obs_df=obs_df, enabled=rec_enabled, column=band["rec_pco_col"])
+            sat = self._get_corr(
+                obs_df=obs_df,
+                enabled=sat_enabled,
+                column=f"sat_pco_los_{band['freq']}",
+            )
+            common = -rec + sat
+
+            if code_cols:
+                obs_df.loc[:, code_cols] = obs_df[code_cols].to_numpy(copy=False) + common[:, None]
+
+            if phase_cols:
+                phw = self._get_corr(obs_df=obs_df, enabled=windup_enabled, column="phw")
+                lam = self.CLIGHT / self.FREQ_DICT[band["freq"]]
+                phase_corr = common - lam * phw
+                obs_df.loc[:, phase_cols] = obs_df[phase_cols].to_numpy(copy=False) + phase_corr[:, None]
+
         return obs_df
 
     @staticmethod

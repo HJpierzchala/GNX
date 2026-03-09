@@ -5,6 +5,14 @@ from filterpy.kalman import ExtendedKalmanFilter
 from ..conversion import ecef_to_enu
 from ..utils import calculate_distance
 from ..configuration import PPPConfig
+from .pppar import PPPARSettings, apply_uncombined_pppar
+
+def _unit_vectors_and_ranges(sat_xyz: np.ndarray, rec_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    rho_vec = sat_xyz - rec_xyz
+    rho = np.linalg.norm(rho_vec, axis=1)
+    e = -rho_vec / rho[:, None]
+    return e, rho
+
 
 class PPPUducSFMultiGNSS:
     def __init__(self, config:PPPConfig, gps_obs, gps_mode, gal_obs, gal_mode, ekf, pos0, tro=True, interval=0.5):
@@ -40,14 +48,9 @@ class PPPUducSFMultiGNSS:
         n_gal = gal_satellites.shape[0]
         rec_xyz = x[:3].copy()
 
-        # Jednostkowe wektory do satelitów GPS
-        rho_gps = gps_satellites[:, :3] - rec_xyz
-        e_gps = rho_gps / np.linalg.norm(rho_gps, axis=1)[:, None]
+        e_gps, _ = _unit_vectors_and_ranges(gps_satellites[:, :3], rec_xyz)
+        e_gal, _ = _unit_vectors_and_ranges(gal_satellites[:, :3], rec_xyz)
         m_wet_gps = gps_satellites[:, 3]
-
-        # Jednostkowe wektory do satelitów Galileo
-        rho_gal = gal_satellites[:, :3] - rec_xyz
-        e_gal = rho_gal / np.linalg.norm(rho_gal, axis=1)[:, None]
         m_wet_gal = gal_satellites[:, 3]
 
         # Parametry wspólne: XYZ, clk_gps, ISB_galileo, ZTD
@@ -62,49 +65,35 @@ class PPPUducSFMultiGNSS:
         H = np.zeros((2 * (n_gps + n_gal), base_dim + 2 * (n_gps + n_gal)))
 
         # ---------------- GPS ----------------
-        for s in range(n_gps):
-            row = 2 * s
-            ex, ey, ez = -e_gps[s]
-            mw = m_wet_gps[s]
+        if n_gps:
+            gps_rows = slice(0, 2 * n_gps)
+            H[gps_rows, [COL_X, COL_Y, COL_Z]] = np.repeat(e_gps, 2, axis=0)
+            H[gps_rows, COL_CLK] = 1.0
+            H[gps_rows, COL_ZTD] = np.repeat(m_wet_gps, 2)
 
-            for i in range(2):
-                H[row + i, [COL_X, COL_Y, COL_Z]] = [ex, ey, ez]
-                H[row + i, COL_CLK] = 1.0  # wspólny zegar GPS
-                H[row + i, COL_ZTD] = mw
-
-            col_iono = base_dim + 2 * s
-            col_N1 = col_iono + 1
-
-            # Efekt IONO
-            H[row + 0, col_iono] = +MU1  # P1
-            H[row + 1, col_iono] = -MU1  # L1
-
-
-            # Ambiguity
-            H[row + 1, col_N1] = L1
+            idx = np.arange(n_gps)
+            row0 = 2 * idx
+            row1 = row0 + 1
+            col_iono = base_dim + 2 * idx
+            H[row0, col_iono] = MU1
+            H[row1, col_iono] = -MU1
+            H[row1, col_iono + 1] = L1
 
         # ---------------- Galileo ----------------
-        for s in range(n_gal):
-            row = 2 * (n_gps + s)
-            ex, ey, ez = -e_gal[s]
-            mw = m_wet_gal[s]
+        if n_gal:
+            gal_rows = slice(2 * n_gps, 2 * (n_gps + n_gal))
+            H[gal_rows, [COL_X, COL_Y, COL_Z]] = np.repeat(e_gal, 2, axis=0)
+            H[gal_rows, COL_CLK] = 1.0
+            H[gal_rows, COL_ISB] = 1.0
+            H[gal_rows, COL_ZTD] = np.repeat(m_wet_gal, 2)
 
-            for i in range(2):
-                H[row + i, [COL_X, COL_Y, COL_Z]] = [ex, ey, ez]
-                H[row + i, COL_CLK] = 1.0  # współdzielony zegar
-                H[row + i, COL_ISB] = 1.0  # inter-sys bias dla Galileo
-                H[row + i, COL_ZTD] = mw
-
-            col_iono = base_dim + 2 * (n_gps + s)
-            col_N1 = col_iono + 1
-
-            # Efekt IONO (na Galileo)
-            H[row + 0, col_iono] = +MU1_GAL  # E1 code
-            H[row + 1, col_iono] = -MU1_GAL  # E1 phase
-
-
-            # Ambiguity (Galileo)
-            H[row + 1, col_N1] = E1
+            idx = np.arange(n_gal)
+            row0 = 2 * (n_gps + idx)
+            row1 = row0 + 1
+            col_iono = base_dim + 2 * (n_gps + idx)
+            H[row0, col_iono] = MU1_GAL
+            H[row1, col_iono] = -MU1_GAL
+            H[row1, col_iono + 1] = E1
 
         return H
 
@@ -121,7 +110,6 @@ class PPPUducSFMultiGNSS:
         E1 = C / F1_GAL
         MU1_GAL = 1.0
 
-        xr, yr, zr = x_state[0:3]
         clk = x_state[3]
         isb = x_state[4]  # inter-sys bias (dla Galileo)
         zwd = x_state[5]
@@ -130,44 +118,34 @@ class PPPUducSFMultiGNSS:
         n_gps = gps_satellites.shape[0]
         n_gal = gal_satellites.shape[0]
 
-        # Z góry rozmiar wektora predykcji: 4 obserwacje na każdy satelita
         z_hat = np.empty(2 * (n_gps + n_gal))
 
-        # --- GPS ---
-        sat_xyz = gps_satellites[:, :3]
-        m_wet = gps_satellites[:, 3]
-        rho_vec = sat_xyz - np.array([xr, yr, zr])
-        rho = np.linalg.norm(rho_vec, axis=1)
+        if n_gps:
+            gps_state = x_state[base_dim:base_dim + 2 * n_gps].reshape(n_gps, 2)
+            I_gps = gps_state[:, 0]
+            N1_gps = gps_state[:, 1]
+            _, rho_gps = _unit_vectors_and_ranges(gps_satellites[:, :3], x_state[:3])
+            mw_gps = gps_satellites[:, 3]
+            geom = rho_gps
+            gps_block = np.column_stack((
+                geom + clk + mw_gps * zwd + MU1 * I_gps,
+                geom + clk + mw_gps * zwd - MU1 * I_gps + L1 * N1_gps,
+            ))
+            z_hat[:2 * n_gps] = gps_block.reshape(-1)
 
-        for s in range(n_gps):
-            i = base_dim + 2 * s
-            I_s = x_state[i]
-            N1_s = x_state[i + 1]
-
-            geom = rho[s]
-            mw = m_wet[s]
-
-            z_hat[2 * s + 0] = geom + clk + mw * zwd + MU1 * I_s  # P1
-            z_hat[2 * s + 1] = geom + clk + mw * zwd - MU1 * I_s + L1 * N1_s  # L1
-
-        # --- Galileo ---
-        sat_xyz = gal_satellites[:, :3]
-        m_wet = gal_satellites[:, 3]
-        rho_vec = sat_xyz - np.array([xr, yr, zr])
-        rho = np.linalg.norm(rho_vec, axis=1)
-
-        for s in range(n_gal):
-            i = base_dim + 2 * (n_gps + s)
-            I_s = x_state[i]
-            N1_s = x_state[i + 1]
-
-            geom = rho[s]
-            mw = m_wet[s]
-
-            row = 2 * (n_gps + s)
-
-            z_hat[row + 0] = geom + clk + isb + mw * zwd + MU1_GAL * I_s  # E1 code
-            z_hat[row + 1] = geom + clk + isb + mw * zwd - MU1_GAL * I_s + E1 * N1_s  # E1 phase
+        if n_gal:
+            gal_state = x_state[base_dim + 2 * n_gps:base_dim + 2 * (n_gps + n_gal)].reshape(n_gal, 2)
+            I_gal = gal_state[:, 0]
+            N1_gal = gal_state[:, 1]
+            _, rho_gal = _unit_vectors_and_ranges(gal_satellites[:, :3], x_state[:3])
+            mw_gal = gal_satellites[:, 3]
+            geom = rho_gal
+            gal_block = np.column_stack((
+                geom + clk + isb + mw_gal * zwd + MU1_GAL * I_gal,
+                geom + clk + isb + mw_gal * zwd - MU1_GAL * I_gal + E1 * N1_gal,
+            ))
+            start = 2 * n_gps
+            z_hat[start:start + 2 * n_gal] = gal_block.reshape(-1)
 
         return z_hat
 
@@ -211,35 +189,30 @@ class PPPUducSFMultiGNSS:
         prev_all = [tag("G", sv) for sv in prev_gps] + [tag("E", sv) for sv in prev_gal]
         curr_all = [tag("G", sv) for sv in curr_gps] + [tag("E", sv) for sv in curr_gal]
 
-        common = set(prev_all) & set(curr_all)
+        prev_map = {prn: i for i, prn in enumerate(prev_all)}
+        curr_map = {prn: i for i, prn in enumerate(curr_all)}
+        common = [prn for prn in curr_all if prn in prev_map]
 
-        # --- przenoszenie wspólnych satelitów ---
-        for prn in common:
-            i_old = prev_all.index(prn)
-            i_new = curr_all.index(prn)
-            for k in range(2):
-                xo = base_dim + 2 * i_old + k
-                xn = base_dim + 2 * i_new + k
-                x_new[xn] = x_old[xo]
+        if common:
+            prev_idx = np.fromiter((prev_map[prn] for prn in common), dtype=int)
+            curr_idx = np.fromiter((curr_map[prn] for prn in common), dtype=int)
+            offsets = np.arange(2)
+            old_state_idx = (base_dim + 2 * prev_idx[:, None] + offsets[None, :]).ravel()
+            new_state_idx = (base_dim + 2 * curr_idx[:, None] + offsets[None, :]).ravel()
 
-                P_new[xn, :base_dim] = P_old[xo, :base_dim]
-                P_new[:base_dim, xn] = P_old[:base_dim, xo]
-                Q_new[xn, :base_dim] = Q_old[xo, :base_dim]
-                Q_new[:base_dim, xn] = Q_old[:base_dim, xo]
-
-                for prn2 in common:
-                    j_old = prev_all.index(prn2)
-                    j_new = curr_all.index(prn2)
-                    for l in range(2):
-                        yo = base_dim + 2 * j_old + l
-                        yn = base_dim + 2 * j_new + l
-                        P_new[xn, yn] = P_old[xo, yo]
-                        Q_new[xn, yn] = Q_old[xo, yo]
+            x_new[new_state_idx] = x_old[old_state_idx]
+            base_idx = np.arange(base_dim)
+            P_new[np.ix_(new_state_idx, base_idx)] = P_old[np.ix_(old_state_idx, base_idx)]
+            P_new[np.ix_(base_idx, new_state_idx)] = P_old[np.ix_(base_idx, old_state_idx)]
+            Q_new[np.ix_(new_state_idx, base_idx)] = Q_old[np.ix_(old_state_idx, base_idx)]
+            Q_new[np.ix_(base_idx, new_state_idx)] = Q_old[np.ix_(base_idx, old_state_idx)]
+            P_new[np.ix_(new_state_idx, new_state_idx)] = P_old[np.ix_(old_state_idx, old_state_idx)]
+            Q_new[np.ix_(new_state_idx, new_state_idx)] = Q_old[np.ix_(old_state_idx, old_state_idx)]
 
         # --- nowe satelity: zainicjalizuj I_s z P4 ---
         new_only = set(curr_all) - set(prev_all)
         for prn in new_only:
-            j = curr_all.index(prn)
+            j = curr_map[prn]
             idx_I = base_dim + 2 * j
             idx_N1 = idx_I + 1
 
@@ -467,19 +440,17 @@ class PPPUducSFMultiGNSS:
             N_vec    -- wektor [N1_1, N2_1, N1_2, N2_2, ..., N1_n, N2_n]
             P_N      -- macierz kowariancji odpowiadająca N_vec
         """
-        idxs_N = []
-        for i in range(n_sats):
-            idx_N1 = base_dim + 2 * i + 1
-            idx_N2 = base_dim + 2 * i + 2
-            idxs_N.extend([idx_N1, idx_N2])
-
+        offsets = np.array([1, 2])
+        idxs_N = (base_dim + 2 * np.arange(n_sats)[:, None] + offsets[None, :]).ravel()
         N_vec = x[idxs_N]
         P_N = P[np.ix_(idxs_N, idxs_N)]
 
         return N_vec, P_N
 
     def code_screening(self, x, satellites, code_obs, thr=1):
-        dist = calculate_distance(satellites, x)
+        sat_xyz = np.asarray(satellites, dtype=float)
+        ref_xyz = np.asarray(x, dtype=float)
+        dist = np.linalg.norm(sat_xyz - ref_xyz, axis=1)
         prefit = code_obs-dist
         median_prefit = np.median(prefit)
         mask = (prefit >= (median_prefit - thr)) & (prefit <= (median_prefit + thr))
@@ -494,8 +465,26 @@ class PPPUducSFMultiGNSS:
         gps_data, gal_data = self._prepare_obs()
         gps_c1, gps_l1 = gps_data
         gal_c1, gal_l1 = gal_data
-        result = []
+        result_rows = []
+        result_times = []
         e, g = [], []
+        self.gps_obs = self.gps_obs.sort_values(by='sv')
+        self.gal_obs = self.gal_obs.sort_values(by='sv')
+        gps_epochs = {
+            t: df for t, df in self.gps_obs.groupby(level=1, sort=False)
+        }
+        gal_epochs = {
+            t: df for t, df in self.gal_obs.groupby(level=1, sort=False)
+        }
+        gps_osb_c1_col = f'OSB_{gps_c1}'
+        gps_osb_l1_col = f'OSB_{gps_l1}'
+        gal_osb_c1_col = f'OSB_{gal_c1}'
+        gal_osb_l1_col = f'OSB_{gal_l1}'
+        gps_has_osb_c1 = gps_osb_c1_col in self.gps_obs.columns
+        gps_has_osb_l1 = gps_osb_l1_col in self.gps_obs.columns
+        gal_has_osb_c1 = gal_osb_c1_col in self.gal_obs.columns
+        gal_has_osb_l1 = gal_osb_l1_col in self.gal_obs.columns
+        r_cache = {}
         xyz = None
         conv_time = None
         T0 = all_times[0]
@@ -506,13 +495,15 @@ class PPPUducSFMultiGNSS:
                     old_gps_sats, old_gal_sats = self.reset_filter(epoch=t)
                     reset_epoch = True
                     T0 = t
-            gps_epoch = self.gps_obs.loc[(slice(None), t), :].sort_values(by='sv')
-            gal_epoch = self.gal_obs.loc[(slice(None), t), :].sort_values(by='sv')
+            gps_epoch = gps_epochs.get(t)
+            gal_epoch = gal_epochs.get(t)
+            if gps_epoch is None or gal_epoch is None:
+                continue
 
             def safe_get(df, col, length=None):
                 """Zwraca kolumnę jako numpy, a jeśli brak – wektor zer o podanej długości."""
                 if col in df.columns:
-                    return df[col].to_numpy()
+                    return df[col].to_numpy(copy=False)
                 elif length is not None:
                     return np.zeros(length)
                 else:
@@ -568,71 +559,93 @@ class PPPUducSFMultiGNSS:
             old_gps_sats = curr_gps_sats
             old_gal_sats = curr_gal_sats
 
-            tides = gps_epoch['tides_los'].to_numpy()
+            tides = gps_epoch['tides_los'].to_numpy(copy=False)
             gps_satellites = gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
 
-            gps_p1_c1 = gps_epoch.get(f'OSB_{gps_c1}',0.0) * 1e-09 * self.CLIGHT
-            gps_pl1_l1 = gps_epoch.get(f'OSB_{gps_l1}',0.0) * 1e-09 * self.CLIGHT
-            C1 = gps_epoch[
-                     gps_c1].to_numpy() - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p1_c1 - tides
+            gps_p1_c1 = (gps_epoch[gps_osb_c1_col].to_numpy(copy=False) if gps_has_osb_c1 else 0.0)
+            gps_pl1_l1 = (gps_epoch[gps_osb_l1_col].to_numpy(copy=False) if gps_has_osb_l1 else 0.0)
+            gps_p1_c1 = gps_p1_c1 * 1e-09 * self.CLIGHT
+            gps_pl1_l1 = gps_pl1_l1 * 1e-09 * self.CLIGHT
+            C1 = gps_epoch[gps_c1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p1_c1 - tides
+            L1 = gps_epoch[gps_l1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl1_l1 - tides - (
+                self.CLIGHT / self.FREQ_DICT[self.gps_mode]) * phw
 
-            L1 = gps_epoch[
-                     gps_l1].to_numpy() - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl1_l1 - tides - (
-                             self.CLIGHT / self.FREQ_DICT[self.gps_mode]) * phw
-
-
-            gal_tides = gal_epoch['tides_los'].to_numpy()
+            gal_tides = gal_epoch['tides_los'].to_numpy(copy=False)
             gal_satellites = gal_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
 
-            gal_p1_c1 = gal_epoch.get(f'OSB_{gal_c1}',0.0) * 1e-09 * self.CLIGHT
-            gal_pl1_l1 = gal_epoch.get(f'OSB_{gal_l1}',0.0) * 1e-09 * self.CLIGHT
+            gal_p1_c1 = (gal_epoch[gal_osb_c1_col].to_numpy(copy=False) if gal_has_osb_c1 else 0.0)
+            gal_pl1_l1 = (gal_epoch[gal_osb_l1_col].to_numpy(copy=False) if gal_has_osb_l1 else 0.0)
+            gal_p1_c1 = gal_p1_c1 * 1e-09 * self.CLIGHT
+            gal_pl1_l1 = gal_pl1_l1 * 1e-09 * self.CLIGHT
 
-            EC1 = gal_epoch[
-                      gal_c1].to_numpy() - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_p1_c1 - gal_tides
+            EC1 = gal_epoch[gal_c1].to_numpy(copy=False) - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_p1_c1 - gal_tides
+            EL1 = gal_epoch[gal_l1].to_numpy(copy=False) - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_pl1_l1 - gal_tides - (
+                self.CLIGHT / self.FREQ_DICT[self.gal_mode]) * gal_phw
 
-            EL1 = gal_epoch[
-                      gal_l1].to_numpy() - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_pl1_l1 - gal_tides - (
-                              self.CLIGHT / self.FREQ_DICT[self.gal_mode]) * gal_phw
-
-
-            ZGPS = np.vstack((C1, L1 )).T.reshape(-1)
-            ZGAL = np.vstack((EC1, EL1)).T.reshape(-1)
+            ZGPS = np.empty(2 * len(C1))
+            ZGPS[0::2] = C1
+            ZGPS[1::2] = L1
+            ZGAL = np.empty(2 * len(EC1))
+            ZGAL[0::2] = EC1
+            ZGAL[1::2] = EL1
 
             Z = np.concatenate((ZGPS, ZGAL))
+            if not np.all(np.isfinite(Z)):
+                if trace_filter:
+                    print(f"[WARN] Non-finite Z at epoch {t}; skipping.")
+                continue
+            if not np.all(np.isfinite(Z)):
+                if trace_filter:
+                    print(f"[WARN] Non-finite Z at epoch {t}; skipping.")
+                continue
             gps_c1_mask = self.code_screening(x=self.ekf.x[:3],code_obs=C1,thr=30,satellites=gps_satellites[:,:3])
             gal_c1_mask = self.code_screening(x=self.ekf.x[:3], code_obs=EC1, thr=30, satellites=gal_satellites[:,:3])
 
             # WEIGHTS GPS
-            ev_gps = np.deg2rad(gps_epoch['ev'].to_numpy())
-            R = np.zeros(2 * len(C1))
-            for k in range(len(curr_gps_sats)):
-                base = 2 * k
-
-                R[base + 0] = 1 / np.sin(ev_gps[k]) if gps_c1_mask[k] else 1e12
-
-                R[base + 1] = 0.001 / np.sin(ev_gps[k])#if gps_c1_mask[k] else 1e12
+            ev_gps = np.deg2rad(gps_epoch['ev'].to_numpy(copy=False))
+            inv_sin_gps = 1.0 / np.sin(ev_gps)
+            R = np.empty(2 * len(C1))
+            R[0::2] = np.where(gps_c1_mask, inv_sin_gps, 1e12)
+            R[1::2] = 0.001 * inv_sin_gps
 
             # WEIGHTS GAL
-            ev_gal = np.deg2rad(gal_epoch['ev'].to_numpy())
-            RG = np.zeros(2 * len(EC1))
-            for k in range(len(curr_gal_sats)):
-                base = 2 * k
+            ev_gal = np.deg2rad(gal_epoch['ev'].to_numpy(copy=False))
+            inv_sin_gal = 1.0 / np.sin(ev_gal)
+            RG = np.empty(2 * len(EC1))
+            RG[0::2] = np.where(gal_c1_mask, inv_sin_gal, 1e12)
+            RG[1::2] = 0.001 * inv_sin_gal
 
-                RG[base + 0] = 1 / np.sin(ev_gal[k]) if gal_c1_mask[k] else 1e12
-
-                RG[base + 1] = 0.001 / np.sin(ev_gal[k])#if gal_c1_mask[k] else 1e12
-
-            Rdiag = np.diag(np.concatenate((R, RG)))
-
-
-
-            self.ekf.R = Rdiag
-
-            self.ekf.predict_update(z=Z,
-                                    HJacobian=self.Hjacobian,
-                                    args=(gps_satellites, gal_satellites),
-                                    Hx=self.Hx,
-                                    hx_args=(gps_satellites, gal_satellites))
+            r_diag = np.concatenate((R, RG))
+            r_diag = np.nan_to_num(r_diag, nan=1e12, posinf=1e12, neginf=1e12)
+            m = r_diag.size
+            R = r_cache.get(m)
+            if R is None:
+                R = np.zeros((m, m), dtype=np.float64)
+                r_cache[m] = R
+            else:
+                R.fill(0.0)
+            R.flat[::m + 1] = r_diag
+            self.ekf.R = R
+            updated = False
+            for k in range(5):
+                try:
+                    self.ekf.predict_update(
+                        z=Z,
+                        HJacobian=self.Hjacobian,
+                        args=(gps_satellites, gal_satellites),
+                        Hx=self.Hx,
+                        hx_args=(gps_satellites, gal_satellites),
+                    )
+                    updated = True
+                    break
+                except np.linalg.LinAlgError:
+                    jitter = 1e-6 * (10.0 ** k)
+                    self.ekf.R.flat[::m + 1] += jitter
+            if not updated:
+                if trace_filter:
+                    print(f"[WARN] Singular S at epoch {t}; reset and continue.")
+                old_gps_sats, old_gal_sats = self.reset_filter(epoch=t)
+                continue
             if not reset_epoch or reset_every == 0:
                 if xyz is not None:
                     position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
@@ -668,16 +681,22 @@ class PPPUducSFMultiGNSS:
             if ref is not None and flh is not None:
                 dx = ref - self.ekf.x[:3]
                 enu = np.array(ecef_to_enu(dXYZ=dx, flh=flh, degrees=True)).flatten()
-                result.append(pd.DataFrame(data={'de': enu[0], 'dn': enu[1], 'du': enu[2], 'dtr': dtr, 'ztd': ztd,
-                                                 'x': xyz[0], 'y': xyz[1], 'z': xyz[2],'isb':isb},
-                                           index=pd.DatetimeIndex(data=[t],name='time')))
             else:
                 enu = np.zeros(3)
-                result.append(pd.DataFrame(data={'de': enu[0], 'dn': enu[1], 'du': enu[2], 'dtr': dtr, 'ztd': ztd,
-                                                 'x': xyz[0], 'y': xyz[1], 'z': xyz[2],'isb':isb},
-                                           index=pd.DatetimeIndex(data=[t],name='time')))
+            result_rows.append({
+                'de': enu[0],
+                'dn': enu[1],
+                'du': enu[2],
+                'dtr': dtr,
+                'ztd': ztd,
+                'x': xyz[0],
+                'y': xyz[1],
+                'z': xyz[2],
+                'isb': isb,
+            })
+            result_times.append(t)
             if trace_filter:
-                print(result[-1])
+                print(result_rows[-1])
         if conv_time is not None:
             if trace_filter:
                 print('Convergence time < 5 mm: ', conv_time.total_seconds() / 60,
@@ -687,9 +706,387 @@ class PPPUducSFMultiGNSS:
             ct = None
         gps_result = pd.concat(g)
         gal_result = pd.concat(e)
-        result = pd.concat(result)
+        result = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time'))
         result['ct_min']=ct
         return result, gps_result, gal_result, ct
+
+
+class PPPUducSFSingleGNSS:
+    """
+    PPP Undifferenced Uncombined Single-Frequency estimator for a single GNSS system.
+    Uses ionospheric constraints (pseudo-observations of slant ionosphere delay).
+    """
+
+    def __init__(
+        self,
+        config: PPPConfig,
+        obs,
+        mode,
+        ekf,
+        pos0,
+        tro=True,
+        interval=0.5,
+        use_iono_rms=True,
+        sigma_iono_0=1.1,
+        sigma_iono_end=2.3,
+        t_end=30,
+    ):
+        self.cfg = config
+        self.obs = obs
+        self.mode = mode
+        self.tro = tro
+        self.ekf = ekf
+        self.FREQ_DICT = {
+            'L1': 1575.42e06,
+            'E1': 1575.42e06,
+            'L2': 1227.60e06,
+            'E5a': 1176.45e06,
+            'L5': 1176.450e06,
+            'E5b': 1207.14e06,
+        }
+        self.CLIGHT = 299792458
+        self.base_dim = 5 if tro else 4  # X, Y, Z, clk, ZTD(optional)
+        self.pos0 = pos0
+        self.interval = interval
+        self.use_iono_rms = use_iono_rms
+        self.sigma_iono_0 = sigma_iono_0
+        self.sigma_iono_end = sigma_iono_end
+        self.t_end = t_end
+        print('RUNNING NEW CLASS')
+
+    def _obs_mode_columns(self):
+        if self.mode in ('L1', 'E1'):
+            return 'C1', 'L1', 'pco_los_l1'
+        if self.mode == 'L2':
+            return 'C2', 'L2', 'pco_los_l2'
+        if self.mode in ('L5', 'E5a'):
+            return 'C5', 'L5', 'pco_los_l5'
+        if self.mode == 'E5b':
+            return 'C7', 'L7', 'pco_los_l5'
+        raise ValueError(f"Unsupported single-frequency mode: {self.mode}")
+
+    def Hjacobian(self, x, satellites):
+        n = satellites.shape[0]
+        C = self.CLIGHT
+        f1 = self.FREQ_DICT[self.mode]
+        lam = C / f1
+        rec_xyz = x[:3].copy()
+        e_vec, _ = _unit_vectors_and_ranges(satellites[:, :3], rec_xyz)
+        dim = self.base_dim + 2 * n
+        H = np.zeros((3 * n, dim))
+        col_x, col_y, col_z = 0, 1, 2
+        col_clk = 3
+        col_ztd = 4
+        for s in range(n):
+            row = 3 * s
+            ex, ey, ez = e_vec[s]
+            H[row + 0, [col_x, col_y, col_z]] = [ex, ey, ez]
+            H[row + 1, [col_x, col_y, col_z]] = [ex, ey, ez]
+            H[row + 0, col_clk] = 1.0
+            H[row + 1, col_clk] = 1.0
+            if self.tro:
+                mw = satellites[s, 3]
+                H[row + 0, col_ztd] = mw
+                H[row + 1, col_ztd] = mw
+            col_iono = self.base_dim + 2 * s
+            col_n1 = col_iono + 1
+            H[row + 0, col_iono] = 1.0
+            H[row + 1, col_iono] = -1.0
+            H[row + 1, col_n1] = lam
+            H[row + 2, col_iono] = 1.0
+        return H
+
+    def Hx(self, x, satellites):
+        n = satellites.shape[0]
+        C = self.CLIGHT
+        f1 = self.FREQ_DICT[self.mode]
+        lam = C / f1
+        clk = x[3]
+        zwd = x[4] if self.tro else 0.0
+        z_hat = np.empty(3 * n)
+        if n == 0:
+            return z_hat
+        state = x[self.base_dim:self.base_dim + 2 * n].reshape(n, 2)
+        I = state[:, 0]
+        N1 = state[:, 1]
+        _, rho = _unit_vectors_and_ranges(satellites[:, :3], x[:3])
+        mw = satellites[:, 3] if self.tro else 0.0
+        code = rho + clk + mw * zwd + I
+        phase = rho + clk + mw * zwd - I + lam * N1
+        z_hat[0::3] = code
+        z_hat[1::3] = phase
+        z_hat[2::3] = I
+        return z_hat
+
+    def rebuild_state(self, x_old, P_old, Q_old, prev_sats, curr_sats):
+        base = self.base_dim
+        n_prev = len(prev_sats)
+        n_curr = len(curr_sats)
+        new_dim = base + 2 * n_curr
+        x_new = np.zeros(new_dim)
+        x_new[:base] = x_old[:base]
+        P_new = np.zeros((new_dim, new_dim))
+        P_new[:base, :base] = P_old[:base, :base]
+        Q_new = np.zeros((new_dim, new_dim))
+        Q_new[:base, :base] = Q_old[:base, :base]
+        prev_map = {sv: i for i, sv in enumerate(prev_sats)}
+        curr_map = {sv: i for i, sv in enumerate(curr_sats)}
+        common = [sv for sv in curr_sats if sv in prev_map]
+        if common:
+            prev_idx = np.fromiter((prev_map[sv] for sv in common), dtype=int)
+            curr_idx = np.fromiter((curr_map[sv] for sv in common), dtype=int)
+            offs = np.arange(2)
+            old_state = (base + 2 * prev_idx[:, None] + offs[None, :]).ravel()
+            new_state = (base + 2 * curr_idx[:, None] + offs[None, :]).ravel()
+            x_new[new_state] = x_old[old_state]
+            b = np.arange(base)
+            P_new[np.ix_(new_state, b)] = P_old[np.ix_(old_state, b)]
+            P_new[np.ix_(b, new_state)] = P_old[np.ix_(b, old_state)]
+            Q_new[np.ix_(new_state, b)] = Q_old[np.ix_(old_state, b)]
+            Q_new[np.ix_(b, new_state)] = Q_old[np.ix_(b, old_state)]
+            P_new[np.ix_(new_state, new_state)] = P_old[np.ix_(old_state, old_state)]
+            Q_new[np.ix_(new_state, new_state)] = Q_old[np.ix_(old_state, old_state)]
+        new_only = set(curr_sats) - set(prev_sats)
+        for sv in new_only:
+            j = curr_map[sv]
+            idx_i = base + 2 * j
+            idx_n = idx_i + 1
+            P_new[idx_i, idx_i] = self.cfg.p_iono
+            Q_new[idx_i, idx_i] = self.cfg.q_iono * (self.interval * 60) / 3600
+            P_new[idx_n, idx_n] = self.cfg.p_amb
+        return x_new, P_new, Q_new
+
+    def _init_filter_common(self, epoch, clk0=0.0, zwd0=0.0):
+        sats = self.obs.loc[(slice(None), epoch), :].index.get_level_values('sv').tolist()
+        n = len(sats)
+        dim_x = self.base_dim + 2 * n
+        dim_z = 3 * n
+        x0 = np.zeros(dim_x)
+        x0[:3] = self.pos0
+        x0[3] = clk0
+        if self.tro:
+            x0[4] = zwd0
+        self.ekf = ExtendedKalmanFilter(dim_x=dim_x, dim_z=dim_z)
+        self.ekf._I = np.eye(dim_x)
+        self.ekf.x = x0.copy()
+        self.ekf.P = np.eye(dim_x) * 1e2
+        self.ekf.P[3, 3] = self.cfg.p_dt
+        self.ekf.Q = np.zeros_like(self.ekf.P)
+        self.ekf.Q[3, 3] = self.cfg.q_dt
+        if self.tro:
+            self.ekf.P[4, 4] = self.cfg.p_tro
+            self.ekf.Q[4, 4] = self.cfg.q_tro
+        self.ekf.F = np.eye(dim_x)
+        self.ekf.F[3, 3] = 0.0
+        if 'ion' in self.obs.columns:
+            ion_init = self.obs.loc[(slice(None), epoch), 'ion'].to_numpy()
+        elif 'P4' in self.obs.columns:
+            ion_init = self.obs.loc[(slice(None), epoch), 'P4'].to_numpy()
+        else:
+            ion_init = np.zeros(n, dtype=float)
+        for k in range(n):
+            idx_i = self.base_dim + 2 * k
+            idx_n = idx_i + 1
+            self.ekf.x[idx_i] = ion_init[k]
+            self.ekf.P[idx_i, idx_i] = self.cfg.p_iono
+            self.ekf.Q[idx_i, idx_i] = self.cfg.q_iono * (self.interval * 60) / 3600
+            self.ekf.P[idx_n, idx_n] = self.cfg.p_amb
+        return sats
+
+    def init_filter(self, clk0=0.0, zwd0=0.0):
+        epochs = sorted(self.obs.index.get_level_values('time').unique())
+        first_ep = epochs[0]
+        sats = self._init_filter_common(first_ep, clk0=clk0, zwd0=zwd0)
+        return sats, epochs
+
+    def reset_filter(self, epoch, clk0=0.0, zwd0=0.0):
+        return self._init_filter_common(epoch, clk0=clk0, zwd0=zwd0)
+
+    def _prepare_obs(self):
+        c_prefix, l_prefix, pco_col = self._obs_mode_columns()
+        c_col = [c for c in self.obs.columns if c.startswith(c_prefix)][0]
+        l_col = [c for c in self.obs.columns if c.startswith(l_prefix)][0]
+        self.obs = self.obs.copy()
+        if pco_col not in self.obs.columns:
+            self.obs.loc[:, pco_col] = 0.0
+        if 'me_wet' not in self.obs.columns:
+            self.obs.loc[:, 'me_wet'] = 0.0
+        return c_col, l_col, pco_col
+
+    def code_screening(self, x, satellites, code_obs, thr=1):
+        sat_xyz = np.asarray(satellites, dtype=float)
+        ref_xyz = np.asarray(x, dtype=float)
+        dist = np.linalg.norm(sat_xyz - ref_xyz, axis=1)
+        prefit = code_obs - dist
+        median_prefit = np.median(prefit)
+        mask = (prefit >= (median_prefit - thr)) & (prefit <= (median_prefit + thr))
+        n_sat = len(prefit)
+        n_bad = np.count_nonzero(~mask)
+        if n_bad > n_sat / 2:
+            mask = np.ones(n_sat, dtype=bool)
+        return mask
+
+    def run_filter(self, clk0=0.0, ref=None, flh=None, zwd0=0.0, trace_filter=False, reset_every=0):
+        old_sats, all_epochs = self.init_filter(clk0=clk0, zwd0=zwd0)
+        c_col, l_col, pco_col = self._prepare_obs()
+        result_rows = []
+        result_times = []
+        self.obs = self.obs.sort_values(by='sv')
+        obs_epochs = {t: df for t, df in self.obs.groupby(level=1, sort=False)}
+        osb_c_col = f'OSB_{c_col}'
+        osb_l_col = f'OSB_{l_col}'
+        has_osb_c = osb_c_col in self.obs.columns
+        has_osb_l = osb_l_col in self.obs.columns
+        r_cache = {}
+        xyz = None
+        conv_time = None
+        T0 = all_epochs[0]
+        for num, t in enumerate(all_epochs):
+            reset_epoch = False
+            if reset_every != 0:
+                if ((num * self.interval) % reset_every == 0) and (num != 0):
+                    old_sats = self.reset_filter(epoch=t, clk0=clk0, zwd0=zwd0)
+                    reset_epoch = True
+                    T0 = t
+            epoch = obs_epochs.get(t)
+            if epoch is None:
+                continue
+            curr_sats = epoch.index.get_level_values('sv').tolist()
+            if curr_sats != old_sats:
+                self.ekf.x, self.ekf.P, self.ekf.Q = self.rebuild_state(
+                    self.ekf.x.copy(),
+                    self.ekf.P.copy(),
+                    self.ekf.Q.copy(),
+                    old_sats,
+                    curr_sats,
+                )
+                self.ekf.dim_x = len(self.ekf.x)
+                self.ekf.dim_z = 3 * len(curr_sats)
+                self.ekf._I = np.eye(self.ekf.dim_x)
+                self.ekf.F = np.eye(self.ekf.dim_x)
+            old_sats = curr_sats
+            tides = epoch['tides_los'].to_numpy(copy=False) if 'tides_los' in epoch.columns else 0.0
+            satellites = epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
+            clk = epoch['clk'].to_numpy(copy=False) if 'clk' in epoch.columns else 0.0
+            tro = epoch['tro'].to_numpy(copy=False) if 'tro' in epoch.columns else 0.0
+            ah_los = epoch['ah_los'].to_numpy(copy=False) if 'ah_los' in epoch.columns else 0.0
+            dprel = epoch['dprel'].to_numpy(copy=False) if 'dprel' in epoch.columns else 0.0
+            rec_pco = epoch[pco_col].to_numpy(copy=False)
+            sat_pco = (
+                epoch[f'sat_pco_los_{self.mode}'].to_numpy(copy=False)
+                if f'sat_pco_los_{self.mode}' in epoch.columns
+                else 0.0
+            )
+            phw = epoch['phw'].to_numpy(copy=False) if 'phw' in epoch.columns else 0.0
+            osb_c = epoch[osb_c_col].to_numpy(copy=False) * 1e-09 * self.CLIGHT if has_osb_c else 0.0
+            osb_l = epoch[osb_l_col].to_numpy(copy=False) * 1e-09 * self.CLIGHT if has_osb_l else 0.0
+            C1 = (
+                epoch[c_col].to_numpy(copy=False) - rec_pco + sat_pco + clk * self.CLIGHT
+                - tro - ah_los - dprel - osb_c - tides
+            )
+            L1 = (
+                epoch[l_col].to_numpy(copy=False) - rec_pco + sat_pco + clk * self.CLIGHT
+                - tro - ah_los - dprel - osb_l - tides
+                - (self.CLIGHT / self.FREQ_DICT[self.mode]) * phw
+            )
+            if 'ion' in epoch.columns:
+                I_obs = epoch['ion'].to_numpy(copy=False)
+            elif 'P4' in epoch.columns:
+                I_obs = epoch['P4'].to_numpy(copy=False)
+            else:
+                I_obs = np.zeros(len(epoch), dtype=float)
+            Z = np.empty(3 * len(C1))
+            Z[0::3] = C1
+            Z[1::3] = L1
+            Z[2::3] = I_obs
+            if not np.all(np.isfinite(Z)):
+                continue
+            code_mask = self.code_screening(
+                x=self.ekf.x[:3],
+                code_obs=C1,
+                thr=30,
+                satellites=satellites[:, :3],
+            )
+            ev = np.deg2rad(epoch['ev'].to_numpy(copy=False)) if 'ev' in epoch.columns else np.deg2rad(
+                np.full(len(epoch), 30.0)
+            )
+            inv_sin = 1.0 / np.sin(ev)
+            r_diag = np.empty(3 * len(C1))
+            r_diag[0::3] = np.where(code_mask, inv_sin, 1e12)
+            r_diag[1::3] = 0.001 * inv_sin
+            if self.use_iono_rms and ('ion_rms' in epoch.columns):
+                ion_sigma = epoch['ion_rms'].to_numpy(copy=False)
+                ion_sigma = np.where(np.isfinite(ion_sigma), ion_sigma, self.sigma_iono_end)
+                ion_sigma = np.clip(ion_sigma, 1e-6, 1e6)
+            else:
+                frac = min(num, self.t_end) / max(self.t_end, 1)
+                ion_sigma = np.full(
+                    len(C1),
+                    self.sigma_iono_0 + (self.sigma_iono_end - self.sigma_iono_0) * frac,
+                    dtype=float,
+                )
+            r_diag[2::3] = ion_sigma
+            r_diag = np.nan_to_num(r_diag, nan=1e12, posinf=1e12, neginf=1e12)
+            m = r_diag.size
+            R = r_cache.get(m)
+            if R is None:
+                R = np.zeros((m, m), dtype=np.float64)
+                r_cache[m] = R
+            else:
+                R.fill(0.0)
+            R.flat[::m + 1] = r_diag
+            self.ekf.R = R
+            self.ekf.predict_update(
+                z=Z,
+                HJacobian=self.Hjacobian,
+                args=(satellites,),
+                Hx=self.Hx,
+                hx_args=(satellites,),
+            )
+            if not reset_epoch or reset_every == 0:
+                if xyz is not None:
+                    position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
+                    if conv_time is None and position_diff < 0.005:
+                        conv_time = t - T0
+                    elif position_diff > 0.005:
+                        conv_time = None
+            xyz = self.ekf.x[:3].copy()
+            dtr = self.ekf.x[3]
+            ztd = self.ekf.x[4] if self.tro else 0.0
+            if ref is not None and flh is not None:
+                dx = ref - self.ekf.x[:3]
+                enu = np.array(ecef_to_enu(dXYZ=dx, flh=flh, degrees=True)).flatten()
+            else:
+                enu = np.zeros(3)
+            result_rows.append({
+                'de': enu[0],
+                'dn': enu[1],
+                'du': enu[2],
+                'dtr': dtr,
+                'ztd': ztd,
+                'x': xyz[0],
+                'y': xyz[1],
+                'z': xyz[2],
+            })
+            result_times.append(t)
+            if trace_filter:
+                print(result_rows[-1])
+        if conv_time is not None:
+            if trace_filter:
+                print(
+                    'Convergence time < 5 mm: ',
+                    conv_time.total_seconds() / 60,
+                    ' [min] ',
+                    conv_time.total_seconds() / 3600,
+                    ' [h]',
+                )
+            ct = conv_time.total_seconds() / 3600
+        else:
+            ct = None
+        result = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time'))
+        result['ct_min'] = ct
+        return result, self.obs, None, ct
+
 
 class PPPUdMultiGNSS:
     def __init__(self, config:PPPConfig, gps_obs, gps_mode, gal_obs, gal_mode, ekf, pos0, tro=True, interval=0.5):
@@ -731,14 +1128,9 @@ class PPPUdMultiGNSS:
         n_gal = gal_satellites.shape[0]
         rec_xyz = x[:3].copy()
 
-        # Jednostkowe wektory do satelitów GPS
-        rho_gps = gps_satellites[:, :3] - rec_xyz
-        e_gps = rho_gps / np.linalg.norm(rho_gps, axis=1)[:, None]
+        e_gps, _ = _unit_vectors_and_ranges(gps_satellites[:, :3], rec_xyz)
+        e_gal, _ = _unit_vectors_and_ranges(gal_satellites[:, :3], rec_xyz)
         m_wet_gps = gps_satellites[:, 3]
-
-        # Jednostkowe wektory do satelitów Galileo
-        rho_gal = gal_satellites[:, :3] - rec_xyz
-        e_gal = rho_gal / np.linalg.norm(rho_gal, axis=1)[:, None]
         m_wet_gal = gal_satellites[:, 3]
 
         # Parametry wspólne: XYZ, clk_gps, ISB_galileo, ZTD
@@ -753,55 +1145,45 @@ class PPPUdMultiGNSS:
         H = np.zeros((4 * (n_gps + n_gal), base_dim + 3 * (n_gps + n_gal)))
 
         # ---------------- GPS ----------------
-        for s in range(n_gps):
-            row = 4 * s
-            ex, ey, ez = -e_gps[s]
-            mw = m_wet_gps[s]
+        if n_gps:
+            gps_rows = slice(0, 4 * n_gps)
+            H[gps_rows, [COL_X, COL_Y, COL_Z]] = np.repeat(e_gps, 4, axis=0)
+            H[gps_rows, COL_CLK] = 1.0
+            H[gps_rows, COL_ZTD] = np.repeat(m_wet_gps, 4)
 
-            for i in range(4):
-                H[row + i, [COL_X, COL_Y, COL_Z]] = [ex, ey, ez]
-                H[row + i, COL_CLK] = 1.0  # wspólny zegar GPS
-                H[row + i, COL_ZTD] = mw
-
-            col_iono = base_dim + 3 * s
-            col_N1 = col_iono + 1
-            col_N2 = col_iono + 2
-
-            # Efekt IONO
-            H[row + 0, col_iono] = +MU1  # P1
-            H[row + 1, col_iono] = -MU1  # L1
-            H[row + 2, col_iono] = +MU2  # P2
-            H[row + 3, col_iono] = -MU2  # L2
-
-            # Ambiguity
-            H[row + 1, col_N1] = L1
-            H[row + 3, col_N2] = L2
+            idx = np.arange(n_gps)
+            row0 = 4 * idx
+            row1 = row0 + 1
+            row2 = row0 + 2
+            row3 = row0 + 3
+            col_iono = base_dim + 3 * idx
+            H[row0, col_iono] = MU1
+            H[row1, col_iono] = -MU1
+            H[row2, col_iono] = MU2
+            H[row3, col_iono] = -MU2
+            H[row1, col_iono + 1] = L1
+            H[row3, col_iono + 2] = L2
 
         # ---------------- Galileo ----------------
-        for s in range(n_gal):
-            row = 4 * (n_gps + s)
-            ex, ey, ez = -e_gal[s]
-            mw = m_wet_gal[s]
+        if n_gal:
+            gal_rows = slice(4 * n_gps, 4 * (n_gps + n_gal))
+            H[gal_rows, [COL_X, COL_Y, COL_Z]] = np.repeat(e_gal, 4, axis=0)
+            H[gal_rows, COL_CLK] = 1.0
+            H[gal_rows, COL_ISB] = 1.0
+            H[gal_rows, COL_ZTD] = np.repeat(m_wet_gal, 4)
 
-            for i in range(4):
-                H[row + i, [COL_X, COL_Y, COL_Z]] = [ex, ey, ez]
-                H[row + i, COL_CLK] = 1.0  # współdzielony zegar
-                H[row + i, COL_ISB] = 1.0  # inter-sys bias dla Galileo
-                H[row + i, COL_ZTD] = mw
-
-            col_iono = base_dim + 3 * (n_gps + s)
-            col_N1 = col_iono + 1
-            col_N2 = col_iono + 2
-
-            # Efekt IONO (na Galileo)
-            H[row + 0, col_iono] = +MU1_GAL  # E1 code
-            H[row + 1, col_iono] = -MU1_GAL  # E1 phase
-            H[row + 2, col_iono] = +MU2_GAL  # E5a code
-            H[row + 3, col_iono] = -MU2_GAL  # E5a phase
-
-            # Ambiguity (Galileo)
-            H[row + 1, col_N1] = E1
-            H[row + 3, col_N2] = E5a
+            idx = np.arange(n_gal)
+            row0 = 4 * (n_gps + idx)
+            row1 = row0 + 1
+            row2 = row0 + 2
+            row3 = row0 + 3
+            col_iono = base_dim + 3 * (n_gps + idx)
+            H[row0, col_iono] = MU1_GAL
+            H[row1, col_iono] = -MU1_GAL
+            H[row2, col_iono] = MU2_GAL
+            H[row3, col_iono] = -MU2_GAL
+            H[row1, col_iono + 1] = E1
+            H[row3, col_iono + 2] = E5a
 
         return H
 
@@ -825,7 +1207,6 @@ class PPPUdMultiGNSS:
         MU1_GAL = 1.0
         MU2_GAL = (F1_GAL / F2_GAL) ** 2
 
-        xr, yr, zr = x_state[0:3]
         clk = x_state[3]
         isb = x_state[4]  # inter-sys bias (dla Galileo)
         zwd = x_state[5]
@@ -834,50 +1215,40 @@ class PPPUdMultiGNSS:
         n_gps = gps_satellites.shape[0]
         n_gal = gal_satellites.shape[0]
 
-        # Z góry rozmiar wektora predykcji: 4 obserwacje na każdy satelita
         z_hat = np.empty(4 * (n_gps + n_gal))
 
-        # --- GPS ---
-        sat_xyz = gps_satellites[:, :3]
-        m_wet = gps_satellites[:, 3]
-        rho_vec = sat_xyz - np.array([xr, yr, zr])
-        rho = np.linalg.norm(rho_vec, axis=1)
+        if n_gps:
+            gps_state = x_state[base_dim:base_dim + 3 * n_gps].reshape(n_gps, 3)
+            I_gps = gps_state[:, 0]
+            N1_gps = gps_state[:, 1]
+            N2_gps = gps_state[:, 2]
+            _, rho_gps = _unit_vectors_and_ranges(gps_satellites[:, :3], x_state[:3])
+            mw_gps = gps_satellites[:, 3]
+            geom = rho_gps
+            gps_block = np.column_stack((
+                geom + clk + mw_gps * zwd + MU1 * I_gps,
+                geom + clk + mw_gps * zwd - MU1 * I_gps + L1 * N1_gps,
+                geom + clk + mw_gps * zwd + MU2 * I_gps,
+                geom + clk + mw_gps * zwd - MU2 * I_gps + L2 * N2_gps,
+            ))
+            z_hat[:4 * n_gps] = gps_block.reshape(-1)
 
-        for s in range(n_gps):
-            i = base_dim + 3 * s
-            I_s = x_state[i]
-            N1_s = x_state[i + 1]
-            N2_s = x_state[i + 2]
-
-            geom = rho[s]
-            mw = m_wet[s]
-
-            z_hat[4 * s + 0] = geom + clk + mw * zwd + MU1 * I_s  # P1
-            z_hat[4 * s + 1] = geom + clk + mw * zwd - MU1 * I_s + L1 * N1_s  # L1
-            z_hat[4 * s + 2] = geom + clk + mw * zwd + MU2 * I_s  # P2
-            z_hat[4 * s + 3] = geom + clk + mw * zwd - MU2 * I_s + L2 * N2_s  # L2
-
-        # --- Galileo ---
-        sat_xyz = gal_satellites[:, :3]
-        m_wet = gal_satellites[:, 3]
-        rho_vec = sat_xyz - np.array([xr, yr, zr])
-        rho = np.linalg.norm(rho_vec, axis=1)
-
-        for s in range(n_gal):
-            i = base_dim + 3 * (n_gps + s)
-            I_s = x_state[i]
-            N1_s = x_state[i + 1]
-            N2_s = x_state[i + 2]
-
-            geom = rho[s]
-            mw = m_wet[s]
-
-            row = 4 * (n_gps + s)
-
-            z_hat[row + 0] = geom + clk + isb + mw * zwd + MU1_GAL * I_s  # E1 code
-            z_hat[row + 1] = geom + clk + isb + mw * zwd - MU1_GAL * I_s + E1 * N1_s  # E1 phase
-            z_hat[row + 2] = geom + clk + isb + mw * zwd + MU2_GAL * I_s  # E5a code
-            z_hat[row + 3] = geom + clk + isb + mw * zwd - MU2_GAL * I_s + E5a * N2_s  # E5a phase
+        if n_gal:
+            gal_state = x_state[base_dim + 3 * n_gps:base_dim + 3 * (n_gps + n_gal)].reshape(n_gal, 3)
+            I_gal = gal_state[:, 0]
+            N1_gal = gal_state[:, 1]
+            N2_gal = gal_state[:, 2]
+            _, rho_gal = _unit_vectors_and_ranges(gal_satellites[:, :3], x_state[:3])
+            mw_gal = gal_satellites[:, 3]
+            geom = rho_gal
+            gal_block = np.column_stack((
+                geom + clk + isb + mw_gal * zwd + MU1_GAL * I_gal,
+                geom + clk + isb + mw_gal * zwd - MU1_GAL * I_gal + E1 * N1_gal,
+                geom + clk + isb + mw_gal * zwd + MU2_GAL * I_gal,
+                geom + clk + isb + mw_gal * zwd - MU2_GAL * I_gal + E5a * N2_gal,
+            ))
+            start = 4 * n_gps
+            z_hat[start:start + 4 * n_gal] = gal_block.reshape(-1)
 
         return z_hat
 
@@ -921,35 +1292,30 @@ class PPPUdMultiGNSS:
         prev_all = [tag("G", sv) for sv in prev_gps] + [tag("E", sv) for sv in prev_gal]
         curr_all = [tag("G", sv) for sv in curr_gps] + [tag("E", sv) for sv in curr_gal]
 
-        common = set(prev_all) & set(curr_all)
+        prev_map = {prn: i for i, prn in enumerate(prev_all)}
+        curr_map = {prn: i for i, prn in enumerate(curr_all)}
+        common = [prn for prn in curr_all if prn in prev_map]
 
-        # --- przenoszenie wspólnych satelitów ---
-        for prn in common:
-            i_old = prev_all.index(prn)
-            i_new = curr_all.index(prn)
-            for k in range(3):
-                xo = base_dim + 3 * i_old + k
-                xn = base_dim + 3 * i_new + k
-                x_new[xn] = x_old[xo]
+        if common:
+            prev_idx = np.fromiter((prev_map[prn] for prn in common), dtype=int)
+            curr_idx = np.fromiter((curr_map[prn] for prn in common), dtype=int)
+            offsets = np.arange(3)
+            old_state_idx = (base_dim + 3 * prev_idx[:, None] + offsets[None, :]).ravel()
+            new_state_idx = (base_dim + 3 * curr_idx[:, None] + offsets[None, :]).ravel()
 
-                P_new[xn, :base_dim] = P_old[xo, :base_dim]
-                P_new[:base_dim, xn] = P_old[:base_dim, xo]
-                Q_new[xn, :base_dim] = Q_old[xo, :base_dim]
-                Q_new[:base_dim, xn] = Q_old[:base_dim, xo]
-
-                for prn2 in common:
-                    j_old = prev_all.index(prn2)
-                    j_new = curr_all.index(prn2)
-                    for l in range(3):
-                        yo = base_dim + 3 * j_old + l
-                        yn = base_dim + 3 * j_new + l
-                        P_new[xn, yn] = P_old[xo, yo]
-                        Q_new[xn, yn] = Q_old[xo, yo]
+            x_new[new_state_idx] = x_old[old_state_idx]
+            base_idx = np.arange(base_dim)
+            P_new[np.ix_(new_state_idx, base_idx)] = P_old[np.ix_(old_state_idx, base_idx)]
+            P_new[np.ix_(base_idx, new_state_idx)] = P_old[np.ix_(base_idx, old_state_idx)]
+            Q_new[np.ix_(new_state_idx, base_idx)] = Q_old[np.ix_(old_state_idx, base_idx)]
+            Q_new[np.ix_(base_idx, new_state_idx)] = Q_old[np.ix_(base_idx, old_state_idx)]
+            P_new[np.ix_(new_state_idx, new_state_idx)] = P_old[np.ix_(old_state_idx, old_state_idx)]
+            Q_new[np.ix_(new_state_idx, new_state_idx)] = Q_old[np.ix_(old_state_idx, old_state_idx)]
 
         # --- nowe satelity: zainicjalizuj I_s z P4 ---
         new_only = set(curr_all) - set(prev_all)
         for prn in new_only:
-            j = curr_all.index(prn)
+            j = curr_map[prn]
             idx_I = base_dim + 3 * j
             idx_N1 = idx_I + 1
             idx_N2 = idx_I + 2
@@ -1193,19 +1559,17 @@ class PPPUdMultiGNSS:
             N_vec    -- wektor [N1_1, N2_1, N1_2, N2_2, ..., N1_n, N2_n]
             P_N      -- macierz kowariancji odpowiadająca N_vec
         """
-        idxs_N = []
-        for i in range(n_sats):
-            idx_N1 = base_dim + 3 * i + 1
-            idx_N2 = base_dim + 3 * i + 2
-            idxs_N.extend([idx_N1, idx_N2])
-
+        offsets = np.array([1, 2])
+        idxs_N = (base_dim + 3 * np.arange(n_sats)[:, None] + offsets[None, :]).ravel()
         N_vec = x[idxs_N]
         P_N = P[np.ix_(idxs_N, idxs_N)]
 
         return N_vec, P_N
 
     def code_screening(self, x, satellites, code_obs, thr=1):
-        dist = calculate_distance(satellites, x)
+        sat_xyz = np.asarray(satellites, dtype=float)
+        ref_xyz = np.asarray(x, dtype=float)
+        dist = np.linalg.norm(sat_xyz - ref_xyz, axis=1)
         prefit = code_obs-dist
         median_prefit = np.median(prefit)
         mask = (prefit >= (median_prefit - thr)) & (prefit <= (median_prefit + thr))
@@ -1220,8 +1584,41 @@ class PPPUdMultiGNSS:
         gps_data, gal_data = self._prepare_obs()
         agps, bgps, gps_c1, gps_c2, gps_l1, gps_l2 = gps_data
         _, _, gal_c1, gal_c2, gal_l1, gal_l2 = gal_data
-        result = []
+        result_rows = []
+        result_times = []
         e, g = [], []
+        self.gps_obs = self.gps_obs.sort_values(by='sv')
+        self.gal_obs = self.gal_obs.sort_values(by='sv')
+        gps_epochs = {
+            t: df for t, df in self.gps_obs.groupby(level=1, sort=False)
+        }
+        gal_epochs = {
+            t: df for t, df in self.gal_obs.groupby(level=1, sort=False)
+        }
+        gps_osb_c1_col = f'OSB_{gps_c1}'
+        gps_osb_c2_col = f'OSB_{gps_c2}'
+        gps_osb_l1_col = f'OSB_{gps_l1}'
+        gps_osb_l2_col = f'OSB_{gps_l2}'
+        gal_osb_c1_col = f'OSB_{gal_c1}'
+        gal_osb_c2_col = f'OSB_{gal_c2}'
+        gal_osb_l1_col = f'OSB_{gal_l1}'
+        gal_osb_l2_col = f'OSB_{gal_l2}'
+        gps_has_osb_c1 = gps_osb_c1_col in self.gps_obs.columns
+        gps_has_osb_c2 = gps_osb_c2_col in self.gps_obs.columns
+        gps_has_osb_l1 = gps_osb_l1_col in self.gps_obs.columns
+        gps_has_osb_l2 = gps_osb_l2_col in self.gps_obs.columns
+        gal_has_osb_c1 = gal_osb_c1_col in self.gal_obs.columns
+        gal_has_osb_c2 = gal_osb_c2_col in self.gal_obs.columns
+        gal_has_osb_l1 = gal_osb_l1_col in self.gal_obs.columns
+        gal_has_osb_l2 = gal_osb_l2_col in self.gal_obs.columns
+        r_cache = {}
+        ar_cfg = PPPARSettings(
+            enabled=bool(getattr(self.cfg, "pppar_enabled", False)),
+            warmup_epochs=int(getattr(self.cfg, "pppar_warmup_epochs", 60)),
+            min_ambiguities=int(getattr(self.cfg, "pppar_min_ambiguities", 4)),
+            ratio_threshold=float(getattr(self.cfg, "pppar_ratio_threshold", 2.0)),
+            constraint_sigma_cycles=float(getattr(self.cfg, "pppar_constraint_sigma_cycles", 1e-3)),
+        )
         xyz = None
         conv_time = None
         T0 = all_times[0]
@@ -1232,13 +1629,15 @@ class PPPUdMultiGNSS:
                     old_gps_sats, old_gal_sats = self.reset_filter(epoch=t)
                     reset_epoch = True
                     T0 = t
-            gps_epoch = self.gps_obs.loc[(slice(None), t), :].sort_values(by='sv')
-            gal_epoch = self.gal_obs.loc[(slice(None), t), :].sort_values(by='sv')
+            gps_epoch = gps_epochs.get(t)
+            gal_epoch = gal_epochs.get(t)
+            if gps_epoch is None or gal_epoch is None:
+                continue
 
             def safe_get(df, col, length=None):
                 """Zwraca kolumnę jako numpy, a jeśli brak – wektor zer o podanej długości."""
                 if col in df.columns:
-                    return df[col].to_numpy()
+                    return df[col].to_numpy(copy=False)
                 elif length is not None:
                     return np.zeros(length)
                 else:
@@ -1296,44 +1695,52 @@ class PPPUdMultiGNSS:
             old_gps_sats = curr_gps_sats
             old_gal_sats = curr_gal_sats
 
-            tides = gps_epoch['tides_los'].to_numpy()
+            tides = gps_epoch['tides_los'].to_numpy(copy=False)
             gps_satellites = gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
 
-            gps_p1_c1 = gps_epoch.get(f'OSB_{gps_c1}',0.0) * 1e-09 * self.CLIGHT
-            gps_p2_c2 = gps_epoch.get(f'OSB_{gps_c2}',0.0) * 1e-09 * self.CLIGHT
-            gps_pl1_l1 = gps_epoch.get(f'OSB_{gps_l1}',0.0) * 1e-09 * self.CLIGHT
-            gps_pl2_l2 = gps_epoch.get(f'OSB_{gps_l2}',0.0) * 1e-09 * self.CLIGHT
-            C1 = gps_epoch[
-                     gps_c1].to_numpy() - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p1_c1 - tides
-            C2 = gps_epoch[
-                     gps_c2].to_numpy() - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p2_c2 - tides
-            L1 = gps_epoch[
-                     gps_l1].to_numpy() - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl1_l1 - tides - (
-                             self.CLIGHT / self.FREQ_DICT[self.gps_mode[:2]]) * phw
-            L2 = gps_epoch[
-                     gps_l2].to_numpy() - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl2_l2 - tides - (
-                             self.CLIGHT / self.FREQ_DICT[self.gps_mode[2:]]) * phw
+            gps_p1_c1 = (gps_epoch[gps_osb_c1_col].to_numpy(copy=False) if gps_has_osb_c1 else 0.0)
+            gps_p2_c2 = (gps_epoch[gps_osb_c2_col].to_numpy(copy=False) if gps_has_osb_c2 else 0.0)
+            gps_pl1_l1 = (gps_epoch[gps_osb_l1_col].to_numpy(copy=False) if gps_has_osb_l1 else 0.0)
+            gps_pl2_l2 = (gps_epoch[gps_osb_l2_col].to_numpy(copy=False) if gps_has_osb_l2 else 0.0)
+            gps_p1_c1 = gps_p1_c1 * 1e-09 * self.CLIGHT
+            gps_p2_c2 = gps_p2_c2 * 1e-09 * self.CLIGHT
+            gps_pl1_l1 = gps_pl1_l1 * 1e-09 * self.CLIGHT
+            gps_pl2_l2 = gps_pl2_l2 * 1e-09 * self.CLIGHT
+            C1 = gps_epoch[gps_c1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p1_c1 - tides
+            C2 = gps_epoch[gps_c2].to_numpy(copy=False) - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p2_c2 - tides
+            L1 = gps_epoch[gps_l1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl1_l1 - tides - (
+                self.CLIGHT / self.FREQ_DICT[self.gps_mode[:2]]) * phw
+            L2 = gps_epoch[gps_l2].to_numpy(copy=False) - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl2_l2 - tides - (
+                self.CLIGHT / self.FREQ_DICT[self.gps_mode[2:]]) * phw
 
-            gal_tides = gal_epoch['tides_los'].to_numpy()
+            gal_tides = gal_epoch['tides_los'].to_numpy(copy=False)
             gal_satellites = gal_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
 
-            gal_p1_c1 = gal_epoch.get(f'OSB_{gal_c1}',0.0) * 1e-09 * self.CLIGHT
-            gal_p2_c2 = gal_epoch.get(f'OSB_{gal_c2}',0.0) * 1e-09 * self.CLIGHT
-            gal_pl1_l1 = gal_epoch.get(f'OSB_{gal_l1}',0.0) * 1e-09 * self.CLIGHT
-            gal_pl2_l2 = gal_epoch.get(f'OSB_{gal_l2}',0.0) * 1e-09 * self.CLIGHT
-            EC1 = gal_epoch[
-                      gal_c1].to_numpy() - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_p1_c1 - gal_tides
-            EC2 = gal_epoch[
-                      gal_c2].to_numpy() - gal_pco2 + sat_pco_E5a + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_p2_c2 - gal_tides
-            EL1 = gal_epoch[
-                      gal_l1].to_numpy() - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_pl1_l1 - gal_tides - (
-                              self.CLIGHT / self.FREQ_DICT[self.gal_mode[:2]]) * gal_phw
-            EL2 = gal_epoch[
-                      gal_l2].to_numpy() - gal_pco2 + sat_pco_E5a + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_pl2_l2 - gal_tides - (
-                              self.CLIGHT / self.FREQ_DICT[self.gal_mode[2:]]) * gal_phw
+            gal_p1_c1 = (gal_epoch[gal_osb_c1_col].to_numpy(copy=False) if gal_has_osb_c1 else 0.0)
+            gal_p2_c2 = (gal_epoch[gal_osb_c2_col].to_numpy(copy=False) if gal_has_osb_c2 else 0.0)
+            gal_pl1_l1 = (gal_epoch[gal_osb_l1_col].to_numpy(copy=False) if gal_has_osb_l1 else 0.0)
+            gal_pl2_l2 = (gal_epoch[gal_osb_l2_col].to_numpy(copy=False) if gal_has_osb_l2 else 0.0)
+            gal_p1_c1 = gal_p1_c1 * 1e-09 * self.CLIGHT
+            gal_p2_c2 = gal_p2_c2 * 1e-09 * self.CLIGHT
+            gal_pl1_l1 = gal_pl1_l1 * 1e-09 * self.CLIGHT
+            gal_pl2_l2 = gal_pl2_l2 * 1e-09 * self.CLIGHT
+            EC1 = gal_epoch[gal_c1].to_numpy(copy=False) - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_p1_c1 - gal_tides
+            EC2 = gal_epoch[gal_c2].to_numpy(copy=False) - gal_pco2 + sat_pco_E5a + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_p2_c2 - gal_tides
+            EL1 = gal_epoch[gal_l1].to_numpy(copy=False) - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_pl1_l1 - gal_tides - (
+                self.CLIGHT / self.FREQ_DICT[self.gal_mode[:2]]) * gal_phw
+            EL2 = gal_epoch[gal_l2].to_numpy(copy=False) - gal_pco2 + sat_pco_E5a + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_pl2_l2 - gal_tides - (
+                self.CLIGHT / self.FREQ_DICT[self.gal_mode[2:]]) * gal_phw
 
-            ZGPS = np.vstack((C1, L1, C2, L2)).T.reshape(-1)
-            ZGAL = np.vstack((EC1, EL1, EC2, EL2)).T.reshape(-1)
+            ZGPS = np.empty(4 * len(C1))
+            ZGPS[0::4] = C1
+            ZGPS[1::4] = L1
+            ZGPS[2::4] = C2
+            ZGPS[3::4] = L2
+            ZGAL = np.empty(4 * len(EC1))
+            ZGAL[0::4] = EC1
+            ZGAL[1::4] = EL1
+            ZGAL[2::4] = EC2
+            ZGAL[3::4] = EL2
 
             Z = np.concatenate((ZGPS, ZGAL))
             gps_c1_mask = self.code_screening(x=self.ekf.x[:3],code_obs=C1,thr=30,satellites=gps_satellites[:,:3])
@@ -1342,44 +1749,66 @@ class PPPUdMultiGNSS:
             gal_c2_mask = self.code_screening(x=self.ekf.x[:3], code_obs=EC2, thr=30, satellites=gal_satellites[:,:3])
 
             # WEIGHTS GPS
-            ev_gps = np.deg2rad(gps_epoch['ev'].to_numpy())
-            R = np.zeros(4 * len(C1))
-            for k in range(len(curr_gps_sats)):
-                base = 4 * k
-
-                R[base + 0] = 1 / np.sin(ev_gps[k]) if gps_c1_mask[k] else 1e12
-
-                R[base + 1] = 0.001 / np.sin(ev_gps[k])#if gps_c1_mask[k] else 1e12
-
-                R[base + 2] = 1 / np.sin(ev_gps[k]) if gps_c2_mask[k] else 1e12
-
-                R[base + 3] = 0.001 / np.sin(ev_gps[k])#if gps_c2_mask[k] else 1e12
+            ev_gps = np.deg2rad(gps_epoch['ev'].to_numpy(copy=False))
+            inv_sin_gps = 1.0 / np.sin(ev_gps)
+            R = np.empty(4 * len(C1))
+            R[0::4] = np.where(gps_c1_mask, inv_sin_gps, 1e12)
+            R[1::4] = 0.001 * inv_sin_gps
+            R[2::4] = np.where(gps_c2_mask, inv_sin_gps, 1e12)
+            R[3::4] = 0.001 * inv_sin_gps
 
             # WEIGHTS GAL
-            ev_gal = np.deg2rad(gal_epoch['ev'].to_numpy())
-            RG = np.zeros(4 * len(EC1))
-            for k in range(len(curr_gal_sats)):
-                base = 4 * k
+            ev_gal = np.deg2rad(gal_epoch['ev'].to_numpy(copy=False))
+            inv_sin_gal = 1.0 / np.sin(ev_gal)
+            RG = np.empty(4 * len(EC1))
+            RG[0::4] = np.where(gal_c1_mask, inv_sin_gal, 1e12)
+            RG[1::4] = 0.001 * inv_sin_gal
+            RG[2::4] = np.where(gal_c2_mask, inv_sin_gal, 1e12)
+            RG[3::4] = 0.001 * inv_sin_gal
 
-                RG[base + 0] = 1 / np.sin(ev_gal[k]) if gal_c1_mask[k] else 1e12
-
-                RG[base + 1] = 0.001 / np.sin(ev_gal[k])#if gal_c1_mask[k] else 1e12
-
-                RG[base + 2] = 1 / np.sin(ev_gal[k]) if gal_c2_mask[k] else 1e12
-
-                RG[base + 3] = 0.001 / np.sin(ev_gal[k]) #if gal_c2_mask[k] else 1e12
-
-            Rdiag = np.diag(np.concatenate((R, RG)))
-
-
-
-            self.ekf.R = Rdiag
-
-            self.ekf.predict_update(z=Z,
-                                    HJacobian=self.Hjacobian,
-                                    args=(gps_satellites, gal_satellites),
-                                    Hx=self.Hx,
-                                    hx_args=(gps_satellites, gal_satellites))
+            r_diag = np.concatenate((R, RG))
+            r_diag = np.nan_to_num(r_diag, nan=1e12, posinf=1e12, neginf=1e12)
+            m = r_diag.size
+            R = r_cache.get(m)
+            if R is None:
+                R = np.zeros((m, m), dtype=np.float64)
+                r_cache[m] = R
+            else:
+                R.fill(0.0)
+            R.flat[::m + 1] = r_diag
+            self.ekf.R = R
+            updated = False
+            for k in range(5):
+                try:
+                    self.ekf.predict_update(
+                        z=Z,
+                        HJacobian=self.Hjacobian,
+                        args=(gps_satellites, gal_satellites),
+                        Hx=self.Hx,
+                        hx_args=(gps_satellites, gal_satellites),
+                    )
+                    updated = True
+                    break
+                except np.linalg.LinAlgError:
+                    jitter = 1e-6 * (10.0 ** k)
+                    self.ekf.R.flat[::m + 1] += jitter
+            if not updated:
+                if trace_filter:
+                    print(f"[WARN] Singular S at epoch {t}; reset and continue.")
+                old_gps_sats, old_gal_sats = self.reset_filter(epoch=t)
+                continue
+            ar_diag = None
+            if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
+                self.ekf.x, self.ekf.P, ar_diag = apply_uncombined_pppar(
+                    x=self.ekf.x,
+                    P=self.ekf.P,
+                    base_dim=self.base_dim,
+                    n_gps=len(curr_gps_sats),
+                    n_gal=len(curr_gal_sats),
+                    gps_ev=gps_epoch['ev'].to_numpy(copy=False),
+                    gal_ev=gal_epoch['ev'].to_numpy(copy=False),
+                    settings=ar_cfg,
+                )
             if not reset_epoch or reset_every == 0:
                 if xyz is not None:
                     position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
@@ -1419,16 +1848,26 @@ class PPPUdMultiGNSS:
             if ref is not None and flh is not None:
                 dx = ref - self.ekf.x[:3]
                 enu = np.array(ecef_to_enu(dXYZ=dx, flh=flh, degrees=True)).flatten()
-                result.append(pd.DataFrame(data={'de': enu[0], 'dn': enu[1], 'du': enu[2], 'dtr': dtr, 'ztd': ztd,
-                                                 'x': xyz[0], 'y': xyz[1], 'z': xyz[2],'isb':isb},
-                                           index=pd.DatetimeIndex(data=[t],name='time')))
             else:
                 enu = np.zeros(3)
-                result.append(pd.DataFrame(data={'de': enu[0], 'dn': enu[1], 'du': enu[2], 'dtr': dtr, 'ztd': ztd,
-                                                 'x': xyz[0], 'y': xyz[1], 'z': xyz[2],'isb':isb},
-                                           index=pd.DatetimeIndex(data=[t],name='time')))
+            result_rows.append({
+                'de': enu[0],
+                'dn': enu[1],
+                'du': enu[2],
+                'dtr': dtr,
+                'ztd': ztd,
+                'x': xyz[0],
+                'y': xyz[1],
+                'z': xyz[2],
+                'isb': isb,
+            })
+            if ar_diag is not None:
+                result_rows[-1]['ar_fixed'] = int(ar_diag.fixed_ambiguities)
+                result_rows[-1]['ar_ratio'] = np.nan if ar_diag.ratio_min is None else float(ar_diag.ratio_min)
+                result_rows[-1]['ar_ok'] = bool(ar_diag.accepted)
+            result_times.append(t)
             if trace_filter:
-                print(result[-1])
+                print(result_rows[-1])
         if conv_time is not None:
             if trace_filter:
                 print('Convergence time < 5 mm: ', conv_time.total_seconds() / 60,
@@ -1438,7 +1877,7 @@ class PPPUdMultiGNSS:
             ct = None
         gps_result = pd.concat(g)
         gal_result = pd.concat(e)
-        result = pd.concat(result)
+        result = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time'))
         result['ct_min']=ct
         return result, gps_result, gal_result, ct
 
@@ -1472,36 +1911,31 @@ class PPPUdSingleGNSS:
         m_wet = gps_satellites[:, 3]
         n = sat_xyz.shape[0]
         rec_xyz = x[:3].copy()
-        rho_vec = sat_xyz - rec_xyz
-        rho_norm = np.linalg.norm(rho_vec, axis=1, keepdims=True)
-        e_vec = rho_vec / rho_norm
+        e_vec, _ = _unit_vectors_and_ranges(sat_xyz, rec_xyz)
 
         n_params = self.base_dim + 3 * n
         H = np.zeros((4 * n, n_params))
         COL_X, COL_Y, COL_Z, COL_CLK, COL_ZTD = 0, 1, 2, 3, 4
 
-        for s in range(n):
-            row = 4 * s
-            ex, ey, ez = -e_vec[s]
-            mw = m_wet[s]
+        if n:
+            rows = slice(0, 4 * n)
+            H[rows, [COL_X, COL_Y, COL_Z]] = np.repeat(e_vec, 4, axis=0)
+            H[rows, COL_CLK] = 1.0
+            H[rows, COL_ZTD] = np.repeat(m_wet, 4)
 
-            for i in range(4):
-                H[row + i, [COL_X, COL_Y, COL_Z]] = [ex, ey, ez]
-                H[row + i, COL_CLK] = 1.0
-                H[row + i, COL_ZTD] = mw
+            idx = np.arange(n)
+            row0 = 4 * idx
+            row1 = row0 + 1
+            row2 = row0 + 2
+            row3 = row0 + 3
+            col_iono = self.base_dim + 3 * idx
+            H[row0, col_iono] = MU1
+            H[row1, col_iono] = -MU1
+            H[row2, col_iono] = MU2
+            H[row3, col_iono] = -MU2
+            H[row1, col_iono + 1] = L1
+            H[row3, col_iono + 2] = L2
 
-            col_iono = self.base_dim + 3 * s
-            col_N1 = col_iono + 1
-            col_N2 = col_iono + 2
-
-            H[row + 0, col_iono] = +MU1
-            H[row + 1, col_iono] = -MU1
-            H[row + 2, col_iono] = +MU2
-            H[row + 3, col_iono] = -MU2
-
-            H[row + 1, col_N1] = L1
-            H[row + 3, col_N2] = L2
-        # print(H)
         return H
 
     def Hx(self, x: np.ndarray, gps_satellites: np.ndarray) -> np.ndarray:
@@ -1514,32 +1948,28 @@ class PPPUdSingleGNSS:
         MU1 = 1.0
         MU2 = (F1 / F2) ** 2
 
-        xr, yr, zr = x_state[0:3]
         clk = x_state[3]
         zwd = x_state[4]
         n = gps_satellites.shape[0]
         base_dim = self.base_dim
 
-        sat_xyz = gps_satellites[:, :3]
-        m_wet = gps_satellites[:, 3]
-        rho_vec = sat_xyz - np.array([xr, yr, zr])
-        rho = np.linalg.norm(rho_vec, axis=1)
-
         z_hat = np.empty(4 * n)
 
-        for s in range(n):
-            i = base_dim + 3 * s
-            I_s = x_state[i]
-            N1_s = x_state[i + 1]
-            N2_s = x_state[i + 2]
-
-            geom = rho[s]
-            mw = m_wet[s]
-
-            z_hat[4 * s + 0] = geom + clk + mw * zwd + MU1 * I_s
-            z_hat[4 * s + 1] = geom + clk + mw * zwd - MU1 * I_s + L1 * N1_s
-            z_hat[4 * s + 2] = geom + clk + mw * zwd + MU2 * I_s
-            z_hat[4 * s + 3] = geom + clk + mw * zwd - MU2 * I_s + L2 * N2_s
+        if n:
+            gps_state = x_state[base_dim:base_dim + 3 * n].reshape(n, 3)
+            I = gps_state[:, 0]
+            N1 = gps_state[:, 1]
+            N2 = gps_state[:, 2]
+            _, rho = _unit_vectors_and_ranges(gps_satellites[:, :3], x_state[:3])
+            m_wet = gps_satellites[:, 3]
+            geom = rho
+            block = np.column_stack((
+                geom + clk + m_wet * zwd + MU1 * I,
+                geom + clk + m_wet * zwd - MU1 * I + L1 * N1,
+                geom + clk + m_wet * zwd + MU2 * I,
+                geom + clk + m_wet * zwd - MU2 * I + L2 * N2,
+            ))
+            z_hat[:] = block.reshape(-1)
 
         return z_hat
 
@@ -1563,32 +1993,29 @@ class PPPUdSingleGNSS:
         Q_new = np.zeros((new_dim, new_dim))
         Q_new[:base_dim, :base_dim] = Q_old[:base_dim, :base_dim]
 
-        common = set(prev_sats) & set(curr_sats)
-        for prn in common:
-            i_old = prev_sats.index(prn)
-            i_new = curr_sats.index(prn)
-            for k in range(3):
-                xo = base_dim + 3 * i_old + k
-                xn = base_dim + 3 * i_new + k
-                x_new[xn] = x_old[xo]
+        prev_map = {sv: i for i, sv in enumerate(prev_sats)}
+        curr_map = {sv: i for i, sv in enumerate(curr_sats)}
+        common = [sv for sv in curr_sats if sv in prev_map]
 
-                P_new[xn, :base_dim] = P_old[xo, :base_dim]
-                P_new[:base_dim, xn] = P_old[:base_dim, xo]
-                Q_new[xn, :base_dim] = Q_old[xo, :base_dim]
-                Q_new[:base_dim, xn] = Q_old[:base_dim, xo]
+        if common:
+            prev_idx = np.fromiter((prev_map[sv] for sv in common), dtype=int)
+            curr_idx = np.fromiter((curr_map[sv] for sv in common), dtype=int)
+            offsets = np.arange(3)
+            old_state_idx = (base_dim + 3 * prev_idx[:, None] + offsets[None, :]).ravel()
+            new_state_idx = (base_dim + 3 * curr_idx[:, None] + offsets[None, :]).ravel()
 
-                for prn2 in common:
-                    j_old = prev_sats.index(prn2)
-                    j_new = curr_sats.index(prn2)
-                    for l in range(3):
-                        yo = base_dim + 3 * j_old + l
-                        yn = base_dim + 3 * j_new + l
-                        P_new[xn, yn] = P_old[xo, yo]
-                        Q_new[xn, yn] = Q_old[xo, yo]
+            x_new[new_state_idx] = x_old[old_state_idx]
+            base_idx = np.arange(base_dim)
+            P_new[np.ix_(new_state_idx, base_idx)] = P_old[np.ix_(old_state_idx, base_idx)]
+            P_new[np.ix_(base_idx, new_state_idx)] = P_old[np.ix_(base_idx, old_state_idx)]
+            Q_new[np.ix_(new_state_idx, base_idx)] = Q_old[np.ix_(old_state_idx, base_idx)]
+            Q_new[np.ix_(base_idx, new_state_idx)] = Q_old[np.ix_(base_idx, old_state_idx)]
+            P_new[np.ix_(new_state_idx, new_state_idx)] = P_old[np.ix_(old_state_idx, old_state_idx)]
+            Q_new[np.ix_(new_state_idx, new_state_idx)] = Q_old[np.ix_(old_state_idx, old_state_idx)]
 
         new_only = set(curr_sats) - set(prev_sats)
         for prn in new_only:
-            j = curr_sats.index(prn)
+            j = curr_map[prn]
             idx_I = base_dim + 3 * j
             idx_N1 = idx_I + 1
             idx_N2 = idx_I + 2
@@ -1757,19 +2184,17 @@ class PPPUdSingleGNSS:
             N_vec    -- wektor [N1_1, N2_1, N1_2, N2_2, ..., N1_n, N2_n]
             P_N      -- macierz kowariancji odpowiadająca N_vec
         """
-        idxs_N = []
-        for i in range(n_sats):
-            idx_N1 = base_dim + 3 * i + 1
-            idx_N2 = base_dim + 3 * i + 2
-            idxs_N.extend([idx_N1, idx_N2])
-
+        offsets = np.array([1, 2])
+        idxs_N = (base_dim + 3 * np.arange(n_sats)[:, None] + offsets[None, :]).ravel()
         N_vec = x[idxs_N]
         P_N = P[np.ix_(idxs_N, idxs_N)]
 
         return N_vec, P_N
 
     def code_screening(self, x, satellites, code_obs, thr=1):
-        dist = calculate_distance(satellites, x)
+        sat_xyz = np.asarray(satellites, dtype=float)
+        ref_xyz = np.asarray(x, dtype=float)
+        dist = np.linalg.norm(sat_xyz - ref_xyz, axis=1)
         prefit = code_obs-dist
         median_prefit = np.median(prefit)
         mask = (prefit >= (median_prefit - thr)) & (prefit <= (median_prefit + thr))
@@ -1785,8 +2210,27 @@ class PPPUdSingleGNSS:
         agps, bgps, gps_c1, gps_c2, gps_l1, gps_l2 = gps_data
         if epochs is None:
             epochs = all_epochs
-        result = []
+        result_rows = []
+        result_times = []
         obs_result =[]
+        self.obs = self.obs.sort_values(by='sv')
+        obs_epochs = {t: df for t, df in self.obs.groupby(level=1, sort=False)}
+        gps_osb_c1_col = f'OSB_{gps_c1}'
+        gps_osb_c2_col = f'OSB_{gps_c2}'
+        gps_osb_l1_col = f'OSB_{gps_l1}'
+        gps_osb_l2_col = f'OSB_{gps_l2}'
+        gps_has_osb_c1 = gps_osb_c1_col in self.obs.columns
+        gps_has_osb_c2 = gps_osb_c2_col in self.obs.columns
+        gps_has_osb_l1 = gps_osb_l1_col in self.obs.columns
+        gps_has_osb_l2 = gps_osb_l2_col in self.obs.columns
+        r_cache = {}
+        ar_cfg = PPPARSettings(
+            enabled=bool(getattr(self.cfg, "pppar_enabled", False)),
+            warmup_epochs=int(getattr(self.cfg, "pppar_warmup_epochs", 60)),
+            min_ambiguities=int(getattr(self.cfg, "pppar_min_ambiguities", 4)),
+            ratio_threshold=float(getattr(self.cfg, "pppar_ratio_threshold", 2.0)),
+            constraint_sigma_cycles=float(getattr(self.cfg, "pppar_constraint_sigma_cycles", 1e-3)),
+        )
         xyz = None
         conv_time = None
         T0 = all_epochs[0]
@@ -1797,12 +2241,14 @@ class PPPUdSingleGNSS:
                     old_sats = self.reset_filter(epoch=t)
                     reset_epoch = True
                     T0 = t
-            gps_epoch = self.obs.loc[(slice(None), t), :].sort_values(by='sv')
+            gps_epoch = obs_epochs.get(t)
+            if gps_epoch is None:
+                continue
 
             def safe_get(df, col, length=None):
                 """Zwraca kolumnę jako numpy, a jeśli brak – wektor zer o podanej długości."""
                 if col in df.columns:
-                    return df[col].to_numpy()
+                    return df[col].to_numpy(copy=False)
                 elif length is not None:
                     return np.zeros(length)
                 else:
@@ -1836,42 +2282,65 @@ class PPPUdSingleGNSS:
 
             old_sats = curr_sats
 
-            tides = gps_epoch['tides_los'].to_numpy()
+            tides = gps_epoch['tides_los'].to_numpy(copy=False)
             gps_satellites = gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
 
-            gps_p1_c1 = np.asarray(gps_epoch.get(f'OSB_{gps_c1}',0.0)) * 1e-09 * self.CLIGHT
-            gps_p2_c2 = np.asarray(gps_epoch.get(f'OSB_{gps_c2}',0.0) )* 1e-09 * self.CLIGHT
-            gps_pl1_l1 = np.asarray(gps_epoch.get(f'OSB_{gps_l1}',0.0)) * 1e-09 * self.CLIGHT
-            gps_pl2_l2 = np.asarray(gps_epoch.get(f'OSB_{gps_l2}',0.0)) * 1e-09 * self.CLIGHT
-            C1 = gps_epoch[
-                     gps_c1].to_numpy() - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p1_c1 - tides
-            C2 = gps_epoch[
-                     gps_c2].to_numpy() - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p2_c2 - tides
-            L1 = gps_epoch[
-                     gps_l1].to_numpy() - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl1_l1 - tides - (
-                             self.CLIGHT / self.FREQ_DICT[self.mode[:2]]) * phw
-            L2 = gps_epoch[
-                     gps_l2].to_numpy() - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl2_l2 - tides - (
-                             self.CLIGHT / self.FREQ_DICT[self.mode[2:]]) * phw
+            gps_p1_c1 = (gps_epoch[gps_osb_c1_col].to_numpy(copy=False) if gps_has_osb_c1 else 0.0)
+            gps_p2_c2 = (gps_epoch[gps_osb_c2_col].to_numpy(copy=False) if gps_has_osb_c2 else 0.0)
+            gps_pl1_l1 = (gps_epoch[gps_osb_l1_col].to_numpy(copy=False) if gps_has_osb_l1 else 0.0)
+            gps_pl2_l2 = (gps_epoch[gps_osb_l2_col].to_numpy(copy=False) if gps_has_osb_l2 else 0.0)
+            gps_p1_c1 = gps_p1_c1 * 1e-09 * self.CLIGHT
+            gps_p2_c2 = gps_p2_c2 * 1e-09 * self.CLIGHT
+            gps_pl1_l1 = gps_pl1_l1 * 1e-09 * self.CLIGHT
+            gps_pl2_l2 = gps_pl2_l2 * 1e-09 * self.CLIGHT
+            C1 = gps_epoch[gps_c1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p1_c1 - tides
+            C2 = gps_epoch[gps_c2].to_numpy(copy=False) - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p2_c2 - tides
+            L1 = gps_epoch[gps_l1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl1_l1 - tides - (
+                self.CLIGHT / self.FREQ_DICT[self.mode[:2]]) * phw
+            L2 = gps_epoch[gps_l2].to_numpy(copy=False) - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl2_l2 - tides - (
+                self.CLIGHT / self.FREQ_DICT[self.mode[2:]]) * phw
 
-            Z = np.vstack((C1, L1, C2, L2)).T.reshape(-1)
+            Z = np.empty(4 * len(C1))
+            Z[0::4] = C1
+            Z[1::4] = L1
+            Z[2::4] = C2
+            Z[3::4] = L2
 
             gps_c1_mask = self.code_screening(x=self.ekf.x[:3], code_obs=C1, thr=30, satellites=gps_satellites[:, :3])
             gps_c2_mask = self.code_screening(x=self.ekf.x[:3], code_obs=C2, thr=30, satellites=gps_satellites[:, :3])
-            R_diag = np.zeros(4*len(curr_sats))
-            for k in range(len(curr_sats)):
-                base = 4*k
-                R_diag[base+0] = 1 if gps_c1_mask[k] else 1e12
-                R_diag[base+1] = 1
-                R_diag[base + 2] = 1 if gps_c2_mask[k] else 1e12
-                R_diag[base + 3] = 1
-            self.ekf.R = np.diag(R_diag)
+            R_diag = np.ones(4 * len(curr_sats))
+            R_diag[0::4] = np.where(gps_c1_mask, 1.0, 1e12)
+            R_diag[2::4] = np.where(gps_c2_mask, 1.0, 1e12)
+            m = R_diag.size
+            R = r_cache.get(m)
+            if R is None:
+                R = np.zeros((m, m), dtype=np.float64)
+                r_cache[m] = R
+            else:
+                R.fill(0.0)
+            R.flat[::m + 1] = R_diag
+            self.ekf.R = R
 
             self.ekf.predict_update(z=Z,
                                     HJacobian=self.Hjacobian,
                                     args=(gps_satellites,),
                                     Hx=self.Hx,
                                     hx_args=(gps_satellites,))
+            gps_ev = gps_epoch['ev'].to_numpy(copy=False) if 'ev' in gps_epoch.columns else np.full(
+                len(curr_sats), 45.0, dtype=float
+            )
+            ar_diag = None
+            if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
+                self.ekf.x, self.ekf.P, ar_diag = apply_uncombined_pppar(
+                    x=self.ekf.x,
+                    P=self.ekf.P,
+                    base_dim=self.base_dim,
+                    n_gps=len(curr_sats),
+                    n_gal=0,
+                    gps_ev=gps_ev,
+                    gal_ev=np.empty(0, dtype=float),
+                    settings=ar_cfg,
+                )
 
             if not reset_epoch or reset_every == 0:
                 if xyz is not None:
@@ -1888,11 +2357,28 @@ class PPPUdSingleGNSS:
             if ref is not None and flh is not None:
                 dx = ref - self.ekf.x[:3]
                 enu = np.array(ecef_to_enu(dXYZ=dx, flh=flh, degrees=True)).flatten()
-                result.append(pd.DataFrame(data={'de': enu[0], 'dn': enu[1], 'du': enu[2], 'dtr': dtr, 'ztd': ztd,
-                                                 'x':xyz[0],'y':xyz[1],'z':xyz[2]},
-                                           index=pd.DatetimeIndex(data=[t])))
+            else:
+                enu = np.zeros(3)
+            result_rows.append({
+                'de': enu[0],
+                'dn': enu[1],
+                'du': enu[2],
+                'dtr': dtr,
+                'ztd': ztd,
+                'x': xyz[0],
+                'y': xyz[1],
+                'z': xyz[2],
+                'ar_fixed': 0 if ar_diag is None else ar_diag.fixed_ambiguities,
+                'ar_ratio': np.nan if ar_diag is None or ar_diag.ratio_min is None else ar_diag.ratio_min,
+                'ar_ok': False if ar_diag is None else ar_diag.accepted,
+            })
+            result_times.append(t)
             if trace_filter:
-                print(result[-1])
+                if reset_epoch:
+                    print('===' * 30, '  RESET  ', '===' * 30)
+                print(result_rows[-1])
+                print('===' * 30)
+                print('\n\n')
         if conv_time is not None:
             if trace_filter:
                 print('Convergence time < 5 mm: ', conv_time.total_seconds() / 60,
@@ -1900,7 +2386,7 @@ class PPPUdSingleGNSS:
             ct = conv_time.total_seconds() / 3600
         else:
             ct = None
-        output = pd.concat(result)
+        output = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time'))
         output['ct_min'] = ct
         return output, self.obs, self.obs, ct
 
@@ -2422,8 +2908,9 @@ class PPPFilterMultiGNSSIonConst:
         :param thr: [float,int], threshold for median filter
         :return: np.ndarray, array of bools, outlier markers
         """
-        dist = calculate_distance(satellites, x)
-        dist = dist.astype(np.float64, copy=False)
+        sat_xyz = np.asarray(satellites, dtype=float)
+        ref_xyz = np.asarray(x, dtype=float)
+        dist = np.linalg.norm(sat_xyz - ref_xyz, axis=1)
         prefit = code_obs - dist
         median_prefit = np.median(prefit)
         mask = (prefit >= (median_prefit - thr)) & (prefit <= (median_prefit + thr))
@@ -2519,6 +3006,20 @@ class PPPFilterMultiGNSSIonConst:
         prt_gal_l2 = {}
         self.gps_obs.sort_values(by='sv', inplace=True)
         self.gal_obs.sort_values(by='sv', inplace=True)
+        gps_epochs = {
+            t: df for t, df in self.gps_obs.groupby(level=1, sort=False)
+        }
+        gal_epochs = {
+            t: df for t, df in self.gal_obs.groupby(level=1, sort=False)
+        }
+        r_cache = {}
+        ar_cfg = PPPARSettings(
+            enabled=bool(getattr(self.cfg, "pppar_enabled", False)),
+            warmup_epochs=int(getattr(self.cfg, "pppar_warmup_epochs", 60)),
+            min_ambiguities=int(getattr(self.cfg, "pppar_min_ambiguities", 4)),
+            ratio_threshold=float(getattr(self.cfg, "pppar_ratio_threshold", 2.0)),
+            constraint_sigma_cycles=float(getattr(self.cfg, "pppar_constraint_sigma_cycles", 1e-3)),
+        )
         for num, t in enumerate(epochs):
             reset_epoch = False
             if reset_every != 0:
@@ -2529,8 +3030,10 @@ class PPPFilterMultiGNSSIonConst:
                     T0 = t
                     # n_i = 0
 
-            gps_epoch = self.gps_obs.loc[(slice(None), t), :]  # .sort_values(by='sv')
-            gal_epoch = self.gal_obs.loc[(slice(None), t), :]  # .sort_values(by='sv')
+            gps_epoch = gps_epochs.get(t)
+            gal_epoch = gal_epochs.get(t)
+            if gps_epoch is None or gal_epoch is None:
+                continue
             curr_gps_sats = gps_epoch.index.get_level_values('sv').tolist()
             curr_gal_sats = gal_epoch.index.get_level_values('sv').tolist()
             if (curr_gps_sats != gps_sats) or (curr_gal_sats != gal_sats):
@@ -2646,8 +3149,8 @@ class PPPFilterMultiGNSSIonConst:
             Z = np.hstack([np.vstack((C1, L1, C2, L2, IONO)).T.reshape(-1),
                            np.vstack((EC1, EL1, EC2, EL2, EIONO)).T.reshape(-1)])
 
-            dist_gps = calculate_distance(gps_satellites[:, :3].copy(), self.ekf.x[:3].copy())
-            dist_gal = calculate_distance(gal_satellites[:, :3].copy(), self.ekf.x[:3].copy())
+            dist_gps = calculate_distance(gps_satellites[:, :3], self.ekf.x[:3])
+            dist_gal = calculate_distance(gal_satellites[:, :3], self.ekf.x[:3])
             prefit_gps_l1 = L1 - dist_gps
             prefit_gps_l2 = L2 - dist_gps
             prt_gps_l1[num] = {sv: r for sv, r in zip(curr_gps_sats, prefit_gps_l1)}
@@ -2672,23 +3175,24 @@ class PPPFilterMultiGNSSIonConst:
             else:
                 sigma_ion = sigma_iono_t[-1]
 
-            ev_gps = gps_epoch['ev'].to_numpy()
-            ev_gal = gal_epoch['ev'].to_numpy()
-            sigma_code_gps = 0.3 + 0.0025 / np.sin(np.deg2rad(ev_gps))  # **2
-            sigma_phase_gps = 1e-4 + 0.0003 / np.sin(np.deg2rad(ev_gps))  # **2
+            ev_gps = gps_epoch['ev'].to_numpy(copy=False)
+            ev_gal = gal_epoch['ev'].to_numpy(copy=False)
+            inv_sin_gps = 1.0 / np.sin(np.deg2rad(ev_gps))
+            inv_sin_gal = 1.0 / np.sin(np.deg2rad(ev_gal))
+            sigma_code_gps = 0.3 + 0.0025 * inv_sin_gps  # **2
+            sigma_phase_gps = 1e-4 + 0.0003 * inv_sin_gps  # **2
             if self.use_iono_rms:
                 sigma_ion_gps = gps_epoch[
-                                    'ion_rms'].to_numpy() * sigma_ion  # sigma_ion/np.sin(np.deg2rad(ev_gps)) #np.full_like(ev_gps, sigma_ion)
+                                    'ion_rms'].to_numpy(copy=False) * sigma_ion  # sigma_ion/np.sin(np.deg2rad(ev_gps)) #np.full_like(ev_gps, sigma_ion)
                 sigma_ion_gal = gal_epoch[
-                                    'ion_rms'].to_numpy() * sigma_ion  # sigma_ion/np.sin(np.deg2rad(ev_gal)) #np.full_like(ev_gal, sigma_ion)
+                                    'ion_rms'].to_numpy(copy=False) * sigma_ion  # sigma_ion/np.sin(np.deg2rad(ev_gal)) #np.full_like(ev_gal, sigma_ion)
             else:
                 sigma_ion_gps = np.full_like(ev_gps, sigma_ion)
                 sigma_ion_gal = np.full_like(ev_gal, sigma_ion)
 
-            sigma_code_gal = 0.3 + 0.0025 / np.sin(np.deg2rad(ev_gal))  # **2
-            sigma_phase_gal = 1e-4 + 0.0003 / np.sin(np.deg2rad(ev_gal))  # **2
+            sigma_code_gal = 0.3 + 0.0025 * inv_sin_gal  # **2
+            sigma_phase_gal = 1e-4 + 0.0003 * inv_sin_gal  # **2
 
-            W = []
             gps_c1_mask, prefit_c1 = self.code_screening(x=self.ekf.x[:3], satellites=gps_satellites[:, :3],
                                                          code_obs=C1, thr=10)
             gps_c2_mask, prefit_c2 = self.code_screening(x=self.ekf.x[:3], satellites=gps_satellites[:, :3],
@@ -2699,39 +3203,71 @@ class PPPFilterMultiGNSSIonConst:
             gal_c2_mask, prefit_e2 = self.code_screening(x=self.ekf.x[:3], satellites=gal_satellites[:, :3],
                                                          code_obs=EC2, thr=10)
 
-            for i, (sc, sp, si) in enumerate(zip(sigma_code_gps, sigma_phase_gps, sigma_ion_gps)):
-                sc1 = sc
-                sc2 = sc
-                if not gps_c1_mask[i]:
-                    sc1 = 1e12
-                if not gps_c2_mask[i]:
-                    sc2 = 1e12
-                W.extend([sc1, sp, sc2, sp, si])
+            gps_sc1 = np.where(gps_c1_mask, sigma_code_gps, 1e12)
+            gps_sc2 = np.where(gps_c2_mask, sigma_code_gps, 1e12)
+            W_gps = np.column_stack(
+                (gps_sc1, sigma_phase_gps, gps_sc2, sigma_phase_gps, sigma_ion_gps)
+            ).ravel()
 
-            for i, (sc, sp, si) in enumerate(zip(sigma_code_gal, sigma_phase_gal, sigma_ion_gal)):
-                sc1 = sc
-                sc2 = sc
-                if not gal_c1_mask[i]:
-                    sc1 = 1e12
-                if not gal_c2_mask[i]:
-                    sc2 = 1e12
-                W.extend([sc1, sp, sc2, sp, si])
+            gal_sc1 = np.where(gal_c1_mask, sigma_code_gal, 1e12)
+            gal_sc2 = np.where(gal_c2_mask, sigma_code_gal, 1e12)
+            W_gal = np.column_stack(
+                (gal_sc1, sigma_phase_gal, gal_sc2, sigma_phase_gal, sigma_ion_gal)
+            ).ravel()
+
+            W = np.concatenate((W_gps, W_gal))
+            W = np.nan_to_num(W, nan=1e12, posinf=1e12, neginf=1e12)
 
             # W = np.array(W, dtype=np.float32)
             #
             # self.ekf.R = np.diag(W)
             m = self.ekf.dim_z
-            if getattr(self.ekf, "R", None) is None or self.ekf.R.shape != (m, m):
-                self.ekf.R = np.zeros((m, m), dtype=np.float64)
+            R = r_cache.get(m)
+            if R is None:
+                R = np.zeros((m, m), dtype=np.float64)
+                r_cache[m] = R
+            else:
+                R.fill(0.0)
 
             # W musi mieć długość m
-            self.ekf.R.flat[::m + 1] = W  # wstaw przekątną bez tworzenia diag
-
-            self.ekf.predict_update(z=Z,
-                                    HJacobian=self.Hjacobian,
-                                    args=(gps_satellites, gal_satellites),
-                                    Hx=self.Hx,
-                                    hx_args=(gps_satellites, gal_satellites))
+            R.flat[::m + 1] = W  # wstaw przekątną bez tworzenia diag
+            self.ekf.R = R
+            if not np.all(np.isfinite(Z)):
+                if trace_filter:
+                    print(f"[WARN] Non-finite Z at epoch {t}; skipping.")
+                continue
+            updated = False
+            for k in range(5):
+                try:
+                    self.ekf.predict_update(
+                        z=Z,
+                        HJacobian=self.Hjacobian,
+                        args=(gps_satellites, gal_satellites),
+                        Hx=self.Hx,
+                        hx_args=(gps_satellites, gal_satellites),
+                    )
+                    updated = True
+                    break
+                except np.linalg.LinAlgError:
+                    jitter = 1e-6 * (10.0 ** k)
+                    self.ekf.R.flat[::m + 1] += jitter
+            if not updated:
+                if trace_filter:
+                    print(f"[WARN] Singular S at epoch {t}; reset and continue.")
+                gps_sats, gal_sats = self.reset_filter(epoch=t)
+                continue
+            ar_diag = None
+            if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
+                self.ekf.x, self.ekf.P, ar_diag = apply_uncombined_pppar(
+                    x=self.ekf.x,
+                    P=self.ekf.P,
+                    base_dim=self.base_dim,
+                    n_gps=len(curr_gps_sats),
+                    n_gal=len(curr_gal_sats),
+                    gps_ev=ev_gps,
+                    gal_ev=ev_gal,
+                    settings=ar_cfg,
+                )
 
             dtr = self.ekf.x[3]
             isb = self.ekf.x[4]
@@ -2771,6 +3307,10 @@ class PPPFilterMultiGNSSIonConst:
                            'dtr': dtr, 'isb': isb, 'ztd': ztd, 'dcb_gps_c1': dcb[0], 'dcb_gps_c2': dcb[1],
                            'dcb_gal_c1': dcb[2], 'dcb_gal_c2': dcb[3], 'xr': self.ekf.x[0], 'yr': self.ekf.x[1],
                            'zr': self.ekf.x[2]})
+            if ar_diag is not None:
+                result[-1]['ar_fixed'] = int(ar_diag.fixed_ambiguities)
+                result[-1]['ar_ratio'] = np.nan if ar_diag.ratio_min is None else float(ar_diag.ratio_min)
+                result[-1]['ar_ok'] = bool(ar_diag.accepted)
 
             y_gps = self.ekf.y[:5 * len(curr_gps_sats)].copy()
             v_gps_c1 = y_gps[0::5]
@@ -2869,5 +3409,3 @@ class PPPFilterMultiGNSSIonConst:
             ct = None
         print('Finish')
         return df_result, df_obs_gps, df_obs_gal, ct
-
-

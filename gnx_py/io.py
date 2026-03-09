@@ -162,7 +162,7 @@ class GFZRNX2:
             .filter(regex=r"^[CLS]\d")
             .sort_index()
         )
-        df = df.apply(lambda x: pd.to_numeric(x)).replace(self.drop_sentinel, pd.NA)
+        df = df.apply(pd.to_numeric, errors="coerce").replace(self.drop_sentinel, pd.NA)
         mask = (df[[c for c in df.columns if c.startswith(('C', 'L'))]] == 9999999999.999).any(axis=1)
         df = df[~mask]
         #

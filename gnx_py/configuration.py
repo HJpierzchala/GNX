@@ -196,6 +196,13 @@ class PPPConfig(Config):
     trace_filter: Optional[bool] = False
     reset_every: Optional[int] = 0
 
+    # PPP-AR options
+    pppar_enabled: bool = False
+    pppar_warmup_epochs: int = 60
+    pppar_min_ambiguities: int = 4
+    pppar_ratio_threshold: float = 2.0
+    pppar_constraint_sigma_cycles: float = 1e-3
+
     # KF params: ustawiamy MISSING, żeby wykryć override od użytkownika
     clock_process: Any = field(default=MISSING)  # Literal['RW','WN']
     p_crd: Any = field(default=MISSING)
@@ -293,7 +300,6 @@ class PPPConfig(Config):
         eff = self.effective()
         for k, v in eff.items():
             setattr(self, k, v)
-
 
 
 

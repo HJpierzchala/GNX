@@ -30,6 +30,586 @@ DT_VEL  = 5e-6                  # [s] – pół-okno do prędkości (±0.5 µs)
 pi = np.pi
 WEEK = 604800.0
 
+def _process_satellite_interpolation(args):
+    """
+        Processes interpolation for a single satellite.
+
+        args – dictionary containing:
+          - sat: satellite identifier
+          - sat_df: DataFrame with data for the satellite (sorted by toc)
+          - epoch_times: NumPy array of continuous epoch times (in seconds)
+          - epochs: list of epochs (datetime) corresponding to epoch_times
+          - method: interpolation method ('chebyshev' or 'cubic_spline')
+          - window_size: initial window size
+          - min_window_size: minimum window size
+          - delta_t: small time step for calculating velocity (seconds)
+        Returns a list of dictionaries with interpolation results for a given satellite.
+        """
+    sat = args['sat']
+    sat_df = args['sat_df']
+    epoch_times = args['epoch_times']
+    epochs = args['epochs']
+    method = args['method']
+    window_size = args['window_size']
+    min_window_size = args['min_window_size']
+    delta_t = args['delta_t']
+
+    results = []
+    toc = sat_df['toc'].values  # ciągły czas (w sekundach)
+    x = sat_df['x'].values
+    y = sat_df['y'].values
+    z = sat_df['z'].values
+    clk = sat_df['clk'].values
+
+    for epoch_time, epoch in zip(epoch_times, epochs):
+        window_found = False
+        current_window_size = window_size
+
+        while current_window_size >= min_window_size and not window_found:
+            half_window = (current_window_size - 1) * 300 / 2  # 5-minutowe interwały (300 s)
+            indices = np.where((toc >= epoch_time - half_window) & (toc < epoch_time + half_window))[0]
+
+            if len(indices) >= min_window_size:
+                window_found = True
+                toc_window = toc[indices]
+                x_window = x[indices]
+                y_window = y[indices]
+                z_window = z[indices]
+                clk_window = clk[indices]
+
+                t_min = toc_window.min()
+                t_max = toc_window.max()
+                # Normalizacja czasu do przedziału [0, 2] (zachowujemy proporcje)
+                toc_normalized = 2 * (toc_window - t_min) / (t_max - t_min)
+                epoch_time_normalized = 2 * (epoch_time - t_min) / (t_max - t_min)
+                epoch_time_plus_dt_normalized = 2 * ((epoch_time + delta_t) - t_min) / (t_max - t_min)
+                epoch_time_minus_dt_normalized = 2 * ((epoch_time - delta_t) - t_min) / (t_max - t_min)
+
+                degree = len(toc_normalized) - 1
+
+                if method == 'chebyshev':
+                    with warnings.catch_warnings():
+                        # Dopasowanie wielomianu Czebyszewa
+                        cheb_x = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, x_window, deg=degree)
+                        cheb_y = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, y_window, deg=degree)
+                        cheb_z = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, z_window, deg=degree)
+                    interpolated_x = cheb_x(epoch_time_normalized)
+                    interpolated_y = cheb_y(epoch_time_normalized)
+                    interpolated_z = cheb_z(epoch_time_normalized)
+                    interpolated_x_dt = cheb_x(epoch_time_plus_dt_normalized)
+                    interpolated_y_dt = cheb_y(epoch_time_plus_dt_normalized)
+                    interpolated_z_dt = cheb_z(epoch_time_plus_dt_normalized)
+                    interpolated_x_min_dt = cheb_x(epoch_time_minus_dt_normalized)
+                    interpolated_y_min_dt = cheb_y(epoch_time_minus_dt_normalized)
+                    interpolated_z_min_dt = cheb_z(epoch_time_minus_dt_normalized)
+                else:
+                    raise ValueError("Unsupported interpolation method.")
+
+                # Obliczenie prędkości metodą różnic centralnych (skalujemy do metrów na sekundę)
+                vx = (interpolated_x_dt - interpolated_x_min_dt) / (2 * delta_t) * 1000
+                vy = (interpolated_y_dt - interpolated_y_min_dt) / (2 * delta_t) * 1000
+                vz = (interpolated_z_dt - interpolated_z_min_dt) / (2 * delta_t) * 1000
+
+                # Interpolacja korekty zegara – liniowa interpolacja pomiędzy dwoma najbliższymi punktami
+                idx = np.searchsorted(toc_window, epoch_time)
+                if idx == 0:
+                    idx0, idx1 = 0, 1
+                elif idx == len(toc_window):
+                    idx0, idx1 = len(toc_window) - 2, len(toc_window) - 1
+                else:
+                    idx0, idx1 = idx - 1, idx
+                t0, t1 = toc_window[idx0], toc_window[idx1]
+                clk0, clk1 = clk_window[idx0], clk_window[idx1]
+                if epoch_time == t1:
+                    interpolated_clk = clk1
+                elif epoch_time == t0:
+                    interpolated_clk = clk0
+                else:
+                    if t1 != t0:
+                        interpolated_clk = clk0 + (clk1 - clk0) * (epoch_time - t0) / (t1 - t0)
+                    else:
+                        interpolated_clk = clk0
+                interpolated_clk *= 1e-6  # przeskalowanie jednostek
+
+                c = 299792458
+                r_vec = np.array([interpolated_x, interpolated_y, interpolated_z]) * 1000  # m
+                v_vec = np.array([vx, vy, vz])
+                dot_product = np.dot(r_vec, v_vec)
+                delta_t_rel = -2 * dot_product / c ** 2  # w sekundach
+                corrected_clk = interpolated_clk + delta_t_rel
+
+                results.append({
+                    'sv': sat,
+                    'epoch': epoch,
+                    'x': interpolated_x,
+                    'y': interpolated_y,
+                    'z': interpolated_z,
+                    'clk': corrected_clk,
+                    'vx': vx,
+                    'vy': vy,
+                    'vz': vz,
+                    'dt_rel': delta_t_rel,
+                    'clk_raw':interpolated_clk
+                })
+            else:
+                current_window_size -= 1
+
+
+        if not window_found:
+            max_half = (window_size - 1) * 300 / 2
+            t_min = toc.min()
+            t_max = toc.max()
+            start = max(t_min, epoch_time - max_half)
+            end = min(t_max, epoch_time + max_half)
+            indices = np.where((toc >= start) & (toc <= end))[0]
+
+            if len(indices) >= min_window_size:
+                toc_window = toc[indices]
+                x_window = x[indices]
+                y_window = y[indices]
+                z_window = z[indices]
+                clk_window = clk[indices]
+
+                t_min = toc_window.min()
+                t_max = toc_window.max()
+                toc_normalized = 2 * (toc_window - t_min) / (t_max - t_min)
+                epoch_time_normalized = 2 * (epoch_time - t_min) / (t_max - t_min)
+                epoch_time_plus_dt_normalized = 2 * ((epoch_time + delta_t) - t_min) / (t_max - t_min)
+                epoch_time_minus_dt_normalized = 2 * ((epoch_time - delta_t) - t_min) / (t_max - t_min)
+
+                degree = len(toc_normalized) - 1
+
+                if method == 'chebyshev':
+                    with warnings.catch_warnings():
+                        cheb_x = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, x_window, deg=degree)
+                        cheb_y = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, y_window, deg=degree)
+                        cheb_z = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, z_window, deg=degree)
+                    interpolated_x = cheb_x(epoch_time_normalized)
+                    interpolated_y = cheb_y(epoch_time_normalized)
+                    interpolated_z = cheb_z(epoch_time_normalized)
+                    interpolated_x_dt = cheb_x(epoch_time_plus_dt_normalized)
+                    interpolated_y_dt = cheb_y(epoch_time_plus_dt_normalized)
+                    interpolated_z_dt = cheb_z(epoch_time_plus_dt_normalized)
+                    interpolated_x_min_dt = cheb_x(epoch_time_minus_dt_normalized)
+                    interpolated_y_min_dt = cheb_y(epoch_time_minus_dt_normalized)
+                    interpolated_z_min_dt = cheb_z(epoch_time_minus_dt_normalized)
+                else:
+                    raise ValueError("Unsupported interpolation method.")
+
+                vx = (interpolated_x_dt - interpolated_x_min_dt) / (2 * delta_t) * 1000
+                vy = (interpolated_y_dt - interpolated_y_min_dt) / (2 * delta_t) * 1000
+                vz = (interpolated_z_dt - interpolated_z_min_dt) / (2 * delta_t) * 1000
+
+                idx = np.searchsorted(toc_window, epoch_time)
+                if idx == 0:
+                    idx0, idx1 = 0, 1
+                elif idx == len(toc_window):
+                    idx0, idx1 = len(toc_window) - 2, len(toc_window) - 1
+                else:
+                    idx0, idx1 = idx - 1, idx
+                t0, t1 = toc_window[idx0], toc_window[idx1]
+                clk0, clk1 = clk_window[idx0], clk_window[idx1]
+                if epoch_time == t1:
+                    interpolated_clk = clk1
+                elif epoch_time == t0:
+                    interpolated_clk = clk0
+                else:
+                    interpolated_clk = clk0 + (clk1 - clk0) * (epoch_time - t0) / (t1 - t0) if t1 != t0 else clk0
+                interpolated_clk *= 1e-6
+
+                c = 299792458
+                r_vec = np.array([interpolated_x, interpolated_y, interpolated_z]) * 1000
+                v_vec = np.array([vx, vy, vz])
+                dot_product = np.dot(r_vec, v_vec)
+                delta_t_rel = -2 * dot_product / c ** 2
+                corrected_clk = interpolated_clk + delta_t_rel
+
+                results.append({
+                    'sv': sat,
+                    'epoch': epoch,
+                    'x': interpolated_x,
+                    'y': interpolated_y,
+                    'z': interpolated_z,
+                    'clk': corrected_clk,
+                    'vx': vx,
+                    'vy': vy,
+                    'vz': vz,
+                    'dt_rel': delta_t_rel,
+                    'clk_raw': interpolated_clk
+                })
+
+    return results
+
+
+class SP3InterpolatorOptimized:
+    def __init__(self, sp3_dataframe):
+        """
+        Inicjalizacja z danymi SP3.
+        """
+        self.sp3_df = sp3_dataframe.copy()
+        self.prepare_data()
+
+    def prepare_data(self):
+        # Konwersja kolumny 'epoch' do daty
+        self.sp3_df.loc[:,'epoch'] = pd.to_datetime(self.sp3_df['epoch'], utc=False)
+        self.sp3_df['gps_week'], self.sp3_df['tow'] = zip(*self.sp3_df['epoch'].apply(self.datetime2gpsweek_and_tow))
+        min_gps_week = self.sp3_df['gps_week'].min()
+        self.sp3_df['continuous_time'] = (self.sp3_df['gps_week'] - min_gps_week) * 604800 + self.sp3_df['tow']
+        self.sp3_df['toc'] = self.sp3_df['continuous_time']
+        self.satellites = self.sp3_df['sat'].unique()
+        self.sat_data = {}
+        for sat in self.satellites:
+            sat_df = self.sp3_df[self.sp3_df['sat'] == sat].sort_values('toc')
+            self.sat_data[sat] = sat_df
+
+    def datetime2gpsweek_and_tow(self, dt):
+        gps_epoch = datetime.datetime(1980, 1, 6, tzinfo=datetime.timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = dt.astimezone(datetime.timezone.utc)
+        delta = dt - gps_epoch
+        delta_seconds = delta.total_seconds()
+        gps_week = int(delta_seconds // 604800)
+        tow = delta_seconds % 604800
+        return gps_week, tow
+
+    def interpolate(self, epochs, method='chebyshev', window_size=12, min_window_size=5, delta_t=0.5e-6):
+        """
+        Przeprowadza interpolację pozycji satelitów dla podanych epok, równolegle przetwarzając dane dla każdego satelity.
+        """
+        interpolated_positions = []
+        # Przeliczenie epok na GPS week i ciągły czas
+        epoch_weeks, epoch_tows = zip(*[self.datetime2gpsweek_and_tow(epoch) for epoch in epochs])
+        min_gps_week = self.sp3_df['gps_week'].min()
+        epoch_times = np.array([(week - min_gps_week) * 604800 + tow for week, tow in zip(epoch_weeks, epoch_tows)])
+
+        # Przygotowanie argumentów dla równoległego przetwarzania – każdy satelita osobno
+        tasks = []
+        for sat in self.satellites:
+            sat_df = self.sat_data[sat]
+            if sat_df.empty:
+                continue
+            task = {
+                'sat': sat,
+                'sat_df': sat_df,
+                'epoch_times': epoch_times,
+                'epochs': epochs,
+                'method': method,
+                'window_size': window_size,
+                'min_window_size': min_window_size,
+                'delta_t': delta_t
+            }
+            tasks.append(task)
+
+        # Równoległe przetwarzanie z użyciem ProcessPoolExecutor
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            results = list(executor.map(_process_satellite_interpolation, tasks))
+
+        # Scal wyniki – results to lista list słowników
+        for sat_results in results:
+            interpolated_positions.extend(sat_results)
+
+        interpolated_df = pd.DataFrame(interpolated_positions)
+        interpolated_df.set_index(['sv', 'epoch'], inplace=True)
+        return interpolated_df
+
+    def include_adjacent_data(self, prev_sp3_df=None, next_sp3_df=None):
+        if prev_sp3_df is not None:
+            prev_sp3_df['epoch'] = pd.to_datetime(prev_sp3_df['epoch'])
+            combined_df = pd.concat([prev_sp3_df, self.sp3_df])
+            self.sp3_df = combined_df.reset_index(drop=True)
+        if next_sp3_df is not None:
+            next_sp3_df['epoch'] = pd.to_datetime(next_sp3_df['epoch'])
+            combined_df = pd.concat([self.sp3_df, next_sp3_df])
+            self.sp3_df = combined_df.reset_index(drop=True)
+        self.sp3_df = self.sp3_df.drop_duplicates(subset=['sat', 'epoch'], keep='first')
+        self.prepare_data()
+
+    def run(self, epochs, method, prev_sp3_df=None, next_sp3_df=None):
+        if (prev_sp3_df is not None) or (next_sp3_df is not None):
+            self.include_adjacent_data(prev_sp3_df=prev_sp3_df,next_sp3_df=next_sp3_df)
+        interpolated_positions = self.interpolate(epochs=epochs, method=method)
+        interpolated_positions = interpolated_positions.swaplevel(0, 1)
+        interpolated_positions[['x', 'y', 'z']] = interpolated_positions[['x', 'y', 'z']].apply(lambda x: x * 1000)
+        return interpolated_positions
+
+def _process_satellite_tuple(args):
+    """
+    Przetwarza interpolację dla jednego tuple: (sat, [epoch1, epoch2, ...], [rec_epoch1, ...]).
+    Zwraca listę słowników z wynikami interpolacji dla danego satelity.
+
+    args – słownik zawierający:
+      - sat: identyfikator satelity
+      - epochs: lista epok (datetime) do interpolacji (czas emisji sygnału)
+      - rec_epochs: odpowiadająca lista epok obserwacji (do indeksowania wyniku)
+      - sat_df: DataFrame z danymi SP3 dla satelity (posortowany według 'toc')
+      - method: metoda interpolacji ('chebyshev' lub 'cubic_spline')
+      - window_size: początkowy rozmiar okna
+      - min_window_size: minimalny rozmiar okna
+      - delta_t: mały krok czasu (w sekundach) do obliczania prędkości
+      - datetime2gpsweek_and_tow: funkcja konwertująca datetime na (gps_week, tow)
+      - min_gps_week: minimalna wartość gps_week z całego zbioru
+    """
+    sat = args['sat']
+    epochs = args['epochs']
+    rec_epochs = args['rec_epochs']
+    sat_df = args['sat_df']
+    method = args['method']
+    window_size = args['window_size']
+    min_window_size = args['min_window_size']
+    delta_t = args['delta_t']
+    datetime2gpsweek_and_tow = args['datetime2gpsweek_and_tow']
+    min_gps_week = args['min_gps_week']
+
+    results = []
+    toc = sat_df['toc'].values
+    x = sat_df['x'].values
+    y = sat_df['y'].values
+    z = sat_df['z'].values
+    clk = sat_df['clk'].values
+
+    # Konwersja listy epok na ciągłe czasy
+    epoch_weeks, epoch_tows = zip(*[datetime2gpsweek_and_tow(epoch) for epoch in epochs])
+    epoch_times = np.array([(week - min_gps_week) * 604800 + tow for week, tow in zip(epoch_weeks, epoch_tows)])
+
+    # Dla każdej epoki z listy (dla satelity)
+    for epoch_time, epoch, rec_epoch in zip(epoch_times, epochs, rec_epochs):
+        window_found = False
+        current_window_size = window_size
+
+        while current_window_size >= min_window_size and not window_found:
+            half_window = (current_window_size - 1) * 300 / 2  # Zakładamy 5-minutowe interwały (300 s)
+            indices = np.where((toc >= epoch_time - half_window) & (toc < epoch_time + half_window))[0]
+
+            if len(indices) >= min_window_size:
+                window_found = True
+                toc_window = toc[indices]
+                x_window = x[indices]
+                y_window = y[indices]
+                z_window = z[indices]
+                clk_window = clk[indices]
+
+                t_min = toc_window.min()
+                t_max = toc_window.max()
+                # Normalizacja czasu – zachowujemy oryginalne przeliczenie (2 * ...)
+                toc_normalized = 2 * (toc_window - t_min) / (t_max - t_min)
+                epoch_time_normalized = 2 * (epoch_time - t_min) / (t_max - t_min)
+                epoch_time_plus_dt_normalized = 2 * ((epoch_time + delta_t) - t_min) / (t_max - t_min)
+                epoch_time_minus_dt_normalized = 2 * ((epoch_time - delta_t) - t_min) / (t_max - t_min)
+
+                if method == 'chebyshev':
+                    with warnings.catch_warnings():
+                        # warnings.simplefilter('ignore', RankWarning)
+                        cheb_x = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, x_window,
+                                                                       deg=len(toc_normalized) - 1)
+                        cheb_y = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, y_window,
+                                                                       deg=len(toc_normalized) - 1)
+                        cheb_z = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, z_window,
+                                                                       deg=len(toc_normalized) - 1)
+                    interpolated_x = cheb_x(epoch_time_normalized)
+                    interpolated_y = cheb_y(epoch_time_normalized)
+                    interpolated_z = cheb_z(epoch_time_normalized)
+                    interpolated_x_dt = cheb_x(epoch_time_plus_dt_normalized)
+                    interpolated_y_dt = cheb_y(epoch_time_plus_dt_normalized)
+                    interpolated_z_dt = cheb_z(epoch_time_plus_dt_normalized)
+                    interpolated_x_min_dt = cheb_x(epoch_time_minus_dt_normalized)
+                    interpolated_y_min_dt = cheb_y(epoch_time_minus_dt_normalized)
+                    interpolated_z_min_dt = cheb_z(epoch_time_minus_dt_normalized)
+
+                else:
+                    raise ValueError("Unsupported interpolation method.")
+
+                vx = (interpolated_x_dt - interpolated_x_min_dt) / (2 * delta_t) * 1000
+                vy = (interpolated_y_dt - interpolated_y_min_dt) / (2 * delta_t) * 1000
+                vz = (interpolated_z_dt - interpolated_z_min_dt) / (2 * delta_t) * 1000
+
+                idx = np.searchsorted(toc_window, epoch_time)
+                if idx == 0:
+                    idx0, idx1 = 0, 1
+                elif idx == len(toc_window):
+                    idx0, idx1 = len(toc_window) - 2, len(toc_window) - 1
+                else:
+                    idx0, idx1 = idx - 1, idx
+                t0 = toc_window[idx0]
+                t1 = toc_window[idx1]
+                clk0 = clk_window[idx0]
+                clk1 = clk_window[idx1]
+                if epoch_time == t1:
+                    interpolated_clk = clk1
+                elif epoch_time == t0:
+                    interpolated_clk = clk0
+                else:
+                    if t1 != t0:
+                        interpolated_clk = clk0 + (clk1 - clk0) * (epoch_time - t0) / (t1 - t0)
+                    else:
+                        interpolated_clk = clk0
+                interpolated_clk *= 1e-6
+
+                c = 299792458  # prędkość światła w m/s
+                r_vec = np.array([interpolated_x, interpolated_y, interpolated_z]) * 1000
+                v_vec = np.array([vx, vy, vz])
+                dot_product = np.dot(r_vec, v_vec)
+                delta_t_rel = -2 * dot_product / c ** 2
+                corrected_clk = interpolated_clk + delta_t_rel
+
+                results.append({
+                    'sv': sat,
+                    'epoch': rec_epoch,  # Używamy rec_epoch jako docelowego indeksu
+                    'em_epoch': epoch,  # epoka emisji sygnału
+                    'x': interpolated_x,
+                    'y': interpolated_y,
+                    'z': interpolated_z,
+                    'clk': corrected_clk,
+                    'vx': vx,
+                    'vy': vy,
+                    'vz': vz,
+                    'dt_rel': delta_t_rel,
+                    'clk_raw':interpolated_clk
+                })
+            else:
+                current_window_size -= 1
+
+        # if not window_found:
+        #     print(f"No sufficient data to interpolate satellite {sat} at epoch {epoch}")
+        if not window_found:
+            # Próba rozszerzenia okna tylko w kierunku dostępnych danych
+            max_half = (window_size - 1) * 300 / 2
+            t_min = toc.min()
+            t_max = toc.max()
+            start = max(t_min, epoch_time - max_half)
+            end = min(t_max, epoch_time + max_half)
+            indices = np.where((toc >= start) & (toc <= end))[0]
+
+            if len(indices) >= min_window_size:
+                toc_window = toc[indices]
+                x_window = x[indices]
+                y_window = y[indices]
+                z_window = z[indices]
+                clk_window = clk[indices]
+
+                t_min = toc_window.min()
+                t_max = toc_window.max()
+                toc_normalized = 2 * (toc_window - t_min) / (t_max - t_min)
+                epoch_time_normalized = 2 * (epoch_time - t_min) / (t_max - t_min)
+                epoch_time_plus_dt_normalized = 2 * ((epoch_time + delta_t) - t_min) / (t_max - t_min)
+                epoch_time_minus_dt_normalized = 2 * ((epoch_time - delta_t) - t_min) / (t_max - t_min)
+
+                degree = len(toc_normalized) - 1
+
+                if method == 'chebyshev':
+                    with warnings.catch_warnings():
+                        # warnings.simplefilter('ignore', RankWarning)
+                        cheb_x = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, x_window, deg=degree)
+                        cheb_y = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, y_window, deg=degree)
+                        cheb_z = np.polynomial.chebyshev.Chebyshev.fit(toc_normalized, z_window, deg=degree)
+                    interpolated_x = cheb_x(epoch_time_normalized)
+                    interpolated_y = cheb_y(epoch_time_normalized)
+                    interpolated_z = cheb_z(epoch_time_normalized)
+                    interpolated_x_dt = cheb_x(epoch_time_plus_dt_normalized)
+                    interpolated_y_dt = cheb_y(epoch_time_plus_dt_normalized)
+                    interpolated_z_dt = cheb_z(epoch_time_plus_dt_normalized)
+                    interpolated_x_min_dt = cheb_x(epoch_time_minus_dt_normalized)
+                    interpolated_y_min_dt = cheb_y(epoch_time_minus_dt_normalized)
+                    interpolated_z_min_dt = cheb_z(epoch_time_minus_dt_normalized)
+
+                else:
+                    raise ValueError("Unsupported interpolation method.")
+
+                vx = (interpolated_x_dt - interpolated_x_min_dt) / (2 * delta_t) * 1000
+                vy = (interpolated_y_dt - interpolated_y_min_dt) / (2 * delta_t) * 1000
+                vz = (interpolated_z_dt - interpolated_z_min_dt) / (2 * delta_t) * 1000
+
+                idx = np.searchsorted(toc_window, epoch_time)
+                if idx == 0:
+                    idx0, idx1 = 0, 1
+                elif idx == len(toc_window):
+                    idx0, idx1 = len(toc_window) - 2, len(toc_window) - 1
+                else:
+                    idx0, idx1 = idx - 1, idx
+                t0, t1 = toc_window[idx0], toc_window[idx1]
+                clk0, clk1 = clk_window[idx0], clk_window[idx1]
+                if epoch_time == t1:
+                    interpolated_clk = clk1
+                elif epoch_time == t0:
+                    interpolated_clk = clk0
+                else:
+                    interpolated_clk = clk0 + (clk1 - clk0) * (epoch_time - t0) / (t1 - t0) if t1 != t0 else clk0
+                interpolated_clk *= 1e-6
+
+                c = 299792458
+                r_vec = np.array([interpolated_x, interpolated_y, interpolated_z]) * 1000
+                v_vec = np.array([vx, vy, vz])
+                dot_product = np.dot(r_vec, v_vec)
+                delta_t_rel = -2 * dot_product / c ** 2
+                corrected_clk = interpolated_clk + delta_t_rel
+
+                results.append({
+                    'sv': sat,
+                    'epoch': epoch,
+                    'x': interpolated_x,
+                    'y': interpolated_y,
+                    'z': interpolated_z,
+                    'clk': corrected_clk,
+                    'vx': vx,
+                    'vy': vy,
+                    'vz': vz,
+                    'dt_rel': delta_t_rel,
+                    'clk_raw': interpolated_clk
+                })
+            else:
+                print(f"No sufficient data (even at edge) to interpolate satellite {sat} at epoch {epoch}")
+
+    return results
+
+
+class SP3CustomInterpolatorOptimized(SP3InterpolatorOptimized):
+    def interpolate_for_tuples(self, satellite_epochs_tuples, method='chebyshev', window_size=12, min_window_size=5,
+                               delta_t=0.5e-6):
+        """
+        Interpoluje pozycje i korekty zegara dla podanych tuple:
+          (satellite, [epoch1, epoch2, ...], [obs_epoch1, obs_epoch2, ...]).
+        Zastosowano równoległe przetwarzanie na poziomie satelitów.
+        Zwraca DataFrame z wynikami.
+        """
+        all_results = []
+        # Przygotowanie wspólnych danych
+        min_gps_week = self.sp3_df['gps_week'].min()
+
+        # Przygotowanie listy zadań dla równoległego przetwarzania
+        tasks = []
+        for tup in satellite_epochs_tuples:
+            sat, epochs, rec_epochs = tup
+            if sat not in self.sat_data or self.sat_data[sat].empty:
+                print(f"Brak danych dla satelity {sat}")
+                continue
+            task = {
+                'sat': sat,
+                'epochs': epochs,
+                'rec_epochs': rec_epochs,
+                'sat_df': self.sat_data[sat],
+                'method': method,
+                'window_size': window_size,
+                'min_window_size': min_window_size,
+                'delta_t': delta_t,
+                'datetime2gpsweek_and_tow': self.datetime2gpsweek_and_tow,
+                'min_gps_week': min_gps_week
+            }
+            tasks.append(task)
+
+        # Równoległe przetwarzanie – każdy satelita osobno
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            results = list(executor.map(_process_satellite_tuple, tasks))
+
+        # Scal wyniki – results to lista list słowników
+        for sat_results in results:
+            all_results.extend(sat_results)
+
+        interpolated_df = pd.DataFrame(all_results)
+        if not interpolated_df.empty:
+            interpolated_df.set_index(['sv', 'epoch'], inplace=True)
+        return interpolated_df
+
 class CrdWrapper:
     """
     This class performs:
@@ -148,6 +728,57 @@ class CustomWrapper(CrdWrapper):
         return self.obs
 
 
+
+
+def emission_interp(obs, crd, prev_sp3_df, sp3_df, next_sp3_df):
+    """
+    Łączy dane obserwacyjne z interpolowanymi współrzędnymi.
+    Funkcja pozostaje bez zmian, poza tym że wykorzystuje zoptymalizowaną
+    wersję interpolatora (SP3CustomInterpolator) do obliczeń.
+    :param obs - dataframe z obserwacjami (jeden sys)
+    :param crd - dataframe z pozycjami satelitow (wszystkie systemy)
+    :param prev_sp3_df: dataframe z dnia poprzedniego
+    :param next_sp3_df: dataframe z dnia nastepnego
+    :param sp3_df: dataframe z dnia obecnego
+    """
+    C = 299792458
+    obs_reset = obs.reset_index().copy()
+    crd_reset = crd.reset_index().copy()
+    # laczymy dataframy zeby miec wiersz z zegarem do liczenia emisji sygnalu
+    obs_crd = pd.merge(obs_reset, crd_reset, left_on=['sv', 'time'], right_on=['sv', 'epoch'])
+    obs_crd.drop(columns=['epoch'], inplace=True)
+    obs_crd = obs_crd.set_index(['sv', 'time'])
+    if 'P3' in obs_crd.columns:
+        t_em = (obs_crd['P3'] / C) + obs_crd['clk']
+        obs_crd['t_em'] = t_em
+    else:
+        c1_col = [col for col in obs_crd.columns if col.startswith('C')][0]
+        t_em = (obs_crd[c1_col] / C) + obs_crd['clk']
+        obs_crd['t_em'] = t_em
+    obs_crd['obs_time'] = obs_crd.index.get_level_values('time')
+    obs_crd['emission_time'] = obs_crd['obs_time'] - pd.to_timedelta(t_em, unit='s')
+    # Tworzymy tuple: (sat, list(emission_time), list(obs_time))
+    satellite_epochs_tuples = [
+        (sv, group['emission_time'].tolist(), group['obs_time'].tolist())
+        for sv, group in obs_crd.reset_index().groupby('sv')
+    ]
+    custom_interpolator = SP3CustomInterpolatorOptimized(sp3_df)
+    custom_interpolator.include_adjacent_data(prev_sp3_df=prev_sp3_df, next_sp3_df=next_sp3_df)
+    # Współrzędne w czasie emisji sygnału
+    interpolated_final = custom_interpolator.interpolate_for_tuples(
+        satellite_epochs_tuples=satellite_epochs_tuples
+    )
+    # obs = obs.loc[obs_crd.index.reorder_levels(order=[1, 0])]
+    # interpolated_final['t_em'] = pd.to_timedelta(t_em, unit='s').to_numpy()
+    # obs['emission_time'] = obs_crd['emission_time'].copy().to_numpy()
+    interpolated_final[['x','y','z']] = interpolated_final[['x','y','z']].apply(lambda x: x * 1000)
+    interpolated_final.index.names = ['sv', 'time']
+    interpolated_final=interpolated_final.sort_values(by='time')
+    interpolated_final=interpolated_final.swaplevel(0,1)
+    obs_crd = pd.merge(obs, interpolated_final, left_on=['sv', 'time'], right_on=['sv', 'time'])
+    return obs_crd
+
+
 def make_ionofree(obs_df,  mode,sys='G'):
     F1 = 1575.42e06
     F2 = 1227.60e06
@@ -196,8 +827,187 @@ def eccentric_anomaly(mk, e, pi):
         diff = (ek - ek_old) #% (2 * pi)
         if abs(diff) < 1e-8:
             return ek% (2 * pi)
-    print('Convergence not reached, diff: ', diff)
     return None
+
+
+def _eccentric_anomaly_vec(mk, e, max_iter=14, tol=1e-8):
+    ek = mk.astype(float, copy=True)
+    for _ in range(max_iter):
+        ek_old = ek
+        ek = mk + e * np.sin(ek)
+        if np.all(np.abs(ek - ek_old) < tol):
+            break
+    return np.mod(ek, 2 * pi)
+
+
+def _numpy_broadcast_interpolation_batch(message_toc, observation_toc, messages):
+    mi = 3.986005e14
+    ome = 7.2921151467e-05
+    c = 299792458.0
+
+    a0 = messages[:, 0]
+    a1 = messages[:, 1]
+    a2 = messages[:, 2]
+
+    t_toc = observation_toc - message_toc
+    dT = np.where(t_toc < -302400.0, t_toc + WEEK, np.where(t_toc > 302400.0, t_toc - WEEK, t_toc))
+    dt = a0 + a1 * dT + a2 * dT ** 2
+    dt_dot = a1 + 2.0 * a2 * dT
+
+    toe = messages[:, 11]
+    t_toe = observation_toc - toe
+    tk = np.where(t_toe > 302400.0, t_toe - WEEK, np.where(t_toe < -302400.0, t_toe + WEEK, t_toe))
+
+    sqrta = messages[:, 10]
+    a = sqrta ** 2
+    n0 = np.sqrt(mi / a ** 3)
+    n = n0 + messages[:, 5]
+    mk = np.mod(messages[:, 6] + n * tk, 2 * pi)
+    e = messages[:, 8]
+    ek = _eccentric_anomaly_vec(mk, e)
+
+    v = np.arctan2(np.sqrt(1.0 - e ** 2) * np.sin(ek), np.cos(ek) - e)
+    u = np.mod(messages[:, 17] + v, 2 * pi)
+
+    cus = messages[:, 9]
+    cuc = messages[:, 7]
+    duk = cus * np.sin(2.0 * u) + cuc * np.cos(2.0 * u)
+
+    crs = messages[:, 4]
+    crc = messages[:, 16]
+    drk = crs * np.sin(2.0 * u) + crc * np.cos(2.0 * u)
+
+    cis = messages[:, 14]
+    cic = messages[:, 12]
+    idot = messages[:, 19]
+    dik = cis * np.sin(2.0 * u) + cic * np.cos(2.0 * u) + idot * tk
+
+    uk = u + duk
+    rk = a * (1.0 - e * np.cos(ek)) + drk
+    ik = messages[:, 15] + dik
+
+    omk = np.mod(messages[:, 13] + (messages[:, 18] - ome) * tk - ome * toe, 2 * pi)
+    xi = rk * np.cos(uk)
+    eta = rk * np.sin(uk)
+
+    cos_omk = np.cos(omk)
+    sin_omk = np.sin(omk)
+    cos_ik = np.cos(ik)
+    sin_ik = np.sin(ik)
+
+    x = xi * cos_omk - eta * cos_ik * sin_omk
+    y = xi * sin_omk + eta * cos_ik * cos_omk
+    z = eta * sin_ik
+
+    em_dot = 1.0 / (1.0 - e * np.cos(ek))
+    v_dot = np.sqrt((1.0 + e) / (1.0 - e)) * (1.0 / (np.cos(ek / 2.0) ** 2)) * (
+            1.0 / (1.0 + np.tan(v / 2.0) ** 2)) * em_dot * n
+
+    om_dot = messages[:, 18]
+    u_dot = v_dot + 2.0 * v_dot * (cus * np.cos(2.0 * u) - cuc * np.sin(2.0 * u))
+    small_om_dot = om_dot - ome
+    i_dot = idot + 2.0 * v_dot * (cis * np.cos(2.0 * u) - cic * np.sin(2.0 * u))
+    r_dot = a * e * np.sin(ek) * em_dot * n + 2.0 * v_dot * (crs * np.cos(2.0 * u) - crc * np.sin(2.0 * u))
+
+    xi_dot = r_dot * np.cos(uk) - rk * np.sin(uk) * u_dot
+    eta_dot = r_dot * np.sin(uk) + rk * np.cos(uk) * u_dot
+
+    x_dot = ((cos_omk * xi_dot - cos_ik * sin_omk * eta_dot - xi * sin_omk * small_om_dot)
+             - eta * cos_ik * cos_omk * small_om_dot
+             + eta * sin_ik * sin_omk * i_dot)
+    y_dot = ((sin_omk * xi_dot + cos_ik * cos_omk * eta_dot + xi * cos_omk * small_om_dot)
+             - eta * cos_ik * sin_omk * small_om_dot
+             - eta * sin_ik * cos_omk * i_dot)
+    z_dot = sin_ik * eta_dot + eta * np.cos(ik) * i_dot
+
+    dt_rel = -2.0 * (x * x_dot + y * y_dot + z * z_dot) / c ** 2
+    dt_sat = dt + dt_rel
+    return np.column_stack([x, y, z, dt_sat, x_dot, y_dot, z_dot, dt_dot])
+
+
+def _gal_numpy_broadcast_interpolation_batch(message_toc, observation_toc, messages):
+    mi = 3.986004418e14
+    ome = 7.2921151467e-05
+    c = 299792458.0
+
+    a0 = messages[:, 0]
+    a1 = messages[:, 1]
+    a2 = messages[:, 2]
+
+    t_toc = observation_toc - message_toc
+    dT = np.where(t_toc < -302400.0, t_toc + WEEK, np.where(t_toc > 302400.0, t_toc - WEEK, t_toc))
+    dt = a0 + a1 * dT + a2 * dT ** 2
+    dt_dot = a1 + 2.0 * a2 * dT
+
+    toe = messages[:, 11]
+    t_toe = observation_toc - toe
+    tk = np.where(t_toe > 302400.0, t_toe - WEEK, np.where(t_toe < -302400.0, t_toe + WEEK, t_toe))
+
+    sqrta = messages[:, 10]
+    a = sqrta ** 2
+    n0 = np.sqrt(mi / a ** 3)
+    n = n0 + messages[:, 5]
+    mk = np.mod(messages[:, 6] + n * tk, 2 * pi)
+    e = messages[:, 8]
+    ek = _eccentric_anomaly_vec(mk, e)
+
+    v = np.arctan2(np.sqrt(1.0 - e ** 2) * np.sin(ek), np.cos(ek) - e)
+    u = np.mod(messages[:, 17] + v, 2 * pi)
+
+    cus = messages[:, 9]
+    cuc = messages[:, 7]
+    duk = cus * np.sin(2.0 * u) + cuc * np.cos(2.0 * u)
+
+    crs = messages[:, 4]
+    crc = messages[:, 16]
+    drk = crs * np.sin(2.0 * u) + crc * np.cos(2.0 * u)
+
+    cis = messages[:, 14]
+    cic = messages[:, 12]
+    idot = messages[:, 19]
+    dik = cis * np.sin(2.0 * u) + cic * np.cos(2.0 * u) + idot * tk
+
+    uk = u + duk
+    rk = a * (1.0 - e * np.cos(ek)) + drk
+    ik = messages[:, 15] + dik
+
+    omk = np.mod(messages[:, 13] + (messages[:, 18] - ome) * tk - ome * toe, 2 * pi)
+    xi = rk * np.cos(uk)
+    eta = rk * np.sin(uk)
+
+    cos_omk = np.cos(omk)
+    sin_omk = np.sin(omk)
+    cos_ik = np.cos(ik)
+    sin_ik = np.sin(ik)
+
+    x = xi * cos_omk - eta * cos_ik * sin_omk
+    y = xi * sin_omk + eta * cos_ik * cos_omk
+    z = eta * sin_ik
+
+    em_dot = 1.0 / (1.0 - e * np.cos(ek))
+    v_dot = np.sqrt((1.0 + e) / (1.0 - e)) * (1.0 / (np.cos(ek / 2.0) ** 2)) * (
+            1.0 / (1.0 + np.tan(v / 2.0) ** 2)) * em_dot * n
+
+    om_dot = messages[:, 18]
+    u_dot = v_dot + 2.0 * v_dot * (cus * np.cos(2.0 * u) - cuc * np.sin(2.0 * u))
+    small_om_dot = om_dot - ome
+    i_dot = idot + 2.0 * v_dot * (cis * np.cos(2.0 * u) - cic * np.sin(2.0 * u))
+    r_dot = a * e * np.sin(ek) * em_dot * n + 2.0 * v_dot * (crs * np.cos(2.0 * u) - crc * np.sin(2.0 * u))
+
+    xi_dot = r_dot * np.cos(uk) - rk * np.sin(uk) * u_dot
+    eta_dot = r_dot * np.sin(uk) + rk * np.cos(uk) * u_dot
+
+    x_dot = ((cos_omk * xi_dot - cos_ik * sin_omk * eta_dot - xi * sin_omk * small_om_dot)
+             - eta * cos_ik * cos_omk * small_om_dot
+             + eta * sin_ik * sin_omk * i_dot)
+    y_dot = ((sin_omk * xi_dot + cos_ik * cos_omk * eta_dot + xi * cos_omk * small_om_dot)
+             - eta * cos_ik * sin_omk * small_om_dot
+             - eta * sin_ik * cos_omk * i_dot)
+    z_dot = sin_ik * eta_dot + eta * np.cos(ik) * i_dot
+
+    dt_rel = -2.0 * (x * x_dot + y * y_dot + z * z_dot) / c ** 2
+    dt_sat = dt + dt_rel
+    return np.column_stack([x, y, z, dt_sat, x_dot, y_dot, z_dot, dt_dot])
 
 
 def numpy_broadcast_interpolation(message_toc, observation_toc, message, with_rel=True, rel_sep=False):
@@ -550,7 +1360,7 @@ def _ensure_obs_block(df_obs, sv_hint=None):
     if 'toc' not in df_obs.columns:
         raise ValueError("df_obs must have 'toc' column.")
 
-    return df_obs[['sv','time','toc']].copy()
+    return df_obs.loc[:, ['sv', 'time', 'toc']]
 
 
 def _ensure_nav_block(df_orb, sv_hint=None):
@@ -570,9 +1380,7 @@ def _ensure_nav_block(df_orb, sv_hint=None):
     if miss:
         raise ValueError(f"df_orb missing columns: {miss} (make sure _add_nav_toc() was already there).")
 
-    return df_orb.copy()
-import numpy as np
-import pandas as pd
+    return df_orb
 
 
 def _prep_nav_arrays(system: str, nav_block: pd.DataFrame):
@@ -882,17 +1690,73 @@ def _select_by_toe_for_sat(system, obs_sv, nav_sv, picker='_gps_pref_future'):
     if not keep.any():
         return pd.DataFrame()
 
-    nav_sel = nav_sv.iloc[choice[keep]].copy()
-    obs_sel = obs_sv.loc[keep].copy()
+    keep_idx = np.flatnonzero(keep)
+    nav_sel = nav_sv.iloc[choice[keep_idx]].reset_index(drop=True)
+    obs_sel = obs_sv.iloc[keep_idx].reset_index(drop=True)
 
-    nav_sel['sv'] = obs_sel['sv'].values
-    nav_sel['time'] = obs_sel['time'].values
+    nav_sel = nav_sel.copy()
+    nav_sel['sv'] = obs_sel['sv'].to_numpy(copy=False)
+    nav_sel['time'] = obs_sel['time'].to_numpy(copy=False)
 
     merged = pd.concat(
-        [obs_sel.reset_index(drop=True),
-         nav_sel.reset_index(drop=True)], axis=1
+        [obs_sel, nav_sel], axis=1
     )
     return merged
+
+
+def _normalize_brdc_interp_result(res):
+    if isinstance(res, (tuple, list)):
+        a = np.atleast_1d(res[0]).astype(float, copy=False).ravel()
+        b = np.atleast_1d(res[1]).astype(float, copy=False).ravel()
+        return np.concatenate([a, b], axis=0)
+    return np.atleast_1d(res).astype(float, copy=False).ravel()
+
+
+def _run_brdc_interp(mes_toc, obs_toc, messages, interp_fun):
+    n = len(messages)
+    valid_mask = np.zeros(n, dtype=bool)
+    if n == 0:
+        return None, valid_mask
+
+    finite_in = np.isfinite(mes_toc) & np.isfinite(obs_toc) & np.all(np.isfinite(messages), axis=1)
+    if not finite_in.any():
+        return None, valid_mask
+
+    batch_fun = None
+    if interp_fun is numpy_broadcast_interpolation:
+        batch_fun = _numpy_broadcast_interpolation_batch
+    elif interp_fun is gal_numpy_broadcast_interpolation:
+        batch_fun = _gal_numpy_broadcast_interpolation_batch
+
+    if batch_fun is not None:
+        try:
+            crd = batch_fun(mes_toc[finite_in], obs_toc[finite_in], messages[finite_in])
+            finite_out = np.all(np.isfinite(crd), axis=1)
+            kept_idx = np.flatnonzero(finite_in)[finite_out]
+            valid_mask[kept_idx] = True
+            if kept_idx.size:
+                return crd[finite_out], valid_mask
+            return None, valid_mask
+        except Exception:
+            pass
+
+    rows = []
+    lengths = []
+    for idx, (mt, ot, msg) in enumerate(zip(mes_toc, obs_toc, messages)):
+        try:
+            row = _normalize_brdc_interp_result(interp_fun(mt, ot, msg))
+        except Exception:
+            continue
+        rows.append(row)
+        lengths.append(row.size)
+        valid_mask[idx] = True
+
+    if not rows:
+        return None, valid_mask
+    if len(set(lengths)) != 1:
+        maxlen = max(lengths)
+        rows = [np.pad(r, (0, maxlen - len(r)), mode='constant') for r in rows]
+    return np.vstack(rows), valid_mask
 
 class BrdcGenerator:
     mes_cols = [
@@ -944,7 +1808,7 @@ class BrdcGenerator:
 
     def _clear_suffixes(self, df):
         df = df.reset_index().copy()
-        df['prn'] = df.apply(lambda row: row['sv'][:3], axis=1)
+        df['prn'] = df['sv'].astype(str).str[:3]
         df = df.drop(columns='sv')
         df.set_index(['prn', 'time'], inplace=True)
         df.index.names = ['sv', 'time']
@@ -967,6 +1831,23 @@ class BrdcGenerator:
             raise ValueError("df_orb must contain 'nav_toc' (seconds-of-week); call _add_nav_toc() first.")
         if 'Toe' not in df_orb.columns:
             raise ValueError("df_orb must contain 'Toe' (seconds-of-week).")
+
+        sv_values = df_obs['sv'].unique()
+        if sv_values.size == 1:
+            sv = sv_values[0]
+            nav_sv = df_orb
+            if 'sv' in df_orb.columns:
+                if not (df_orb['sv'].nunique() == 1 and df_orb['sv'].iloc[0] == sv):
+                    nav_sv = df_orb[df_orb['sv'] == sv]
+            if nav_sv.empty:
+                return pd.DataFrame()
+            picker = '_gps_pref_future' if self.sys == 'G' else '_gal_pref_past'
+            sel = _select_by_toe_for_sat(self.sys, df_obs, nav_sv, picker)
+            if sel is None or sel.empty:
+                return pd.DataFrame()
+            if '__rank__' in sel.columns:
+                sel = sel.drop(columns='__rank__')
+            return sel
 
         out_list = []
         for sv, obs_sv in df_obs.groupby('sv', sort=False):
@@ -1025,20 +1906,42 @@ class BrdcGenerator:
 
     def get_coordinates(self):
         output = []
-        for sv, df_obs_grp in self.table.groupby('sv'):
+        picker = '_gps_pref_future' if self.sys == 'G' else '_gal_pref_past'
+        if self.sys == 'E':
+            needed = self.gal_mes_cols
+            interp_fun = gal_numpy_broadcast_interpolation
+        elif self.sys == 'G':
+            needed = self.mes_cols
+            interp_fun = numpy_broadcast_interpolation
+        else:
+            raise ValueError(f"Unknown sys: {self.sys}")
+
+        nav_by_sv = {}
+        if 'sv' in self.nav.columns:
+            for sv, df in self.nav.groupby('sv', sort=False):
+                nav_by_sv[sv] = _ensure_nav_block(df, sv_hint=sv)
+        else:
+            for sv in self.table.index.get_level_values('sv').unique():
+                try:
+                    nav_by_sv[sv] = _ensure_nav_block(self.nav.loc[sv], sv_hint=sv)
+                except Exception:
+                    continue
+
+        for sv, df_obs_grp in self.table.groupby('sv', sort=False):
             try:
                 # OBS
                 df_obs_block = _ensure_obs_block(df_obs_grp, sv_hint=sv)
 
                 # NAV
-                df_orb_sv = self.nav.loc[sv]
-                df_orb_block = _ensure_nav_block(df_orb_sv, sv_hint=sv)
+                df_orb_block = nav_by_sv.get(sv)
+                if df_orb_block is None or df_orb_block.empty:
+                    continue
 
-                merged = self.select_messages(df_obs_block, df_orb_block)
+                merged = _select_by_toe_for_sat(self.sys, df_obs_block, df_orb_block, picker)
                 if merged is None or merged.empty:
                     try:
-                        toe = _ensure_nav_block(df_orb_sv, sv_hint=sv)['Toe'].to_numpy(float)
-                        toc = _ensure_obs_block(df_obs_grp, sv_hint=sv)['toc'].to_numpy(float)
+                        toe = df_orb_block['Toe'].to_numpy(float)
+                        toc = df_obs_block['toc'].to_numpy(float)
                         D = _wrap_dist_sow(toc, toe) if toe.size and toc.size else None
                         min_d = np.min(D, axis=1) if D is not None else np.array([])
                         within = np.sum(min_d <= (7200.0 if self.sys == 'G' else 14400.0)) if min_d.size else 0
@@ -1047,21 +1950,9 @@ class BrdcGenerator:
                         pass
                     continue
 
-                if merged is None or merged.empty:
-                    continue
-
                 # Przygotowanie do interpolacji
-                mes_toc = merged['nav_toc'].to_numpy(dtype=float)
-                obs_toc = merged['toc'].to_numpy(dtype=float)
-
-                if self.sys == 'E':
-                    needed = self.gal_mes_cols
-                    interp_fun = gal_numpy_broadcast_interpolation
-                elif self.sys == 'G':
-                    needed = self.mes_cols
-                    interp_fun = numpy_broadcast_interpolation
-                else:
-                    raise ValueError(f"Unknown sys: {self.sys}")
+                mes_toc = merged['nav_toc'].to_numpy(dtype=float, copy=False)
+                obs_toc = merged['toc'].to_numpy(dtype=float, copy=False)
 
                 # Na wszelki wypadek: sprawdź, czy wszystkie kolumny istnieją
                 missing = [c for c in needed if c not in merged.columns]
@@ -1069,46 +1960,17 @@ class BrdcGenerator:
                     raise ValueError(f"NAV columns are missing in merged: {missing}")
 
                 # Wymuś float i kształt (N, K)
-                messages = merged[needed].to_numpy(dtype=float, copy=True)
+                messages = merged[needed].to_numpy(dtype=float, copy=False)
                 if messages.ndim != 2:
                     raise ValueError(f"messages has the wrong dimension: {messages.ndim}")
 
-                rows = []
-                bad_rows = 0
-                for mt, ot, msg in zip(mes_toc, obs_toc, messages):
-                    try:
-                        res = interp_fun(mt, ot, msg)
-
-                        if isinstance(res, (tuple, list)):
-                            a = np.atleast_1d(res[0]).astype(float).ravel()
-                            b = np.atleast_1d(res[1]).astype(float).ravel()
-                            row = np.concatenate([a, b], axis=0)
-                        else:
-                            row = np.atleast_1d(res).astype(float).ravel()
-
-                        rows.append(row)
-                    except Exception:
-                        bad_rows += 1
-                        rows.append(None)
-                        continue
-
-                if any(r is None for r in rows):
-                    keep_mask = np.array([r is not None for r in rows])
-                    rows = [r for r in rows if r is not None]
+                crd, keep_mask = _run_brdc_interp(mes_toc, obs_toc, messages, interp_fun)
+                if crd is None:
+                    continue
+                if not keep_mask.all():
                     merged = merged.loc[keep_mask].copy()
                     mes_toc = mes_toc[keep_mask]
                     obs_toc = obs_toc[keep_mask]
-
-                if not rows:
-                    continue
-
-                unique_lengths = {len(r) for r in rows}
-                if len(unique_lengths) != 1:
-                    # jeżeli masz mieszankę 8/9 itp. – dopełnij do maksymalnej długości zerami
-                    maxlen = max(unique_lengths)
-                    rows = [np.pad(r, (0, maxlen - len(r)), mode='constant') for r in rows]
-
-                crd = np.vstack(rows)
 
                 cols8 = ['x', 'y', 'z', 'clk', 'vx', 'vy', 'vz', 'clk_dot']
                 cols9 = ['x', 'y', 'z', 'clk', 'clk_rel', 'vx', 'vy', 'vz', 'clk_dot']
@@ -1169,7 +2031,7 @@ class BroadcastInterp:
 
     def _clear_suffixes(self, df):
         df = df.reset_index().copy()
-        df['prn'] = df.apply(lambda row: row['sv'][:3], axis=1)
+        df['prn'] = df['sv'].astype(str).str[:3]
         df = df.drop(columns='sv')
         df.set_index(['prn', 'time'], inplace=True)
         df.index.names = ['sv', 'time']
@@ -1208,6 +2070,23 @@ class BroadcastInterp:
             raise ValueError("df_orb must contain 'Toe' (seconds-of-week).")
 
         # Zakładamy, że df_obs i df_orb mają kolumnę 'sv'
+        sv_values = df_obs['sv'].unique()
+        if sv_values.size == 1:
+            sv = sv_values[0]
+            nav_sv = df_orb
+            if 'sv' in df_orb.columns:
+                if not (df_orb['sv'].nunique() == 1 and df_orb['sv'].iloc[0] == sv):
+                    nav_sv = df_orb[df_orb['sv'] == sv]
+            if nav_sv.empty:
+                return pd.DataFrame()
+            picker = '_gps_pref_future' if self.sys == 'G' else '_gal_pref_past'
+            sel = _select_by_toe_for_sat(self.sys, df_obs, nav_sv, picker)
+            if sel is None or sel.empty:
+                return pd.DataFrame()
+            if '__rank__' in sel.columns:
+                sel = sel.drop(columns='__rank__')
+            return sel
+
         out_list = []
         for sv, obs_sv in df_obs.groupby('sv', sort=False):
             try:
@@ -1235,20 +2114,42 @@ class BroadcastInterp:
 
     def get_coordinates(self):
         output = []
-        for sv, df_obs_grp in self.obs.groupby('sv'):
+        picker = '_gps_pref_future' if self.sys == 'G' else '_gal_pref_past'
+        if self.sys == 'E':
+            needed = self.gal_mes_cols
+            interp_fun = gal_numpy_broadcast_interpolation
+        elif self.sys == 'G':
+            needed = self.mes_cols
+            interp_fun = numpy_broadcast_interpolation
+        else:
+            raise ValueError(f"Unknown sys: {self.sys}")
+
+        nav_by_sv = {}
+        if 'sv' in self.nav.columns:
+            for sv, df in self.nav.groupby('sv', sort=False):
+                nav_by_sv[sv] = _ensure_nav_block(df, sv_hint=sv)
+        else:
+            for sv in self.obs.index.get_level_values('sv').unique():
+                try:
+                    nav_by_sv[sv] = _ensure_nav_block(self.nav.loc[sv], sv_hint=sv)
+                except Exception:
+                    continue
+
+        for sv, df_obs_grp in self.obs.groupby('sv', sort=False):
             try:
                 # OBS
                 df_obs_block = _ensure_obs_block(df_obs_grp, sv_hint=sv)
 
                 # NAV
-                df_orb_sv = self.nav.loc[sv]
-                df_orb_block = _ensure_nav_block(df_orb_sv, sv_hint=sv)
+                df_orb_block = nav_by_sv.get(sv)
+                if df_orb_block is None or df_orb_block.empty:
+                    continue
 
-                merged = self.select_messages(df_obs_block, df_orb_block)
+                merged = _select_by_toe_for_sat(self.sys, df_obs_block, df_orb_block, picker)
                 if merged is None or merged.empty:
                     try:
-                        toe = _ensure_nav_block(df_orb_sv, sv_hint=sv)['Toe'].to_numpy(float)
-                        toc = _ensure_obs_block(df_obs_grp, sv_hint=sv)['toc'].to_numpy(float)
+                        toe = df_orb_block['Toe'].to_numpy(float)
+                        toc = df_obs_block['toc'].to_numpy(float)
                         D = _wrap_dist_sow(toc, toe) if toe.size and toc.size else None
                         min_d = np.min(D, axis=1) if D is not None else np.array([])
                         within = np.sum(min_d <= (7200.0 if self.sys == 'G' else 14400.0)) if min_d.size else 0
@@ -1257,67 +2158,25 @@ class BroadcastInterp:
                         pass
                     continue
 
-                if merged is None or merged.empty:
-                    continue
-
-                mes_toc = merged['nav_toc'].to_numpy(dtype=float)
-                obs_toc = merged['toc'].to_numpy(dtype=float)
-
-                if self.sys == 'E':
-                    needed = self.gal_mes_cols
-                    interp_fun = gal_numpy_broadcast_interpolation
-                elif self.sys == 'G':
-                    needed = self.mes_cols
-                    interp_fun = numpy_broadcast_interpolation
-                else:
-                    raise ValueError(f"Unknown sys: {self.sys}")
+                mes_toc = merged['nav_toc'].to_numpy(dtype=float, copy=False)
+                obs_toc = merged['toc'].to_numpy(dtype=float, copy=False)
 
                 missing = [c for c in needed if c not in merged.columns]
                 if missing:
                     raise ValueError(f"Missing data: {missing}\n Check your broadcast orbit")
 
                 # Wymuś float i kształt (N, K)
-                messages = merged[needed].to_numpy(dtype=float, copy=True)
+                messages = merged[needed].to_numpy(dtype=float, copy=False)
                 if messages.ndim != 2:
                     raise ValueError(f"Dimension error : {messages.ndim}")
 
-
-
-                rows = []
-                bad_rows = 0
-                for mt, ot, msg in zip(mes_toc, obs_toc, messages):
-                    try:
-                        res = interp_fun(mt, ot, msg)
-
-                        if isinstance(res, (tuple, list)):
-                            a = np.atleast_1d(res[0]).astype(float).ravel()
-                            b = np.atleast_1d(res[1]).astype(float).ravel()
-                            row = np.concatenate([a, b], axis=0)
-                        else:
-                            row = np.atleast_1d(res).astype(float).ravel()
-
-                        rows.append(row)
-                    except Exception:
-                        bad_rows += 1
-                        rows.append(None)
-                        continue
-
-                if any(r is None for r in rows):
-                    keep_mask = np.array([r is not None for r in rows])
-                    rows = [r for r in rows if r is not None]
+                crd, keep_mask = _run_brdc_interp(mes_toc, obs_toc, messages, interp_fun)
+                if crd is None:
+                    continue
+                if not keep_mask.all():
                     merged = merged.loc[keep_mask].copy()
                     mes_toc = mes_toc[keep_mask]
                     obs_toc = obs_toc[keep_mask]
-
-                if not rows:
-                    continue
-
-                unique_lengths = {len(r) for r in rows}
-                if len(unique_lengths) != 1:
-                    maxlen = max(unique_lengths)
-                    rows = [np.pad(r, (0, maxlen - len(r)), mode='constant') for r in rows]
-
-                crd = np.vstack(rows)
 
                 cols8 = ['x', 'y', 'z', 'clk', 'vx', 'vy', 'vz', 'clk_dot']
                 cols9 = ['x', 'y', 'z', 'clk', 'clk_rel', 'vx', 'vy', 'vz', 'clk_dot']

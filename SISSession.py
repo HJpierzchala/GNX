@@ -1,6 +1,7 @@
 import gnx_py as gnx
 from datetime import datetime
 import numpy as np
+from gnx_py.session_errors import SessionExecutionError
 np.set_printoptions(threshold=np.inf, linewidth=200, suppress=True, precision=3)
 
 if __name__ =='__main__':
@@ -24,12 +25,14 @@ if __name__ =='__main__':
                                                                                                               datetime(2024,2,5,0,0,0)],
                        clock_bias=True,clock_bias_function='mean',apply_eclipse=True,compare_dcb=False)
     #  run() comparison
-    compared = gnx.SISController(config=config).run()
+    try:
+        compared = gnx.SISController(config=config).run()
+    except SessionExecutionError as e:
+        print(f"Session error: {e}")
+        raise SystemExit(1)
     # print and save the output
     print(compared[['dx','dy','dz','dt']])
     compared.to_csv(f'./sample_data/CNE_{config.system}_BRDC_SP3.csv')
-
-
 
 
 

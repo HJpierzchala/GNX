@@ -3,6 +3,7 @@ import traceback
 import gnx_py as gnx
 import logging
 from gnx_py import TECSession
+from gnx_py.session_errors import SessionExecutionError
 import os
 
 # Define input products
@@ -39,7 +40,7 @@ if __name__ =='__main__':
                                        sys="G",
                                        gps_freq='L1L2',
                                        gal_freq='E1E5a',
-                                       windup=False,
+                                       windup=True,
                                        rel_path=False,
                                        sat_pco=True,
                                        rec_pco=True,
@@ -94,6 +95,9 @@ if __name__ =='__main__':
                 print('NEGATIVE GAL: ')
                 print(obs_tec[obs_tec['leveled_tec'] < 0])
                 print('==='*30,'\n')
+        except SessionExecutionError as e:
+            print(f"Session error for {RNX}: {e}")
+            continue
         except Exception as e:
             traceback.print_exc()
             continue

@@ -28,7 +28,8 @@ import pandas as pd
 from ..io import GNSSDataProcessor2, read_sp3
 from ..time import arange_datetime
 from ..tools import DDPreprocessing, DefaultConfig
-from ..coordinates import BrdcGenerator, lagrange_reception_interp
+from ..coordinates import BrdcGenerator, SP3InterpolatorOptimized
+from ..session_errors import guarded_session_run
 
 
 @dataclass
@@ -79,6 +80,7 @@ class SISConfig:
                     ValueError: If mutually incompatible options are provided.
                     FileNotFoundError: If a required resource is missing (when validated here).
                 """
+
         self.orb_path_0:Union[str,Path] = orb_path_0
         self.orb_path_1: Union[str, Path] = orb_path_1
 
@@ -244,7 +246,7 @@ class SISController:
         crd[['x_apc','y_apc','z_apc']] = crd[['x','y','z']]
         return crd
 
-    def process_precise_orbit(self, path: str | Path, prev_path: str | Path, next_path: str | Path):
+    def process_precise_orbit(self, path: str | Path, prev_path: str|Path, next_path:str|Path):
         """
                 Process precise orbits (SP3) and align them to an internally determined epoch grid.
 
@@ -270,23 +272,29 @@ class SISController:
                     - Adjacent-day files, when present, improve interpolation at the edges.
                 """
 
-        sp3 = read_sp3(path=path, sys=self.system)
-        sp3[['x', 'y', 'z']] = sp3[['x', 'y', 'z']].apply(lambda x: x * 1000)
-        sp3['clk'] = sp3['clk'] * 1e-6
-
+        sp3 =   read_sp3(path=path, sys=self.system)
         if self.config.tlim is not None:
 
-            epochs = arange_datetime(start_datetime=self.config.tlim[0], end_datetime=self.config.tlim[1],
-                                     step_minutes=self.config.interval / 60)
+            epochs =    arange_datetime(start_datetime=self.config.tlim[0], end_datetime=self.config.tlim[1],
+                                                  step_minutes=self.config.interval/60)
         else:
             sp3_epochs = sorted(sp3.index.get_level_values('time').tolist())
-            epochs = arange_datetime(start_datetime=sp3_epochs[0], end_datetime=sp3_epochs[-1],
-                                     step_minutes=self.config.interval / 60)[:-1]
-        sv_list = sp3.index.get_level_values('sv').unique().tolist()
+            epochs =    arange_datetime(start_datetime=sp3_epochs[0], end_datetime=sp3_epochs[-1],
+                                                  step_minutes=self.config.interval/60)[:-1]
 
-        mi = pd.MultiIndex.from_product([epochs, sv_list], names=["time", "sv"])
-        df = pd.DataFrame(index=mi)
-        _, interpolated = lagrange_reception_interp(obs=df, sp3_df=sp3)
+        precise_interp = SP3InterpolatorOptimized(sp3_dataframe=sp3)
+        if prev_path is not None:
+            prev_sp3 =   read_sp3(path=self.config.prev_sp3, sys=self.system)
+        else:
+            prev_sp3 = None
+        if next_path is not None:
+            next_sp3 =   read_sp3(path=self.config.next_sp3, sys=self.system)
+        else:
+            next_sp3 = None
+        precise_interp.include_adjacent_data(prev_sp3_df=prev_sp3,next_sp3_df=next_sp3)
+        interpolated = precise_interp.run(epochs=epochs, method='chebyshev')
+        interpolated.index.names = ['time', 'sv']
+        interpolated = interpolated.swaplevel()
         return interpolated
 
     def set_common_epochs(self, orbit_0:pd.DataFrame, orbit_1:pd.DataFrame):
@@ -630,6 +638,7 @@ class SISController:
                 orbit['TGD'] = 0.0
         return orbit
 
+    @guarded_session_run("SISController")
     def run(self,kr = 0.9604, kb = 1.0, kac = 0.019881, krb = -1.960):
         """
         Execute the configured SIS processing pipeline.

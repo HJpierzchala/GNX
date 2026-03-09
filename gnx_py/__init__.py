@@ -11,4 +11,5 @@ from .tools import *
 from .troposphere import *
 from .utils import *
 from .configuration import *
+from .session_errors import *
 from .spp import *

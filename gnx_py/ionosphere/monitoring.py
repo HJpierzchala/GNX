@@ -486,17 +486,20 @@ def _ensure_sm_cols(
     dfa['time'] = pd.to_datetime(dfa['time'], utc=True)
     dfa = dfa.reset_index(drop=True)
 
-    lat_sm = np.empty(len(dfa)); lon_sm = np.empty(len(dfa))
-    for t, block_idx in dfa.groupby('time', sort=False).groups.items():
-        b = dfa.loc[block_idx]
-        lat_rad = np.deg2rad(b['lat_ipp'].to_numpy())
-        lon_rad = np.deg2rad(b['lon_ipp'].to_numpy())
-        h      = np.full_like(lat_rad, shell_height_m, dtype=float)
+    lat_sm = np.empty(len(dfa))
+    lon_sm = np.empty(len(dfa))
+    lat_rad_all = np.deg2rad(dfa['lat_ipp'].to_numpy())
+    lon_rad_all = np.deg2rad(dfa['lon_ipp'].to_numpy())
+    groups = dfa.groupby('time', sort=False).groups
+    for t, block_idx in groups.items():
+        idx = np.asarray(block_idx, dtype=int)
+        lat_rad = lat_rad_all[idx]
+        lon_rad = lon_rad_all[idx]
+        h = np.full_like(lat_rad, shell_height_m, dtype=float)
 
         sm_lat, sm_lon, _h = transformer.geodetic_to_sm(
             lat_rad=lat_rad, lon_rad=lon_rad, h_m=h, obstime=Time(t, scale='utc')
         )
-        idx = np.asarray(block_idx, dtype=int)
         lat_sm[idx] = np.rad2deg(sm_lat)
         lon_deg = (np.rad2deg(sm_lon) + 180.0) % 360.0 - 180.0
         lon_sm[idx] = lon_deg
