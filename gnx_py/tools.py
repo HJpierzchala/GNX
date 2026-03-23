@@ -742,6 +742,37 @@ class DDPreprocessing:
         ion = np.array(list(map(lambda row: klobuchar(
             azimuth=row[0], elev=row[1], fi=self.flh[0], lambda_=self.flh[1],
             tow=row[2], beta=self.gpsb, alfa=self.gpsa), zip(az, ev, toc_list))))
+        # default for klobuchar: ionospheric delay for L1 in meters
+        stec = ion/0.162 # TECU
+        K = 40.309
+        if self.mode in ['L1', 'L1L2', 'L1L5']:
+            f = self.F['L1']
+            ion = K * (stec / (f ** 2))
+            self.df['ion'] = ion
+        elif self.mode in ['L2', 'L2L5']:
+            f = self.F['L2']
+            ion = K * (stec / (f ** 2))
+            self.df['ion'] = ion
+        elif self.mode == 'L5':
+            f = self.F['L5']
+            ion = K * (stec / (f ** 2))
+            self.df['ion'] = ion
+
+
+        elif self.mode in ['E1', 'E1E5a', 'E1E5b']:
+            f = self.F['L1']
+            ion = K * (stec / (f ** 2))
+            self.df['ion'] = ion
+        elif self.mode in ['E5a', 'E5aE5b']:
+            f = self.F['E5a']
+            ion = K * (stec / (f ** 2))
+            self.df['ion'] = ion
+        elif self.mode == 'E5b':
+            f = self.F['E5b']
+            ion = K * (stec / (f ** 2))
+            self.df['ion'] = ion
+        else:
+            raise ValueError('Unkown mode')
         self.df['ion'] = ion
 
     def enu2ecef(self, x):
