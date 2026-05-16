@@ -30,7 +30,8 @@ def measure_convergence_time(df: pd.DataFrame,
         raise ValueError("DataFrame must contain 'de', 'dn', 'du' columns.")
 
     df = df.copy()
-    interval = (df.index.tolist()[1]-df.index.tolist()[0]).total_seconds()/60
+    if len(df) < min_stable_duration:
+        return np.nan
 
     if mode == '2D':
         df['error'] = np.sqrt(df['de']**2 + df['dn']**2)
@@ -47,7 +48,7 @@ def measure_convergence_time(df: pd.DataFrame,
             counter += 1
             if counter >= min_stable_duration:
                 conv_time = (df.index[i] - df.index[0]).total_seconds() / 60
-                return conv_time*interval
+                return conv_time
         else:
             counter = 0
 

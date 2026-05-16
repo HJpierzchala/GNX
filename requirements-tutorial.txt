@@ -1,0 +1,9 @@
+# Tutorial and notebook requirements.
+# Install the package itself with:
+#   pip install -e ".[tutorial]"
+
+seaborn>=0.13,<0.14
+nbformat>=5,<6
+nbconvert>=7,<8
+ipykernel>=6,<7
+jupyterlab>=4,<5

@@ -263,6 +263,11 @@ class SolarGeomagneticTransformer:
       - geodetic (lat[rad], lon[rad], h[m])  <->  Solar-Geomagnetic geodetic (lat_SM, lon_SM, h)
       - ECEF/ITRS xyz [m]                    <->  SM Cartesian [m]
 
+    Status:
+      Active support class for monitoring/kriging in solar-geomagnetic
+      coordinates. Requires caution because frame definition, IGRF coefficients
+      and time handling directly affect gridded products.
+
     SM frame (Knecht & Schumann 1985):
       Z = centered-dipole axis (from IGRF n=1),
       X = projection of Sun direction on plane ⟂ Z,

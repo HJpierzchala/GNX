@@ -13,15 +13,23 @@ Notes:
   parameter switch while keeping mathematical equivalence clear in the docs.
 """
 import os
+import logging
 from typing import Optional, Iterable, Tuple, List, Dict
 from pathlib import Path
 import pandas as pd
 import numpy as np
 C = 299792458
-PI = 3.1415296535898
+PI = np.pi
+
+logger = logging.getLogger(__name__)
 
 def get_ipp(ev, az, lat, lon, ish=450.0, R=6371.0):
     """Compute ionospheric pierce point (IPP) geographic coordinates.
+
+        Status:
+            Active geometry helper. A similar implementation also exists on
+            ``TECInterpolator``; keep them numerically equivalent if either is
+            changed.
 
         Computes the latitude and longitude of the ionospheric pierce point (IPP)
         at a specified thin-shell ionosphere height using the receiver geodetic
@@ -100,6 +108,11 @@ def get_local_time(la_pp, ut):
 def stec_mf(ev, ish=450e03, R=6371e03, no=1):
     """Compute slant TEC mapping function (thin-shell ionosphere).
 
+    Status:
+        Active utility used by NTCM and STEC/VTEC workflows. The selected
+        formulation changes VTEC/STEC scaling, so treat ``no`` as numerical
+        configuration.
+
     Implements several mapping function (MF) formulations to convert between
     vertical and slant TEC under a single-layer ionosphere assumption.
 
@@ -152,13 +165,18 @@ def load_stec_folder(
     station_name_len: int = 6,
     unique_id_len: int = 4,
     network_filter: Optional[Iterable[str]] = None,
-    required_columns: Tuple[str, str, str, str] = ("lat_ipp", "lon_ipp", "leveled_tec", "ev","sv","time"),
+    required_columns: Tuple[str, str, str, str, str, str] = ("lat_ipp", "lon_ipp", "leveled_tec", "ev", "sv", "time"),
     quiet: bool = False,
     skip_negative:bool=True
 ) -> Tuple[pd.DataFrame, Dict[str, object]]:
     """
     Load and validate STEC parquet files from a folder, filtering by elevation
     and rejecting files that contain negative leveled TEC values.
+
+    Status:
+        Active convenience loader for monitoring/kriging workflows. Logging is
+        controlled by ``quiet``; the function should not print during normal
+        library use.
 
     The function iterates over files ending with ``file_suffix`` inside ``folder``.
     For each file:
@@ -248,7 +266,7 @@ def load_stec_folder(
 
             if network_filter is not None and unique_id not in network_filter:
                 if not quiet:
-                    print(f"[SKIP-NET] {fpath.name} (unique_id {unique_id} not in network_filter)")
+                    logger.info("[STEC LOAD] file=%s event=skip-network unique_id=%s", fpath.name, unique_id)
                 continue
 
             df = pd.read_parquet(fpath)
@@ -265,14 +283,14 @@ def load_stec_folder(
             if skip_negative:
                 if (df[tec_col] < 0).any():
                     if not quiet:
-                        print(f"[REJECT-NEG] {fpath.name} — negative TEC detected")
+                        logger.info("[STEC LOAD] file=%s event=reject-negative-tec", fpath.name)
                     rejected_files.append(fpath.name)
                     stations_rejected.add(unique_id)
                     continue
 
             if df.empty:
                 if not quiet:
-                    print(f"[SKIP-EMPTY] {fpath.name} — no rows after filtering")
+                    logger.info("[STEC LOAD] file=%s event=skip-empty", fpath.name)
                 # Treat as rejected but without negative TEC
                 rejected_files.append(fpath.name)
                 stations_rejected.add(unique_id)
@@ -285,14 +303,14 @@ def load_stec_folder(
             dfs.append(df)
             stations_accepted.add(unique_id)
             if not quiet:
-                print(f"[ACCEPT] {fpath.name} → rows: {len(df)}")
+                logger.info("[STEC LOAD] file=%s event=accept rows=%d", fpath.name, len(df))
 
         except Exception as e:
             errors.append((fpath.name, str(e)))
             rejected_files.append(fpath.name)
             stations_rejected.add(fpath.name[:unique_id_len])
             if not quiet:
-                print(f"[ERROR] {fpath.name}: {e}")
+                logger.warning("[STEC LOAD] file=%s event=error error=%s", fpath.name, e)
 
     # Build final DataFrame
     if dfs:
@@ -301,8 +319,10 @@ def load_stec_folder(
         df_all = df_all.reset_index()
         df_all['time'] = pd.to_datetime(df_all['time'])
         df_all.set_index(['sv', 'time'], inplace=True)
-    # else:
-    #     df_all = pd.DataFrame(columns=[lat_col, lon_col, tec_col, ev_col, "name"])
+    else:
+        empty_cols = list(required_columns) + ["name"]
+        df_all = pd.DataFrame(columns=empty_cols)
+        df_all = df_all.set_index(["sv", "time"])
 
     summary = {
         "files_scanned": files_scanned,

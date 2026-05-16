@@ -39,6 +39,8 @@ from ..coordinates import make_ionofree, emission_interp, BroadcastInterp
 from ..tools import CSDetector
 from ..tools import DDPreprocessing
 from ..session_errors import guarded_session_run
+from ..gnss import SIGNALS, frequency_hz, mode_layout, mode_signals
+from .bias_policy import apply_stec_bias_policy
 
 
 def apply_savgol_filter_1d(
@@ -204,6 +206,16 @@ class Calibration:
     """
     Single receiver calibration using background GIM data.
 
+    Status:
+        Legacy/active compatibility path. It is still used by ``TECSession``
+        when ``add_sta_dcb=True`` and ``rcv_dcb_source="calibrate"``, but it
+        should be changed only with strong numerical regression tests.
+
+    Purpose:
+        Estimate a receiver DCB from leveled STEC observations by aligning them
+        to a background GIM ionosphere value. The result is a single station
+        bias in nanoseconds.
+
     Workflow:
     1) Smooth L4 observation and divide by speed of light to obtain the uncalibrated
        ionospheric time delay (seconds).
@@ -234,8 +246,7 @@ class Calibration:
         self.df = df
         self.sys = sys
         self.mode = mode
-        self.FREQ_DICT = {'L1':1575.42e06, 'L2':1227.60e06,
-                          'E1':1575.42e06,'E5a':1176.45e06,'E5b':1207.14e06}
+        self.FREQ_DICT = {name: spec.frequency_hz for name, spec in SIGNALS.items()}
         self.C = 299792458
         self.elev_curoff = elev_curoff
         self.dcb_u = None
@@ -250,7 +261,7 @@ class Calibration:
                         - tecu2meters: conversion factor from TECU to meters at f1.
                 """
 
-        m1, m2 = self.mode[:2], self.mode[2:]
+        m1, m2 = mode_signals(self.mode)
         f1, f2 = self.FREQ_DICT[m1], self.FREQ_DICT[m2]
 
 
@@ -298,6 +309,26 @@ class Calibration:
 class STECMonitor:
     """Slant ionospheric TEC measurement class.
 
+     Status:
+     Active core computation class. Requires caution: ``_process_arc`` changes
+     the measured geometry-free code/phase combinations and feeds downstream
+     TEC values.
+
+     Purpose:
+     Process already-prepared dual-frequency observations for one GNSS system
+     and one signal pair. The class assumes ``P4`` and ``L4`` geometry-free
+     observables, elevation angles, arc labels and optional bias/model columns
+     are already present.
+
+     Supported systems:
+     GPS, Galileo and BeiDou are selected by ``sys`` plus the configured
+     ``mode``. BDS ``B1IB3I`` has direct regression coverage in this branch.
+
+     Bias policy:
+     Satellite and station biases are resolved through
+     ``apply_stec_bias_policy`` using ``TECConfig``. The returned total bias is
+     added to ``P4`` before code/phase TEC products are formed.
+
      Produces leveled TEC measurements per satellite arc using:
      - Phase leveling of geometry‑free combinations.
      - Median leveling for robust smoothing at boundaries.
@@ -322,8 +353,7 @@ class STECMonitor:
         self.config: TECConfig =config
         self.flh= flh
         self.broadcast= broadcast
-        self.FREQ_DICT = {'L1':1575.42e06, 'L2':1227.60e06,
-                          'E1':1575.42e06,'E5a':1176.45e06}
+        self.FREQ_DICT = {name: spec.frequency_hz for name, spec in SIGNALS.items()}
         self.GAMMA = 1/40.3
         self.C = 299792458
 
@@ -336,7 +366,7 @@ class STECMonitor:
                     float: Conversion factor for geometry‑free phases to TECU.
                 """
 
-        m1, m2 = self.mode[:2], self.mode[2:]
+        m1, m2 = mode_signals(self.mode)
         f1, f2 = self.FREQ_DICT[m1], self.FREQ_DICT[m2]
         return self.GAMMA * ((f1**2*f2**2)/(f1**2-f2**2))
 
@@ -438,6 +468,10 @@ class STECMonitor:
     def _process_arc(self,gr):
         """Process a single satellite arc: apply DCBs, level phase and compute TEC.
 
+        Status:
+            Active and requires caution. This is the main numerical path for
+            STEC arc processing; changes can alter produced TEC values.
+
         Steps:
         - Optionally add satellite and station DCB to code observable.
         - Apply phase leveling and compute leveled TEC.
@@ -455,27 +489,15 @@ class STECMonitor:
         sv = gr.index.get_level_values('sv').tolist()[0]
         t = gr.index.get_level_values('time').values
 
-        dcb = 0.0
-        if self.config.add_dcb:
-            if 'bias' in gr.columns:
-                dcb = gr['bias']*1e-09*self.C
-            else:
-                print('WARNING! No bias for sv: ', sv)
-                dcb  = 0.0
+        gr, bias = apply_stec_bias_policy(
+            gr,
+            config=self.config,
+            mode=self.mode,
+            system=self.sys,
+            logger=logging.getLogger(__name__),
+        )
 
-        if self.config.add_sta_dcb:
-            if self.config.rcv_dcb_source =='gim':
-                dcb += np.asarray(gr.get('sta_bias',0.0))*1e-09*self.C
-
-
-            elif self.config.rcv_dcb_source =='defined':
-                gr['sta_dcb'] = self.config.define_station_dcb
-                dcb+=gr['sta_dcb']*1e-09*self.C
-            elif self.config.rcv_dcb_source =='calibrate':
-                dcb += gr.get('sta_dcb',0.0)*1e-09*self.C
-
-
-        code = gr['P4'].values+dcb
+        code = gr['P4'].values + bias.total_m
         phase = gr['L4'].values
         ev = gr['ev'].values
 
@@ -514,7 +536,12 @@ class STECMonitor:
         return gr
 
     def compare_models(self):
-        """Compute and attach ionospheric model  for comparison.
+        """Compute and attach ionospheric model values for comparison.
+
+               Status:
+               Experimental diagnostic path. It can add Klobuchar/NTCM/GIM
+               comparison columns, but is not the primary STEC measurement
+               path and should be validated for each model/product setup.
 
                Based on config.compare_models, evaluates selected models (e.g., 'klobuchar',
                'ntcm','gim') and adds their slant ionospheric delays (meters at L1) to self.obs.
@@ -586,6 +613,20 @@ class STECMonitor:
 class TECSession:
     """High‑level controller for a TEC measurement session.
 
+    Status:
+    Active public session driver for STEC/TEC runs. It orchestrates one
+    constellation at a time and routes to ``STECMonitor`` after loading,
+    interpolation, preprocessing and cycle-slip detection.
+
+    Supported systems:
+    GPS (G), Galileo (E) and BeiDou (C). The concrete signal pair is selected
+    from ``TECConfig.gps_freq``, ``gal_freq`` or ``bds_freq``.
+
+    Bias/clock assumptions:
+    Bias products and GIM DCB values are carried through preprocessing columns
+    and then resolved by ``STECMonitor``. Receiver DCB calibration is optional
+    and should be treated as model-dependent.
+
     Orchestrates data loading, optional broadcast‑based screening, precise/broadcast
     orbit interpolation, preprocessing (including PCO/PCV, wind‑up, path corrections),
     cycle‑slip detection, and TEC computation via STECMonitor.
@@ -593,12 +634,7 @@ class TECSession:
 
     CLIGHT: float = 299792458.0
     FREQ_DICT: dict[str, float] = {
-        "L1": 1575.42e06,
-        "L2": 1227.60e06,
-        "L5": 1176.45e06,
-        "E1": 1575.42e06,
-        "E5a": 1176.45e06,
-        "E5b": 1207.14e06,
+        name: spec.frequency_hz for name, spec in SIGNALS.items()
     }
 
 
@@ -607,7 +643,7 @@ class TECSession:
 
                  logger: Optional[logging.Logger] = None,
                  gnss_api: Optional[Any]=None,
-                 use_sys = Optional[Literal['G','E']]) -> None:
+                 use_sys: Optional[Literal['G','E','C']] = None) -> None:
         """Initialize the session controller with external orbit inputs.
 
         Args:
@@ -620,7 +656,10 @@ class TECSession:
 
         self.config: TECConfig = config
         self.log: logging.Logger = logger or self._default_logger()
-        self.use_sys = self.config.sys
+        selected = {use_sys} if use_sys is not None else ({self.config.sys} if isinstance(self.config.sys, str) else set(self.config.sys))
+        if len(selected) != 1:
+            raise ValueError("TECSession processes one constellation at a time; choose exactly one of 'G', 'E' or 'C'.")
+        self.use_sys = next(iter(selected))
 
 
     @guarded_session_run("TECSession")
@@ -639,7 +678,9 @@ class TECSession:
             use_gfz=self.config.use_gfz,
             atx_path=self.config.atx_path,
             mode=self.config.gps_freq,
-            galileo_modes=self.config.gal_freq
+            galileo_modes=self.config.gal_freq,
+            beidou_modes=self.config.bds_freq,
+            station_name=self.config.station_name,
         )
         obs_data = self._load_obs_data(processor)
         self.config.interval = obs_data.interval
@@ -648,32 +689,43 @@ class TECSession:
         if self.config.nav_path:
             broadcast = self._load_nav_data(processor)
             if self.config.screen:
-                gps_obs, gal_obs = self._screen_data(processor, obs_data.gps, obs_data.gal, broadcast)
+                gps_obs, gal_obs, bds_obs = self._screen_data(processor, obs_data.gps, obs_data.gal, obs_data.bds, broadcast)
             else:
-                gps_obs, gal_obs = obs_data.gps, obs_data.gal
+                gps_obs, gal_obs, bds_obs = obs_data.gps, obs_data.gal, obs_data.bds
         else:
-            gps_obs, gal_obs = obs_data.gps, obs_data.gal
+            gps_obs, gal_obs, bds_obs = obs_data.gps, obs_data.gal, obs_data.bds
             broadcast = None
+
         if self.use_sys == 'E':
             if gal_obs is None:
                 raise FileNotFoundError(f'No Galileo observations for this file: {self.config.obs_path}')
-            gps_obs = gal_obs.copy()
+            work_obs = gal_obs.copy()
             mode = self.config.gal_freq
         elif self.use_sys =='G':
+            if gps_obs is None:
+                raise FileNotFoundError(f'No GPS observations for this file: {self.config.obs_path}')
+            work_obs = gps_obs.copy()
             mode = self.config.gps_freq
+        elif self.use_sys == 'C':
+            if bds_obs is None:
+                raise FileNotFoundError(f'No BeiDou observations for this file: {self.config.obs_path}')
+            work_obs = bds_obs.copy()
+            mode = self.config.bds_freq
+        else:
+            raise ValueError(f"Unsupported TEC system: {self.use_sys}")
 
         # positions, sp3 = self._interpolate_reception(gps_info=obs_data.meta,interval=obs_data.interval)
         if self.config.orbit_type == "broadcast":
-            obs_gps_crd = self._interpolate_broadcast(obs_df=gps_obs,
+            obs_gps_crd = self._interpolate_broadcast(obs_df=work_obs,
                                                       xyz=xyz.copy(),
                                                       flh=flh.copy(),
-                                                      sys='G',
-                                                      mode=self.config.gps_freq,
+                                                      sys=self.use_sys,
+                                                      mode=mode,
                                                       orbit=broadcast)
         elif self.config.orbit_type == "precise":
 
-            obs_gps_crd = self._interpolate_lgr(obs=gps_obs, xyz=xyz.copy(), flh=flh.copy(),
-                                                    mode=self.config.gps_freq)
+            obs_gps_crd = self._interpolate_lgr(obs=work_obs, xyz=xyz.copy(), flh=flh.copy(),
+                                                    mode=mode)
         if 'ev' in obs_gps_crd.columns:
             obs_gps_crd = obs_gps_crd[obs_gps_crd['ev']>self.config.ev_mask]
         obs_gps_crd = self._preprocess(obs=obs_gps_crd,
@@ -698,17 +750,23 @@ class TECSession:
                                                )
 
 
-        if self.config.rcv_dcb_source == 'calibrate':
-            self.config.add_dcb=False
+        if self._should_calibrate_station_bias(obs_gps_crd):
+            old_add_dcb = self.config.add_dcb
+            old_add_sta_dcb = self.config.add_sta_dcb
+            try:
+                self.config.add_dcb=False
+                self.config.add_sta_dcb=False
 
-            monitor =  STECMonitor(obs=obs_gps_crd, mode=mode, config=self.config, sys=self.use_sys, flh=flh,
-                                            broadcast=broadcast)
-            obs_tec = monitor.run()
-            calib = Calibration(name=self.config.station_name, df=obs_tec, sys=self.use_sys, mode=mode)
-            dcb_u = calib.calibrate()
-            obs_tec['sta_dcb'] = dcb_u
+                monitor =  STECMonitor(obs=obs_gps_crd, mode=mode, config=self.config, sys=self.use_sys, flh=flh,
+                                                broadcast=broadcast)
+                obs_tec = monitor.run()
+                calib = Calibration(name=self.config.station_name, df=obs_tec, sys=self.use_sys, mode=mode)
+                dcb_u = calib.calibrate()
+                obs_tec['sta_dcb'] = dcb_u
+            finally:
+                self.config.add_dcb=old_add_dcb
+                self.config.add_sta_dcb=old_add_sta_dcb
             # po kalibracji aplikujemy DCB satelitow do pomiarow
-            self.config.add_dcb=True
             monitor =  STECMonitor(obs=obs_tec, mode=mode, config=self.config,
                                             sys=self.use_sys, flh=flh, broadcast=broadcast)
             obs_tec = monitor.run()
@@ -721,15 +779,15 @@ class TECSession:
     def _load_obs_data(self, processor):
         """Load dual‑frequency observations via backend."""
 
-        obs = processor.load_obs_data()
+        obs = processor.load_obs_data(tlim=self.config.time_limit)
         return obs
 
     def _load_nav_data(self, processor):
         """Load broadcast navigation messages for screening."""
-        broadcast = processor.load_broadcast_orbit()
+        broadcast = processor.load_broadcast_orbit(tlim=self.config.time_limit)
         return broadcast
 
-    def _screen_data(self, processor, gps_obs, gal_obs, broadcast):
+    def _screen_data(self, processor, gps_obs, gal_obs, bds_obs, broadcast):
         """Filter observations using broadcast NAV availability and basic quality checks.
 
         Returns:
@@ -746,14 +804,22 @@ class TECSession:
             gal_obs = processor.mark_outages(gal_obs, 'E', gal_nav)
             gal_obs = gal_obs[(gal_obs.filter(regex=r'^L').gt(0)).all(axis=1)]
 
-        return gps_obs, gal_obs
+        if self.config.system_includes('C') and bds_obs is not None:
+            bds_nav = processor.screen_navigation_message(broadcast.bds_orb, 'C')
+            bds_obs = processor.mark_outages(bds_obs, 'C', bds_nav)
+            bds_obs = bds_obs[bds_obs['bds_outage'] == False]
+            bds_obs = bds_obs[(bds_obs.filter(regex=r'^L').gt(0)).all(axis=1)]
 
-    def _interpolate_broadcast(self, obs_df, xyz, flh,sys,mode, orbit, tolerance):
-        make_ionofree(obs_df,sys,mode)
+        return gps_obs, gal_obs, bds_obs
+
+    def _interpolate_broadcast(self, obs_df, xyz, flh,sys,mode, orbit, tolerance=None):
+        make_ionofree(obs_df=obs_df, mode=mode, sys=sys)
         if sys == 'G':
             orb = orbit.gps_orb
         elif sys == 'E':
             orb = orbit.gal_orb
+        elif sys == 'C':
+            orb = orbit.bds_orb
         else:
             raise ValueError("Invalid sys: %s", sys)
 
@@ -789,7 +855,7 @@ class TECSession:
         """
 
 
-        make_ionofree(obs_df,sys,mode)
+        make_ionofree(obs_df=obs_df, mode=mode, sys=sys)
         obs_crd = emission_interp(
             obs=obs_df,
             crd=positions,
@@ -845,46 +911,25 @@ class TECSession:
         obs_df = obs_df.drop(columns=['sv'])
         return obs_df
 
+    def _should_calibrate_station_bias(self, obs_df: pd.DataFrame) -> bool:
+        if not bool(getattr(self.config, "add_sta_dcb", False)):
+            return False
+        if getattr(self.config, "rcv_dcb_source", None) != "calibrate":
+            return False
+        required = {"ion", "bias"}
+        missing = required - set(obs_df.columns)
+        if missing:
+            self.log.warning(
+                "Skipping STEC receiver DCB calibration for %s: missing columns %s. "
+                "Configured fallback policy will be used instead.",
+                self.use_sys,
+                sorted(missing),
+            )
+            return False
+        return True
+
     def _mode_layout(self, mode: str, system: str) -> list[dict[str, str]]:
-        if system == "G":
-            layouts = {
-                "L1": [{"code": "C1", "phase": "L1", "freq": "L1", "rec_pco_col": "pco_los"}],
-                "L2": [{"code": "C2", "phase": "L2", "freq": "L2", "rec_pco_col": "pco_los"}],
-                "L5": [{"code": "C5", "phase": "L5", "freq": "L5", "rec_pco_col": "pco_los"}],
-                "L1L2": [
-                    {"code": "C1", "phase": "L1", "freq": "L1", "rec_pco_col": "pco_los_l1"},
-                    {"code": "C2", "phase": "L2", "freq": "L2", "rec_pco_col": "pco_los_l2"},
-                ],
-                "L1L5": [
-                    {"code": "C1", "phase": "L1", "freq": "L1", "rec_pco_col": "pco_los_l1"},
-                    {"code": "C5", "phase": "L5", "freq": "L5", "rec_pco_col": "pco_los_l2"},
-                ],
-                "L2L5": [
-                    {"code": "C2", "phase": "L2", "freq": "L2", "rec_pco_col": "pco_los_l1"},
-                    {"code": "C5", "phase": "L5", "freq": "L5", "rec_pco_col": "pco_los_l2"},
-                ],
-            }
-        else:
-            layouts = {
-                "E1": [{"code": "C1", "phase": "L1", "freq": "E1", "rec_pco_col": "pco_los"}],
-                "E5a": [{"code": "C5", "phase": "L5", "freq": "E5a", "rec_pco_col": "pco_los"}],
-                "E5b": [{"code": "C7", "phase": "L7", "freq": "E5b", "rec_pco_col": "pco_los"}],
-                "E1E5a": [
-                    {"code": "C1", "phase": "L1", "freq": "E1", "rec_pco_col": "pco_los_l1"},
-                    {"code": "C5", "phase": "L5", "freq": "E5a", "rec_pco_col": "pco_los_l2"},
-                ],
-                "E1E5b": [
-                    {"code": "C1", "phase": "L1", "freq": "E1", "rec_pco_col": "pco_los_l1"},
-                    {"code": "C7", "phase": "L7", "freq": "E5b", "rec_pco_col": "pco_los_l5"},
-                ],
-                "E5aE5b": [
-                    {"code": "C5", "phase": "L5", "freq": "E5a", "rec_pco_col": "pco_los_l1"},
-                    {"code": "C7", "phase": "L7", "freq": "E5b", "rec_pco_col": "pco_los_l5"},
-                ],
-            }
-        if mode not in layouts:
-            raise ValueError(f"Unsupported mode '{mode}' for system '{system}'.")
-        return layouts[mode]
+        return mode_layout(mode)
 
     def _get_corr(self, obs_df: pd.DataFrame, enabled: bool, column: str) -> np.ndarray:
         if enabled and column in obs_df.columns:
@@ -924,7 +969,7 @@ class TECSession:
 
             if phase_cols:
                 phw = self._get_corr(obs_df=obs_df, enabled=windup_enabled, column="phw")
-                lam = self.CLIGHT / self.FREQ_DICT[band["freq"]]
+                lam = self.CLIGHT / frequency_hz(band["freq"])
                 phase_corr = common - lam * phw
                 obs_df.loc[:, phase_cols] = obs_df[phase_cols].to_numpy(copy=False) + phase_corr[:, None]
 
@@ -932,11 +977,10 @@ class TECSession:
 
     @staticmethod
     def _default_logger() -> logging.Logger:  # noqa: D401 – simple phrase
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        )
-        return logging.getLogger("TEC")
+        logger = logging.getLogger("TEC")
+        if not logger.handlers:
+            logger.addHandler(logging.NullHandler())
+        return logger
 
     @staticmethod
     def _import_gnss_api():  # -> ModuleType

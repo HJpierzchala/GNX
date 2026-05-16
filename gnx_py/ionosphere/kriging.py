@@ -35,6 +35,8 @@ class VariogramLike(Protocol):
 @dataclass
 class SparksVariogram:
     """Sparks/WAAS (2011):
+        Status: experimental/research helper for ionosphere kriging.
+
         C(d) = sigma_total^2                         , d=0
              = (sigma_total^2 - sigma_nominal^2) * exp(-d/ddecorr) , d>0
         Units: VTEC->TECU, covariances -> (TECU)^2.
@@ -299,6 +301,28 @@ def _default_rnorm_km(shape, base=EARTH_RADIUS_KM, h=IONO_SHELL_H_KM):
 
 @dataclass
 class IonoKrigingMonitor:
+    """Generate gridded VTEC estimates from IPP observations by kriging.
+
+    Status:
+        Experimental public API. It supports WAAS/Sparks-style kriging and
+        lightweight OK/UK implementations, but should be validated on each
+        network, coordinate frame and variogram choice before operational use.
+
+    Inputs:
+        ``grid_lon``/``grid_lat`` define the output grid in degrees. Input epoch
+        data passed to ``krige_epoch`` must contain IPP coordinates and ``vtec``.
+        SM mode additionally requires ``SolarGeomagneticTransformer`` and an
+        observation time.
+
+    Outputs:
+        ``krige_epoch`` returns VTEC grid, variance grid and diagnostic metadata.
+
+    Limitations:
+        The class mixes research workflows and tutorial utilities. Do not change
+        neighborhood selection, covariance handling or coordinate transforms
+        without numerical comparisons.
+    """
+
     # grid on which we want maps (deg) – can be GEO or SM
     grid_lon: np.ndarray
     grid_lat: np.ndarray
@@ -945,6 +969,9 @@ class OrdinaryKrigingGeo(_BaseKrigingGeo):
     """
         Ordinary Kriging.
 
+            Status: experimental compatibility implementation used by
+            ``IonoKrigingMonitor`` when ``kriging_mode="OK"``.
+
             OK = OrdinaryKrigingGeo(
                 lon, lat, vtec,
                 variogram_model="spherical",
@@ -1030,6 +1057,11 @@ class OrdinaryKrigingGeo(_BaseKrigingGeo):
 class UniversalKrigingGeo(_BaseKrigingGeo):
     """
     Universal Kriging with drift_terms=['regional_linear'] -> baza [1, lon, lat].
+
+    Status:
+        Experimental compatibility implementation used by
+        ``IonoKrigingMonitor`` when ``kriging_mode="UK"``. Only regional
+        linear drift is supported.
 
     UK = UniversalKrigingGeo(
         lon, lat, vtec,

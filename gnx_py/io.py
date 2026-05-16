@@ -20,6 +20,13 @@ import numpy as np
 import pandas as pd
 
 from . import ecef2geodetic
+from .gnss import (
+    DEFAULT_MODE_BY_SYSTEM,
+    mode_signals,
+    signal_spec,
+    validate_mode_for_system,
+)
+from .rinex2_adapter import adapt_rinex2_gps_nav, adapt_rinex2_gps_obs, is_supported_rinex2_version
 from .time import doy_to_datetime, datetime2toc
 
 import warnings
@@ -177,9 +184,12 @@ class OrbitData:
     """
     gps_orb: Optional[pd.DataFrame] = None
     gal_orb: Optional[pd.DataFrame] = None
+    bds_orb: Optional[pd.DataFrame] = None
     gpsa: float | None = None
     gpsb: float | None = None
     gala: float | None = None
+    bdsa: float | None = None
+    bdsb: float | None = None
 
 
 @dataclass
@@ -189,6 +199,7 @@ class ObsData:
     """
     gps: pd.DataFrame = None
     gal: pd.DataFrame = None
+    bds: pd.DataFrame = None
     sat_pco: defaultdict = None
     rec_pco: defaultdict = None
     meta: tuple= None
@@ -206,7 +217,7 @@ class GNSSDataProcessor2:
     """
 
     def __init__(self, atx_path=None, obs_path=None, dcb_path=None, nav_path=None, mode='L1', sys='G',
-                 galileo_modes=None, use_gfz=False):
+                 galileo_modes=None, beidou_modes=None, use_gfz=False, station_name=None):
         """
         :param atx_path: path to .atx file
         :param obs_path: path to .obs file
@@ -228,17 +239,234 @@ class GNSSDataProcessor2:
         if isinstance(sys, str):
             self.sys = {sys}
         else:
-            self.sys = sys
+            self.sys = set(sys)
         self.galileo_modes = galileo_modes
+        self.beidou_modes = beidou_modes or DEFAULT_MODE_BY_SYSTEM["C"]
+        self.station_name = station_name
 
+        self.dcb_paths = self._normalize_dcb_paths(dcb_path)
         self.dcb_type = None
-        if self.dcb_path is not None:
-            osb_path = self.dcb_path.split('/')[-1].split('_')
-
-            self.dcb_type = osb_path[3]
+        if self.dcb_paths:
+            first_bias_path = str(self.dcb_paths[0]).split('/')[-1].split('_')
+            self.dcb_type = first_bias_path[3]
             self.add_dcb = True
         else:
             self.add_dcb = False
+
+    @staticmethod
+    def _normalize_dcb_paths(dcb_path) -> list[str]:
+        if dcb_path is None:
+            return []
+        if isinstance(dcb_path, (list, tuple, set)):
+            return [str(path) for path in dcb_path if path]
+        return [str(dcb_path)]
+
+    def _load_bias_products(self) -> pd.DataFrame | None:
+        merged = None
+        station_bias_parts: list[pd.DataFrame] = []
+
+        def combine_first_aligned(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+            left_aligned = left.copy()
+            right_aligned = right.copy()
+
+            missing_in_left = [col for col in right_aligned.columns if col not in left_aligned.columns]
+            for col in missing_in_left:
+                left_aligned[col] = np.nan
+
+            missing_in_right = [col for col in left_aligned.columns if col not in right_aligned.columns]
+            for col in missing_in_right:
+                right_aligned[col] = np.nan
+
+            left_aligned = left_aligned.sort_index(axis=1)
+            right_aligned = right_aligned.reindex(columns=left_aligned.columns)
+            return left_aligned.combine_first(right_aligned)
+
+        for path in self.dcb_paths:
+            bias_df, _ = self.read_bia(path=path)
+            station_bias = bias_df.attrs.get("station_bias_by_system")
+            if isinstance(station_bias, pd.DataFrame) and not station_bias.empty:
+                station_bias_parts.append(station_bias)
+            if merged is None:
+                merged = bias_df
+                continue
+
+            merged = combine_first_aligned(merged, bias_df)
+
+        if merged is not None and station_bias_parts:
+            station_merged = station_bias_parts[0]
+            for station_bias in station_bias_parts[1:]:
+                station_merged = combine_first_aligned(station_merged, station_bias)
+            merged.attrs["station_bias_by_system"] = station_merged
+
+        return merged
+
+    def _get_obs_rinex_info(self) -> dict:
+        if not hasattr(self, "_obs_rinex_info_cache"):
+            self._obs_rinex_info_cache = gr.rinexinfo(self.obs_path) if self.obs_path else {}
+        return self._obs_rinex_info_cache
+
+    def _get_nav_rinex_info(self) -> dict:
+        if not hasattr(self, "_nav_rinex_info_cache"):
+            self._nav_rinex_info_cache = gr.rinexinfo(self.nav_path) if self.nav_path else {}
+        return self._nav_rinex_info_cache
+
+    def _get_obs_header(self) -> dict:
+        if not hasattr(self, "_obs_header_cache"):
+            self._obs_header_cache = gr.rinexheader(self.obs_path) if self.obs_path else {}
+        return self._obs_header_cache
+
+    def _get_nav_header(self) -> dict:
+        if not hasattr(self, "_nav_header_cache"):
+            if not self.nav_path:
+                self._nav_header_cache = {}
+            else:
+                try:
+                    self._nav_header_cache = gr.rinexheader(self.nav_path)
+                except ValueError:
+                    self._nav_header_cache = self._read_basic_rinex_header(self.nav_path)
+        return self._nav_header_cache
+
+    @staticmethod
+    def _read_basic_rinex_header(path: str | Path) -> dict:
+        header: dict[str, object] = {"IONOSPHERIC CORR": {}}
+        with open(path, "r", encoding="ascii", errors="ignore") as stream:
+            for line in stream:
+                label = line[60:].strip() if len(line) >= 60 else ""
+                payload = line[:60]
+                if label == "RINEX VERSION / TYPE":
+                    try:
+                        header["version"] = float(payload[:9])
+                    except ValueError:
+                        pass
+                    header["filetype"] = payload[20:21].strip()
+                    header["systems"] = payload[40:41].strip()
+                elif label == "IONOSPHERIC CORR":
+                    parts = payload.split()
+                    if parts:
+                        key = parts[0]
+                        values = []
+                        for value in parts[1:]:
+                            try:
+                                values.append(float(value.replace("D", "E").replace("d", "e")))
+                            except ValueError:
+                                pass
+                        header["IONOSPHERIC CORR"][key] = values
+                elif label == "LEAP SECONDS":
+                    parts = payload.split()
+                    if parts:
+                        try:
+                            header["LEAP SECONDS"] = int(parts[0])
+                        except ValueError:
+                            pass
+                elif label == "END OF HEADER" or "END OF HEADER" in line:
+                    break
+        return header
+
+    def _is_rinex2_obs(self) -> bool:
+        return is_supported_rinex2_version(self._get_obs_rinex_info().get("version"))
+
+    def _is_rinex2_nav(self) -> bool:
+        return is_supported_rinex2_version(self._get_nav_rinex_info().get("version"))
+
+    def _is_rinex4_nav(self) -> bool:
+        try:
+            return float(self._get_nav_rinex_info().get("version", 0.0)) >= 4.0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _adapter_report(df: pd.DataFrame | None) -> dict:
+        if isinstance(df, pd.DataFrame):
+            return df.attrs.get("gnx_adapter", {})
+        return {}
+
+    def _parse_obs_start_from_filename(self) -> datetime | None:
+        name = Path(self.obs_path).name
+        parts = name.split("_")
+        if len(parts) < 4:
+            return None
+        token = parts[-4]
+        if len(token) < 7 or not token[:7].isdigit():
+            return None
+        yr = int(token[:4])
+        doy = int(token[4:7])
+        return doy_to_datetime(year=yr, doy=doy)
+
+    @staticmethod
+    def _infer_interval_from_df(df: pd.DataFrame | None) -> float | None:
+        if not isinstance(df, pd.DataFrame) or not isinstance(df.index, pd.MultiIndex):
+            return None
+        if "time" not in df.index.names:
+            return None
+        times = pd.Index(df.index.get_level_values("time")).drop_duplicates().sort_values()
+        if len(times) < 2:
+            return None
+        diffs = times.to_series().diff().dt.total_seconds().dropna()
+        diffs = diffs[diffs > 0]
+        if diffs.empty:
+            return None
+        return float(diffs.median()) / 60.0
+
+    def _resolve_obs_interval_minutes(
+        self,
+        gps: pd.DataFrame | None,
+        gal: pd.DataFrame | None,
+        bds: pd.DataFrame | None = None,
+    ) -> float | None:
+        for df in (gps, gal, bds):
+            report = self._adapter_report(df)
+            interval = report.get("meta_override", {}).get("interval")
+            if interval is not None:
+                return float(interval) / 60.0
+
+        hdr = self._get_obs_header()
+        if "INTERVAL" in hdr:
+            try:
+                return float(str(hdr["INTERVAL"]).strip()) / 60.0
+            except ValueError:
+                pass
+
+        inferred = self._infer_interval_from_df(gps) or self._infer_interval_from_df(gal) or self._infer_interval_from_df(bds)
+        if inferred is not None:
+            return inferred
+
+        parts = Path(self.obs_path).name.split("_")
+        if len(parts) >= 2:
+            token = parts[-2]
+            if len(token) >= 2 and token[:2].isdigit():
+                return float(token[:2]) / 60.0
+        return 0.5
+
+    def _apply_obs_meta_overrides(self, gps_info: tuple, gps: pd.DataFrame | None, gal: pd.DataFrame | None) -> tuple:
+        info = list(gps_info)
+        report = self._adapter_report(gps) or self._adapter_report(gal)
+        override = report.get("meta_override", {})
+
+        if "interval" in override and override["interval"] is not None:
+            info[6] = override["interval"]
+        if "gps_obs" in override and override["gps_obs"] is not None:
+            info[7] = override["gps_obs"]
+        if "gal_obs" in override:
+            info[8] = override["gal_obs"]
+        if "time_of_first_obs" in override and override["time_of_first_obs"] is not None:
+            info[9] = override["time_of_first_obs"]
+        if "time_of_last_obs" in override and override["time_of_last_obs"] is not None:
+            info[10] = override["time_of_last_obs"]
+        if "phase_shift_dict" in override:
+            info[11] = override["phase_shift_dict"]
+
+        if info[9] is None:
+            for df in (gps, gal):
+                if isinstance(df, pd.DataFrame):
+                    info[9] = df.index.get_level_values("time").min()
+                    break
+        if info[10] is None:
+            for df in (gps, gal):
+                if isinstance(df, pd.DataFrame):
+                    info[10] = df.index.get_level_values("time").max()
+                    break
+
+        return tuple(info)
 
     def _colspecs_from_header(self,header: str):
         colspecs, in_field = [], False
@@ -329,41 +557,114 @@ class GNSSDataProcessor2:
             df["BIASSTART_dt"] = df["BIASSTART"].apply(self._to_datetime_gps)
             df["BIASEND_dt"] = df["BIASEND"].apply(self._to_datetime_gps)
 
-        df = df.rename(columns={'BIASSTART_dt': 'time', 'PRN': 'sv'})
+        df = df.rename(columns={'BIASSTART_dt': 'time'})
+        if "PRN" in df.columns:
+            df["_BIAS_SYSTEM"] = df["PRN"].astype(str).str.strip().str[:1]
+        else:
+            df["_BIAS_SYSTEM"] = ""
 
+        if "STATION" in df.columns:
+            station = df["STATION"].replace("", np.nan)
+            station_mask = station.notna()
+            df["sv"] = df["PRN"]
+            df["_STATION_NAME"] = station
+        else:
+            station_mask = pd.Series(False, index=df.index)
+            df = df.rename(columns={'PRN': 'sv'})
+            df["_STATION_NAME"] = np.nan
+
+        sat_df = df[~station_mask].copy()
+        station_df = df[station_mask].copy()
+
+        station_wide = None
         if file_type == "OSB":
             wide = (
-                df.pivot_table(
+                sat_df.pivot_table(
                     index=["sv", "time"],
                     columns="OBS1",
                     values="ESTIMATEDVALUE",
                     aggfunc="first"
                 )
-                .add_prefix("OSB_")  # BIAS_C1C, BIAS_C1W, ...
+                .add_prefix("OSB_")
                 .reset_index()
             )
+            if not station_df.empty:
+                station_wide = (
+                    station_df.pivot_table(
+                        index=["_STATION_NAME", "_BIAS_SYSTEM", "time"],
+                        columns="OBS1",
+                        values="ESTIMATEDVALUE",
+                        aggfunc="first",
+                    )
+                    .add_prefix("OSB_")
+                )
             file_type = 'OSB'
         else:  # file_type == "DSB"
             # Tworzenie nowej kolumny z połączonymi OBS1 i OBS2
             df["OBS_PAIR"] = df["OBS1"] + "_" + df["OBS2"]
+            sat_df = df[~station_mask].copy()
+            station_df = df[station_mask].copy()
             wide = (
-                df.pivot_table(
+                sat_df.pivot_table(
                     index=["sv", "time"],
                     columns="OBS_PAIR",
                     values="ESTIMATEDVALUE",
                     aggfunc="first"
                 )
-                .add_prefix("BIAS_")  # BIAS_C1C_C1W, BIAS_C1C_C2W, ...
+                .add_prefix("BIAS_")
                 .reset_index()
             )
+            if not station_df.empty:
+                station_wide = (
+                    station_df.pivot_table(
+                        index=["_STATION_NAME", "_BIAS_SYSTEM", "time"],
+                        columns="OBS_PAIR",
+                        values="ESTIMATEDVALUE",
+                        aggfunc="first",
+                    )
+                    .add_prefix("BIAS_")
+                )
             file_type = 'DSB'
 
         wide = wide.set_index(['sv', 'time'])
-        valid_systems = ('G', 'E')  # GPS, Galileo
-        wide = wide[wide.index.get_level_values('sv').str.startswith(valid_systems)]
+        valid_systems = ('G', 'E', 'C')  # GPS, Galileo, BeiDou
+        sv_index = wide.index.get_level_values('sv').astype(str)
+        keep = sv_index.str.startswith(valid_systems)
+        wide = wide[keep]
+        bias_availability: dict[str, set[str]] = {}
+        bias_pair_availability: dict[str, set[str]] = {}
+        sv_index = wide.index.get_level_values('sv').astype(str)
+        for system in valid_systems:
+            system_wide = wide[sv_index.str.startswith(system)]
+            if system_wide.empty:
+                continue
+            if file_type == "OSB":
+                bias_availability[system] = {
+                    col[4:]
+                    for col in system_wide.columns
+                    if col.startswith("OSB_") and system_wide[col].notna().any()
+                }
+            else:
+                bias_pair_availability[system] = {
+                    col[5:]
+                    for col in system_wide.columns
+                    if col.startswith("BIAS_") and system_wide[col].notna().any()
+                }
         wide.columns.name = None
+        if station_wide is not None:
+            station_wide.index = station_wide.index.set_names(["station", "system", "time"])
+            station_wide.columns.name = None
+            wide.attrs["station_bias_by_system"] = station_wide.fillna(0.0)
 
-        return wide.fillna(0.0), file_type
+        out = wide.fillna(0.0)
+        out.attrs.update(wide.attrs)
+        out.attrs["bias_observables_by_system"] = {
+            system: sorted(values) for system, values in bias_availability.items()
+        }
+        out.attrs["bias_pairs_by_system"] = {
+            system: sorted(values) for system, values in bias_pair_availability.items()
+        }
+        return out, file_type
 
     def process_observations2(self):
         (sta_name, ant_type, ant_cover, ant_h, approx_pos, pos_geod, interval, gps_obs, gal_obs,
@@ -374,17 +675,94 @@ class GNSSDataProcessor2:
 
         return info
 
+    @staticmethod
+    def _canonical_bias_sv(sv: object) -> str:
+        """Return the PRN used by product bias files, dropping adapter suffixes."""
+        return str(sv).split("_", 1)[0]
+
+    @staticmethod
+    def _infer_observation_system(df: pd.DataFrame) -> str | None:
+        if not isinstance(df.index, pd.MultiIndex) or "sv" not in df.index.names:
+            return None
+        for sv in df.index.get_level_values("sv").astype(str):
+            system = GNSSDataProcessor2._canonical_bias_sv(sv)[:1]
+            if system in {"G", "E", "C"}:
+                return system
+        return None
+
+    def _attach_dcb_to_observations(self, df: pd.DataFrame | None, dcb: pd.DataFrame | None) -> pd.DataFrame | None:
+        """Attach OSB/DSB columns, matching suffixed observation SV ids to product PRNs."""
+        if not isinstance(df, pd.DataFrame) or not isinstance(dcb, pd.DataFrame):
+            return df
+        report = df.attrs.get("gnx_adapter", {})
+        bias_ok = report.get("bias_eligibility", {}).get("attach_bia_in_load_obs_data", True)
+        if not bias_ok:
+            return df
+
+        left = df.reset_index()
+        left["_bias_sv"] = left["sv"].map(self._canonical_bias_sv)
+
+        if self.dcb_type == '30S':
+            right = dcb.reset_index().rename(columns={"sv": "_bias_sv"})
+            out = left.merge(right, on=["_bias_sv", "time"], how="left", sort=False)
+        elif self.dcb_type == '01D':
+            right = dcb.reset_index().rename(columns={"sv": "_bias_sv"}).drop(columns="time", errors="ignore")
+            right = right.drop_duplicates(subset=["_bias_sv"], keep="first")
+            out = left.merge(right, on="_bias_sv", how="left", sort=False)
+        else:
+            return df
+
+        out = out.drop(columns="_bias_sv", errors="ignore").set_index(["sv", "time"])
+        bias_cols = out.columns[out.columns.str.startswith(("OSB", "BIAS"))]
+        if len(bias_cols):
+            out.loc[:, bias_cols] = out.loc[:, bias_cols].fillna(0)
+        if self.station_name:
+            target_system = self._infer_observation_system(df)
+            station_bias_by_system = dcb.attrs.get("station_bias_by_system")
+            if isinstance(station_bias_by_system, pd.DataFrame) and not station_bias_by_system.empty:
+                station_bias = station_bias_by_system.reset_index()
+                station_bias = station_bias[
+                    station_bias["station"].astype(str).str.upper().eq(str(self.station_name).upper())
+                ]
+                if target_system is not None and "system" in station_bias.columns:
+                    station_bias = station_bias[station_bias["system"].astype(str).eq(target_system)]
+            else:
+                station_bias = dcb.reset_index()
+                station_bias = station_bias[
+                    station_bias["sv"].astype(str).str.upper().str.startswith(str(self.station_name).upper())
+                ]
+                if target_system is not None and "system" in station_bias.columns:
+                    station_bias = station_bias[station_bias["system"].astype(str).eq(target_system)]
+            station_bias_cols = [
+                col for col in station_bias.columns
+                if col.startswith(("OSB", "BIAS"))
+            ]
+            if not station_bias.empty and station_bias_cols:
+                station_values = pd.to_numeric(
+                    station_bias.iloc[0][station_bias_cols],
+                    errors="coerce",
+                ).fillna(0.0)
+                for col, value in station_values.items():
+                    out[f"STA_{col}"] = value
+        return out
+
     from pathlib import Path
 
     def load_and_filter(self, tlim=None, version=3.0):
         """
-        Faster load + filter for GPS/Galileo.
+        Faster load + filter for GPS/Galileo/BeiDou.
         Main speedups:
         - avoid df[cols].dropna(...) (double-copy); use one boolean mask
         - optionally build mask on minimal "critical" columns only
         - instantiate GFZRNX2 once
         """
-        results = {"G": None, "E": None}
+        results = {"G": None, "E": None, "C": None}
+        obs_rinex2 = self._is_rinex2_obs()
+        obs_info = self._get_obs_rinex_info()
+        obs_header = self._get_obs_header() if obs_rinex2 else None
+
+        if obs_rinex2 and any(sys_char != "G" for sys_char in self.sys):
+            raise ValueError("RINEX 2 MVP currently supports GPS-only observations.")
 
         # --- Helper: build deterministic output tab path ---
         def _tab_out_path(sys_char: str) -> str:
@@ -403,6 +781,8 @@ class GNSSDataProcessor2:
                 gfz = None
 
         def _load_sys(sys_char: str):
+            if obs_rinex2:
+                return gr.load(self.obs_path, use={sys_char}, tlim=tlim, fast=True).to_dataframe()
             # 1) try gfzrnx if requested and available
             if gfz is not None:
                 try:
@@ -446,12 +826,25 @@ class GNSSDataProcessor2:
             # one mask, then one slicing (usually faster + fewer copies than dropna)
             mask = sub.loc[:, mask_cols].notna().all(axis=1)
             # If mask is all False (weird files), return empty df with right columns
-            return sub.loc[mask]
+            filtered = sub.loc[mask]
+            filtered.attrs = dict(df.attrs)
+            return filtered
 
         # --- GPS ---
         if "G" in self.sys:
             try:
                 gps_df = _load_sys("G")
+                if obs_rinex2 and gps_df is not None and not gps_df.empty:
+                    gps_df = adapt_rinex2_gps_obs(
+                        gps_df,
+                        header=obs_header,
+                        rinex_info=obs_info,
+                        system="G",
+                        mode=self.mode,
+                        strict=True,
+                        bias_policy="safe",
+                        obs_path=self.obs_path,
+                    )
                 gps_obs_types = self.select_obs_types_gps(gps_df)
                 # fast_mask=True is usually faster and matches your "avoid NaN columns" intent
                 gps_df_filtered = _filter_df(gps_df, gps_obs_types, fast_mask=True)
@@ -468,6 +861,16 @@ class GNSSDataProcessor2:
                 results["E"] = gal_df_filtered
             except KeyError:
                 results["E"] = None
+
+        # --- BeiDou / BDS ---
+        if "C" in self.sys:
+            try:
+                bds_df = _load_sys("C")
+                bds_obs_types = self.select_obs_types_beidou(bds_df, self.beidou_modes)
+                bds_df_filtered = _filter_df(bds_df, bds_obs_types, fast_mask=True)
+                results["C"] = bds_df_filtered
+            except KeyError:
+                results["C"] = None
 
         return results
 
@@ -498,7 +901,7 @@ class GNSSDataProcessor2:
             c for c in cols
             if any(f in c for f in wanted_freqs)
                and not (c.startswith("D") or c.endswith("li"))
-               and len(c) >= 3
+               and len(c) >= 2
         ]
         if not selected_columns:
             return []
@@ -510,7 +913,8 @@ class GNSSDataProcessor2:
         # --- 3) Group by kind = col[:-1] ---
         by_kind = defaultdict(list)
         for c in selected_columns:
-            by_kind[c[:-1]].append(c)
+            kind = c if len(c) == 2 else c[:-1]
+            by_kind[kind].append(c)
 
         # Determine kind ordering (same as your freq_key idea)
         def freq_key(kind: str) -> int:
@@ -531,7 +935,11 @@ class GNSSDataProcessor2:
 
             chosen_col = None
 
-            if consistent_suffix and chosen_suffixes:
+            # Canonical internal slots like C1/L1 should win over suffixed variants.
+            if kind in kind_cols:
+                chosen_col = kind
+
+            if chosen_col is None and consistent_suffix and chosen_suffixes:
                 # Try already-chosen suffixes first, pick the candidate with max nn in that suffix.
                 for suf in chosen_suffixes:
                     candidates = [c for c in kind_cols if c.endswith(suf)]
@@ -553,8 +961,8 @@ class GNSSDataProcessor2:
 
             if chosen_col:
                 selected_types.append(chosen_col)
-                suf = chosen_col[-1]
-                if suf not in chosen_suffixes:
+                suf = "" if len(chosen_col) == 2 else chosen_col[-1]
+                if suf and suf not in chosen_suffixes:
                     chosen_suffixes.append(suf)
 
         return selected_types
@@ -647,9 +1055,51 @@ class GNSSDataProcessor2:
 
         return order_preserving_unique(selected_types)
 
+    def select_obs_types_beidou(self, dataframe, mode) -> List[str]:
+        """Select BeiDou RINEX 3/4 observables for a configured BDS signal mode.
+
+        BeiDou RINEX bands are intentionally handled through signal metadata:
+        B1I is C2/L2, B1C is C1/L1, B2a is C5/L5, B2I/B2b is C7/L7,
+        and B3I is C6/L6.
+        """
+        if dataframe is None:
+            return []
+        validate_mode_for_system(mode, "C")
+
+        cols = list(map(str, dataframe.columns))
+        selected: list[str] = []
+
+        def candidates(prefix: str) -> list[str]:
+            return [
+                c for c in cols
+                if c.startswith(prefix)
+                   and not c.startswith("D")
+                   and not c.endswith("li")
+            ]
+
+        def pick(prefix: str, priority: tuple[str, ...]) -> str | None:
+            cand = candidates(prefix)
+            if not cand:
+                return None
+            nn = dataframe[cand].notna().sum(axis=0)
+            for suffix in priority:
+                by_suffix = [c for c in cand if len(c) > len(prefix) and c[-1] == suffix]
+                if by_suffix:
+                    return max(by_suffix, key=lambda c: (int(nn[c]), c))
+            return max(cand, key=lambda c: (int(nn[c]), c))
+
+        for signal in mode_signals(mode):
+            spec = signal_spec(signal)
+            for prefix in (spec.code_prefix, spec.phase_prefix, "S" + spec.code_prefix[1:]):
+                chosen = pick(prefix, spec.suffix_priority)
+                if chosen is not None and chosen not in selected:
+                    selected.append(chosen)
+
+        return selected
+
     def obs_header_reader(self):
         path = self.obs_path
-        hdr = gr.rinexheader(path)
+        hdr = self._get_obs_header()
         if 'MARKER NAME' in hdr.keys():
             sta_name = hdr['MARKER NAME'].strip()
         else:
@@ -689,7 +1139,14 @@ class GNSSDataProcessor2:
         if 'fields' in hdr.keys():
 
             if isinstance(hdr['fields'], list):
-                gps_obs=gal_obs = hdr['fields']
+                if hdr.get('systems') == 'G':
+                    gps_obs, gal_obs, bds_obs = hdr['fields'], None, None
+                elif hdr.get('systems') == 'E':
+                    gps_obs, gal_obs, bds_obs = None, hdr['fields'], None
+                elif hdr.get('systems') == 'C':
+                    gps_obs, gal_obs, bds_obs = None, None, hdr['fields']
+                else:
+                    gps_obs = gal_obs = bds_obs = hdr['fields']
             else:
                 if 'G' in hdr['fields'].keys():
                     gps_obs = hdr['fields']['G']
@@ -699,9 +1156,15 @@ class GNSSDataProcessor2:
                     gal_obs = hdr['fields']['E']
                 else:
                     gal_obs = None
+                if 'C' in hdr['fields'].keys():
+                    bds_obs = hdr['fields']['C']
+                else:
+                    bds_obs = None
         else:
             gps_obs = None
             gal_obs = None
+            bds_obs = None
+        self._obs_fields_by_system = {"G": gps_obs, "E": gal_obs, "C": bds_obs}
 
         if 't0' in hdr.keys():
             time_of_first_obs = hdr['t0']
@@ -712,17 +1175,17 @@ class GNSSDataProcessor2:
         else:
             time_of_first_obs = None
 
-        if 'TIME OF LAST OBS3' in hdr.keys():
+        if 't1' in hdr.keys():
+            time_of_last_obs = hdr['t1']
+        elif 'TIME OF LAST OBS3' in hdr.keys():
             date_list = hdr['TIME OF LAST OBS3'].strip().split()[:-1]
             year, month, day, hour, minute, second = map(float, date_list)
             time_of_last_obs = datetime(int(year), int(month), int(day), int(hour), int(minute), int(second))
         else:
             time_of_last_obs = None
         if time_of_first_obs is None:
-            yr = int(self.obs_path.split('_')[-4][:4])
-            doy = int(self.obs_path.split('_')[-4][4:7])
-            time_of_first_obs = doy_to_datetime(year=yr,doy=doy)
-        if time_of_last_obs is None:
+            time_of_first_obs = self._parse_obs_start_from_filename()
+        if time_of_last_obs is None and time_of_first_obs is not None:
             time_of_last_obs = time_of_first_obs + timedelta(hours=24)
         if 'PRN / # OF OBS3' in hdr.keys():
             raw_data = hdr['PRN / # OF OBS3']
@@ -735,7 +1198,7 @@ class GNSSDataProcessor2:
 
             num_obs_dict = {}
             for sat_id, values in satellite_data.items():
-                if sat_id.startswith(('G', 'E')):
+                if sat_id.startswith(('G', 'E', 'C')):
                     num_obs_dict[sat_id] = {}
                     num_obs_dict[sat_id] = {f"{hdr['fields'][sat_id[:1]][i]}": values[i] for i in range(len(values))}
         else:
@@ -755,25 +1218,37 @@ class GNSSDataProcessor2:
         return sta_name, ant_type, ant_cover, ant_h, approx_pos, pos_geod, interval, gps_obs, gal_obs, time_of_first_obs, time_of_last_obs, phase_shift_dict, num_obs_dict
 
     def nav_header_reader(self):
-        hdr = gr.rinexheader(self.nav_path)
+        hdr = self._get_nav_header()
+        if {'ION ALPHA', 'ION BETA'}.issubset(hdr.keys()):
+            return hdr['ION ALPHA'], hdr['ION BETA'], None
         if 'IONOSPHERIC CORR' in hdr.keys():
-            if 'GPSA' and 'GPSB' in hdr['IONOSPHERIC CORR'].keys():
-                gpsa = hdr['IONOSPHERIC CORR']['GPSA']
-                gpsb = hdr['IONOSPHERIC CORR']['GPSB']
-            elif 'ION ALPHA' and 'ION BETA' in hdr['IONOSPHERIC CORR'].keys():
-                gpsa, gpsb = hdr['IONOSPHERIC CORR']['ION ALPHA'], hdr['IONOSPHERIC CORR']['ION BETA']
+            ion_corr = hdr['IONOSPHERIC CORR']
+            ion_keys = set(ion_corr.keys())
+            if {'GPSA', 'GPSB'}.issubset(ion_keys):
+                gpsa = ion_corr['GPSA']
+                gpsb = ion_corr['GPSB']
+            elif {'ION ALPHA', 'ION BETA'}.issubset(ion_keys):
+                gpsa, gpsb = ion_corr['ION ALPHA'], ion_corr['ION BETA']
             else:
                 gpsa = None
                 gpsb = None
 
-            if 'GAL' in hdr['IONOSPHERIC CORR'].keys():
-                gala = hdr['IONOSPHERIC CORR']['GAL']
+            if 'GAL' in ion_keys:
+                gala = ion_corr['GAL']
             else:
                 gala = None
             return gpsa, gpsb, gala
         else:
             print('No ionospheric coefficients for GPS and Galileo found in navigation file')
             return None, None, None
+
+    def nav_header_reader_bds(self):
+        """Read BeiDou broadcast ionospheric coefficients when present."""
+        hdr = self._get_nav_header()
+        ion_corr = hdr.get('IONOSPHERIC CORR', {})
+        if {'BDSA', 'BDSB'}.issubset(ion_corr.keys()):
+            return ion_corr['BDSA'], ion_corr['BDSB']
+        return None, None
 
     def receiver_pco(self, name, type):
         my_dict = defaultdict(dict)
@@ -889,24 +1364,6 @@ class GNSSDataProcessor2:
                 return df.index.get_level_values('sv').unique().tolist()
             return []
 
-        def _attach_dcb(df: pd.DataFrame | None, dcb: pd.DataFrame | None) -> pd.DataFrame | None:
-            """Adds DCB (OSB) to df according to self.dcb_type and fills missing OSBs with zeros."""
-            if not isinstance(df, pd.DataFrame) or not isinstance(dcb, pd.DataFrame):
-                return df
-
-            if self.dcb_type == '30S':
-                out = df.join(dcb, on=['sv', 'time'])
-            elif self.dcb_type == '01D':
-                tmp = dcb.reset_index().set_index('sv')
-                out = df.join(tmp, on='sv')
-            else:
-                out = df
-
-            osb_cols = out.columns[out.columns.str.startswith("OSB")]
-            if len(osb_cols):
-                out.loc[:, osb_cols] = out.loc[:, osb_cols].fillna(0)
-            return out
-
         def _assert_index(df: pd.DataFrame | None) -> pd.DataFrame | None:
             """Clears the 'time' column, if any, and checks the index."""
             if isinstance(df, pd.DataFrame):
@@ -916,18 +1373,11 @@ class GNSSDataProcessor2:
 
         # ------------------------------------------------------------------------
 
-        rinex_info = gr.rinexinfo(self.obs_path)
-        rinex_version = rinex_info['version']
-
-        try:
-            interval = float(gr.rinexheader(self.obs_path)['INTERVAL'].strip()) / 60
-        except KeyError:
-            interval = float(self.obs_path.split('_')[-2][:2]) / 60
-
         obs_dict = self.load_and_filter(tlim=tlim)
-        gps, gal = obs_dict.get('G'), obs_dict.get('E')
+        gps, gal, bds = obs_dict.get('G'), obs_dict.get('E'), obs_dict.get('C')
+        interval = self._resolve_obs_interval_minutes(gps, gal, bds)
 
-        gps_info  = self.process_observations2()
+        gps_info = self._apply_obs_meta_overrides(self.process_observations2(), gps, gal)
         time_of_first_obs = gps_info[-3]
         sta_name, sta_type, sta_cover = gps_info[0], gps_info[1], gps_info[2]
         xyz, flh = gps_info[4], gps_info[5]
@@ -943,23 +1393,27 @@ class GNSSDataProcessor2:
         if self.atx_path is not None:
             satellite_pco_g = self.read_pco_antex(system_code='G',date=time_of_first_obs)
             satellite_pco_e = self.read_pco_antex(system_code='E', date=time_of_first_obs)
-            satellite_pco = {**satellite_pco_e, **satellite_pco_g}
+            satellite_pco_c = self.read_pco_antex(system_code='C', date=time_of_first_obs)
+            satellite_pco = {**satellite_pco_e, **satellite_pco_g, **satellite_pco_c}
         else:
             satellite_pco = None
         # Satellite DCB
         if self.add_dcb:
-            dcb_df, _ = self.read_bia(path=self.dcb_path)
+            dcb_df = self._load_bias_products()
         else:
             dcb_df = None
-        gps = _attach_dcb(gps, dcb_df)
-        gal = _attach_dcb(gal, dcb_df)
+        gps = self._attach_dcb_to_observations(gps, dcb_df)
+        gal = self._attach_dcb_to_observations(gal, dcb_df)
+        bds = self._attach_dcb_to_observations(bds, dcb_df)
 
         gps = _assert_index(gps)
         gal = _assert_index(gal)
+        bds = _assert_index(bds)
 
         return ObsData(
             gps=gps,
             gal=gal,
+            bds=bds,
             sat_pco=satellite_pco,
             rec_pco=reciever_pco,
             meta=gps_info,
@@ -1043,38 +1497,317 @@ class GNSSDataProcessor2:
         df[prefix + "E5b_SHS"] = df[prefix + "E5b_SHS"].astype(cat)
         return df
 
+    @staticmethod
+    def _repair_galileo_bgd_transtime(data: pd.DataFrame, threshold: float = 1e-1) -> pd.DataFrame:
+        if data.empty or not {'BGDe5a', 'BGDe5b', 'TransTime'}.issubset(data.columns):
+            return data
+
+        repaired = data.copy()
+        invalid_e5a = repaired['BGDe5a'].abs() > threshold
+        invalid_e5b = repaired['BGDe5b'].abs() > threshold
+
+        # When exactly one BGD column carries a transmit-time-scale value, swap it back.
+        # Rows with both BGDs above threshold are ambiguous and should not be altered silently.
+        swap_e5a = invalid_e5a & ~invalid_e5b
+        swap_e5b = invalid_e5b & ~invalid_e5a
+
+        if swap_e5a.any():
+            original_trans = repaired.loc[swap_e5a, 'TransTime'].copy()
+            repaired.loc[swap_e5a, 'TransTime'] = repaired.loc[swap_e5a, 'BGDe5a'].to_numpy()
+            repaired.loc[swap_e5a, 'BGDe5a'] = original_trans.to_numpy()
+
+        if swap_e5b.any():
+            original_trans = repaired.loc[swap_e5b, 'TransTime'].copy()
+            repaired.loc[swap_e5b, 'TransTime'] = repaired.loc[swap_e5b, 'BGDe5b'].to_numpy()
+            repaired.loc[swap_e5b, 'BGDe5b'] = original_trans.to_numpy()
+
+        return repaired
+
+    @staticmethod
+    def _repair_beidou_nav_tail(data: pd.DataFrame) -> pd.DataFrame:
+        """Repair georinex BDS NAV tail shifts around SVacc/SatH1/TGD/TransTime.
+
+        Some mixed RINEX 3.04 BDS records are parsed with one optional spare
+        field present for only part of the constellation. georinex then exposes
+        rows where the tail fields are shifted, e.g. TGD2 contains TransTime or
+        AODC contains TransTime. That makes healthy messages look unhealthy and
+        causes SPP to select stale/future ephemerides.
+        """
+        needed = {"SVacc", "SatH1", "TGD1", "TGD2", "TransTime", "AODC"}
+        if data.empty or not needed.issubset(data.columns):
+            return data
+
+        repaired = data.copy()
+        small = 1e-5
+        sow_like = 1_000.0
+
+        # Pattern A: an extra spare1 value is present and the useful tail is
+        # shifted left from SVacc onward:
+        # spare1->SVacc, SVacc->SatH1, SatH1->TGD1, TGD1->TGD2,
+        # TGD2->TransTime, TransTime->AODC.
+        if "spare1" in repaired.columns:
+            shift_from_spare1 = (
+                repaired["spare1"].notna()
+                & repaired["TGD2"].abs().gt(sow_like)
+                & repaired["SatH1"].abs().lt(small)
+                & repaired["TGD1"].abs().lt(small)
+            )
+            if shift_from_spare1.any():
+                old = repaired.loc[
+                    shift_from_spare1,
+                    ["spare1", "SVacc", "SatH1", "TGD1", "TGD2", "TransTime"],
+                ].copy()
+                repaired.loc[shift_from_spare1, "SVacc"] = old["spare1"].to_numpy()
+                repaired.loc[shift_from_spare1, "SatH1"] = old["SVacc"].to_numpy()
+                repaired.loc[shift_from_spare1, "TGD1"] = old["SatH1"].to_numpy()
+                repaired.loc[shift_from_spare1, "TGD2"] = old["TGD1"].to_numpy()
+                repaired.loc[shift_from_spare1, "TransTime"] = old["TGD2"].to_numpy()
+                repaired.loc[shift_from_spare1, "AODC"] = old["TransTime"].to_numpy()
+
+        # Pattern B: no spare1 value was parsed, so the tail is shifted right:
+        # SatH1->SVacc, TGD1->SatH1, TGD2->TGD1, TransTime->TGD2,
+        # AODC->TransTime. AODC itself is absent in these rows and is not used
+        # in SPP, so set it to zero after moving TransTime back.
+        shift_from_aodc = (
+            repaired["AODC"].abs().gt(sow_like)
+            & repaired["TransTime"].abs().lt(small)
+            & repaired["TGD2"].abs().lt(small)
+        )
+        if shift_from_aodc.any():
+            old = repaired.loc[
+                shift_from_aodc,
+                ["SatH1", "TGD1", "TGD2", "TransTime", "AODC"],
+            ].copy()
+            repaired.loc[shift_from_aodc, "SVacc"] = old["SatH1"].to_numpy()
+            repaired.loc[shift_from_aodc, "SatH1"] = old["TGD1"].to_numpy()
+            repaired.loc[shift_from_aodc, "TGD1"] = old["TGD2"].to_numpy()
+            repaired.loc[shift_from_aodc, "TGD2"] = old["TransTime"].to_numpy()
+            repaired.loc[shift_from_aodc, "TransTime"] = old["AODC"].to_numpy()
+            repaired.loc[shift_from_aodc, "AODC"] = 0.0
+
+        return repaired
+
+    @staticmethod
+    def _rinex_nav_float_fields(line: str, start: int = 4, count: int = 4) -> list[float]:
+        out: list[float] = []
+        padded = line.rstrip("\n").ljust(start + 19 * count)
+        for i in range(count):
+            field = padded[start + 19 * i:start + 19 * (i + 1)].strip()
+            if not field:
+                out.append(np.nan)
+                continue
+            try:
+                out.append(float(field.replace("D", "E").replace("d", "e")))
+            except ValueError:
+                out.append(np.nan)
+        return out
+
+    @staticmethod
+    def _rinex4_clock_line(line: str) -> tuple[str, pd.Timestamp, list[float]]:
+        sv = line[:3].strip()
+        year = int(line[4:8])
+        month = int(line[9:11])
+        day = int(line[12:14])
+        hour = int(line[15:17])
+        minute = int(line[18:20])
+        second = float(line[21:23])
+        sec_int = int(second)
+        microsecond = int(round((second - sec_int) * 1_000_000))
+        epoch = pd.Timestamp(datetime(year, month, day, hour, minute, sec_int, microsecond))
+        return sv, epoch, GNSSDataProcessor2._rinex_nav_float_fields(line, start=23, count=3)
+
+    @staticmethod
+    def _rinex4_record_lines(path: str | Path):
+        in_header = True
+        current_header: str | None = None
+        current_lines: list[str] = []
+        with open(path, "r", encoding="ascii", errors="ignore") as stream:
+            for line in stream:
+                if in_header:
+                    if "END OF HEADER" in line:
+                        in_header = False
+                    continue
+                if line.startswith(">"):
+                    if current_header is not None:
+                        yield current_header, current_lines
+                    current_header = line.rstrip("\n")
+                    current_lines = []
+                else:
+                    current_lines.append(line.rstrip("\n"))
+        if current_header is not None:
+            yield current_header, current_lines
+
+    def _parse_rinex4_bds_eph_record(self, header: str, lines: list[str]) -> dict | None:
+        parts = header.split()
+        if len(parts) < 4 or parts[1] != "EPH" or not parts[2].startswith("C"):
+            return None
+        message_type = parts[3]
+        if message_type not in {"D1", "D2", "CNV1", "CNV2", "CNV3"} or not lines:
+            return None
+
+        sv, epoch, clock = self._rinex4_clock_line(lines[0])
+        data_lines = [self._rinex_nav_float_fields(line) for line in lines[1:]]
+        row: dict[str, object] = {
+            "sv": sv,
+            "time": epoch,
+            "nav_message": message_type,
+            "SVclockBias": clock[0],
+            "SVclockDrift": clock[1],
+            "SVclockDriftRate": clock[2],
+        }
+
+        if message_type in {"D1", "D2"}:
+            vals = [value for fields in data_lines for value in fields]
+            names = [
+                "AODE", "Crs", "DeltaN", "M0",
+                "Cuc", "Eccentricity", "Cus", "sqrtA",
+                "Toe", "Cic", "Omega0", "Cis",
+                "Io", "Crc", "omega", "OmegaDot",
+                "IDOT", "spare0", "BDTWeek", "spare1",
+                "SVacc", "SatH1", "TGD1", "TGD2",
+                "TransTime", "AODC", "spare2", "spare3",
+            ]
+            row.update({name: vals[i] if i < len(vals) else np.nan for i, name in enumerate(names)})
+            row["health"] = row.get("SatH1")
+            return row
+
+        if len(data_lines) < 7:
+            return None
+        orbit1, orbit2, orbit3, orbit4, orbit5, orbit6 = data_lines[:6]
+        row.update(
+            {
+                "ADot": orbit1[0],
+                "Crs": orbit1[1],
+                "DeltaN": orbit1[2],
+                "M0": orbit1[3],
+                "Cuc": orbit2[0],
+                "Eccentricity": orbit2[1],
+                "Cus": orbit2[2],
+                "sqrtA": orbit2[3],
+                "Toe": orbit3[0],
+                "Cic": orbit3[1],
+                "Omega0": orbit3[2],
+                "Cis": orbit3[3],
+                "Io": orbit4[0],
+                "Crc": orbit4[1],
+                "omega": orbit4[2],
+                "OmegaDot": orbit4[3],
+                "IDOT": orbit5[0],
+                "DeltaNdot": orbit5[1],
+                "SatType": orbit5[2],
+                "Top": orbit5[3],
+                "SISAI_oe": orbit6[0],
+                "SISAI_ocb": orbit6[1],
+                "SISAI_oc1": orbit6[2],
+                "SISAI_oc2": orbit6[3],
+                # Compatibility fields used by the existing BDS propagator.
+                "AODE": 0.0,
+                "spare0": orbit5[1],
+                "BDTWeek": 0.0,
+                "SVacc": orbit6[0],
+                "TGD1": 0.0,
+                "TGD2": 0.0,
+            }
+        )
+
+        if message_type in {"CNV1", "CNV2"}:
+            if len(data_lines) < 9:
+                return None
+            orbit7, orbit8, orbit9 = data_lines[6], data_lines[7], data_lines[8]
+            if message_type == "CNV1":
+                row["ISC_B1Cd"] = orbit7[0]
+                row["TGD_B1Cp"] = orbit7[2]
+                row["TGD_B2ap"] = orbit7[3]
+            else:
+                row["ISC_B2ad"] = orbit7[1]
+                row["TGD_B1Cp"] = orbit7[2]
+                row["TGD_B2ap"] = orbit7[3]
+            row.update(
+                {
+                    "SISMAI": orbit8[0],
+                    "SatH1": orbit8[1],
+                    "IntegrityFlags": orbit8[2],
+                    "AODC": orbit8[3],
+                    "IODC": orbit8[3],
+                    "TransTime": orbit9[0],
+                    "IODE": orbit9[3],
+                    "AODE": orbit9[3],
+                    "health": orbit8[1],
+                }
+            )
+            return row
+
+        orbit7 = data_lines[6]
+        orbit8 = data_lines[7] if len(data_lines) > 7 else [np.nan, np.nan, np.nan, np.nan]
+        row.update(
+            {
+                "SISMAI": orbit7[0],
+                "SatH1": orbit7[1],
+                "IntegrityFlags": orbit7[2],
+                "TGD_B2bI": orbit7[3],
+                "TransTime": orbit8[0],
+                "AODC": 0.0,
+                "IODC": 0.0,
+                "IODE": 0.0,
+                "AODE": 0.0,
+                "health": orbit7[1],
+            }
+        )
+        return row
+
+    def _load_rinex4_bds_nav(self, tlim=None) -> pd.DataFrame:
+        rows: list[dict] = []
+        for header, lines in self._rinex4_record_lines(self.nav_path):
+            row = self._parse_rinex4_bds_eph_record(header, lines)
+            if row is not None:
+                rows.append(row)
+        if not rows:
+            return pd.DataFrame(index=pd.MultiIndex.from_arrays([[], []], names=["sv", "time"]))
+
+        out = pd.DataFrame(rows)
+        if tlim is not None:
+            start, end = pd.Timestamp(tlim[0]), pd.Timestamp(tlim[1])
+            out = out[(out["time"] >= start) & (out["time"] <= end)]
+        if out.empty:
+            return pd.DataFrame(index=pd.MultiIndex.from_arrays([[], []], names=["sv", "time"]))
+
+        out = out.set_index(["sv", "time"]).sort_index()
+        out.attrs["rinex_version"] = self._get_nav_rinex_info().get("version")
+        out.attrs["rinex4_bds_message_types"] = sorted(out["nav_message"].dropna().unique().tolist())
+        return out
+
     def load_broadcast_orbit(self, tlim=None):
         gpsa, gpsb, gala = self.nav_header_reader()
+        bdsa, bdsb = self.nav_header_reader_bds() if 'C' in self.sys else (None, None)
+        nav_rinex2 = self._is_rinex2_nav() if 'G' in self.sys else False
+        nav_info = self._get_nav_rinex_info() if nav_rinex2 else {}
+        nav_header = self._get_nav_header() if nav_rinex2 else None
+        if nav_rinex2 and any(sys_char != "G" for sys_char in self.sys):
+            raise ValueError("RINEX 2 MVP currently supports GPS-only navigation.")
         if 'G' in self.sys:
             gps_orb = gr.load(rinexfn=self.nav_path,
                               use={'G'},
                               tlim=tlim).dropna(dim='time', how='all').to_dataframe().dropna(how='all')
-            gps_orb = gps_orb.swaplevel()
+            if nav_rinex2 and not gps_orb.empty:
+                gps_orb = adapt_rinex2_gps_nav(
+                    gps_orb,
+                    header=nav_header,
+                    rinex_info=nav_info,
+                    system='G',
+                    strict=True,
+                    nav_path=self.nav_path,
+                )
+            else:
+                gps_orb = gps_orb.swaplevel()
         else:
             gps_orb = None
         if 'E' in self.sys:
+            gal_orb = None
             try:
                 gal_orb = gr.load(rinexfn=self.nav_path,
                                   use={'E'},
                                   tlim=tlim).dropna(dim='time', how='all').to_dataframe().dropna(how='all')
-                # mixed columns between BGD and trans time - seems like georinex error
-                # --- TEMP FIX:
-                data = gal_orb.copy()
-                threshold = 1e-1
-                swapped_rows = (data['BGDe5a'] > threshold) | (data['BGDe5b'] > threshold )
-
-                for idx in data.index[swapped_rows]:
-                    if data.loc[idx, 'BGDe5a'] > threshold:
-                        # Swap BGDe5a with TransTime
-                        data.loc[idx, 'TransTime'], data.loc[idx, 'BGDe5a'] = data.loc[idx, 'BGDe5a'], data.loc[
-                            idx, 'TransTime']
-                    if data.loc[idx, 'BGDe5b'] > threshold:
-                        # Swap BGDe5b with TransTime
-                        data.loc[idx, 'TransTime'], data.loc[idx, 'BGDe5b'] = data.loc[idx, 'BGDe5b'], data.loc[
-                            idx, 'TransTime']
-                gal_orb = data.copy()
-                # --- END OF TEMP FIX
-
+                gal_orb = self._repair_galileo_bgd_transtime(gal_orb)
                 gal_orb = self.interpret_data_src(df=gal_orb)
                 gal_orb = self.add_galileo_health_cols(df=gal_orb)
                 gal_orb = gal_orb.swaplevel()
@@ -1082,9 +1815,30 @@ class GNSSDataProcessor2:
                 traceback.print_exc()
         else:
             gal_orb = None
+        if 'C' in self.sys:
+            bds_orb = None
+            try:
+                if self._is_rinex4_nav():
+                    bds_orb = self._load_rinex4_bds_nav(tlim=tlim)
+                else:
+                    bds_orb = gr.load(rinexfn=self.nav_path,
+                                      use={'C'},
+                                      tlim=tlim).dropna(dim='time', how='all').to_dataframe().dropna(how='all')
+                if not bds_orb.empty:
+                    if not self._is_rinex4_nav():
+                        bds_orb = self._repair_beidou_nav_tail(bds_orb)
+                        bds_orb = bds_orb.swaplevel()
+                    if 'SatH1' in bds_orb.columns and 'health' not in bds_orb.columns:
+                        bds_orb['health'] = bds_orb['SatH1']
+            except Exception:
+                traceback.print_exc()
+        else:
+            bds_orb = None
         return OrbitData(gps_orb=gps_orb,
                          gal_orb=gal_orb,
-                         gpsa=gpsa, gpsb=gpsb, gala=gala)
+                         bds_orb=bds_orb,
+                         gpsa=gpsa, gpsb=gpsb, gala=gala,
+                         bdsa=bdsa, bdsb=bdsb)
 
     def screen_navigation_message(self, broadcast_df: pd.DataFrame, system: str):
         """
@@ -1095,7 +1849,7 @@ class GNSSDataProcessor2:
                 broadcast_df – MultiIndex (time, sv) + columns E5a_DVS, E5a_SHS, E5b_DVS, E5b_SHS
                 sys       – 'G' (GPS) or 'E' (Galileo)
                 """
-        if system == 'G': # GPS
+        if system in {'G', 'C'}: # GPS / BeiDou
             unhealthy = []
             if broadcast_df is not None:
                 for sv, g in broadcast_df.groupby('sv'):
@@ -1137,6 +1891,7 @@ class GNSSDataProcessor2:
                      system: str,
                      outage_info,
                      gps_span: pd.Timedelta = pd.Timedelta('2h'),
+                     bds_span: pd.Timedelta = pd.Timedelta('2h'),
                      gal_span: pd.Timedelta = pd.Timedelta('10min')) -> pd.DataFrame:
         """
                 Returns a copy of obs_df with additional outage columns.
@@ -1149,20 +1904,22 @@ class GNSSDataProcessor2:
         obs = obs_df.reset_index().sort_values('time')
 
         # ------------------------------------------------------------------ GPS
-        if system.upper() == 'G':
+        if system.upper() in {'G', 'C'}:
+            outage_col = 'gps_outage' if system.upper() == 'G' else 'bds_outage'
+            span = gps_span if system.upper() == 'G' else bds_span
             # --> long‑form: time, sv
             rows = [{'time': t, 'sv': sv} for sv, ts in outage_info for t in ts]
             if not rows:
-                obs_df['gps_outage'] = False
+                obs_df[outage_col] = False
                 return obs_df
             bad = (pd.DataFrame(rows)
                    .sort_values('time')
                    .assign(dummy=True))
 
             merged = pd.merge_asof(obs, bad, on='time', by='sv',
-                                   direction='backward', tolerance=gps_span)
+                                   direction='backward', tolerance=span)
             obs_df = obs_df.copy()
-            obs_df['gps_outage'] = merged['dummy'].notna().to_numpy()
+            obs_df[outage_col] = merged['dummy'].notna().to_numpy()
             return obs_df
 
         # -------------------------------------------------------------- GALILEO
@@ -1219,7 +1976,7 @@ def parse_sinex(sinex_path):
     return sinex
 
 
-def read_sp3(path: str, sys=('G','E')) -> pd.DataFrame:
+def read_sp3(path: str, sys=('G','E','C')) -> pd.DataFrame:
     """
         Input
         -------
@@ -1230,9 +1987,16 @@ def read_sp3(path: str, sys=('G','E')) -> pd.DataFrame:
         MultiIndex (time, sv)
         columns:   x, y, z, clock, dclock, sat, toc, epoch
         """
+    empty = pd.DataFrame(
+        columns=['x', 'y', 'z', 'clk', 'dclk', 'sat', 'toc', 'epoch'],
+        index=pd.MultiIndex.from_arrays([[], []], names=['time', 'sv']),
+    )
+
     df = gr.load_sp3(path, outfn=None).to_dataframe()
     df['sat'] = df.index.get_level_values('sv').tolist()
     df = df[df['sat'].str.startswith(sys)]
+    if df.empty:
+        return empty
     df['epoch'] = df.index.get_level_values('time')
     df['toc'] = datetime2toc(df['epoch'].tolist())
     # --- 1.   (x, y, z)  -------------------------------

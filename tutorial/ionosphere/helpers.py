@@ -1,13 +1,26 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-import seaborn as sns
+try:
+    import seaborn as sns
+except ImportError:  # pragma: no cover - tutorial convenience fallback
+    sns = None
 # Styl publikacyjny
-sns.set_context("paper", font_scale=1.3)
-sns.set_style("ticks")
+if sns is not None:
+    sns.set_context("paper", font_scale=1.3)
+    sns.set_style("ticks")
 mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['font.family'] = 'serif'
 mpl.rcParams['font.serif'] = ['Times New Roman']
+
+
+def _show_or_close(fig):
+    """Show figures interactively, but stay quiet during headless validation."""
+    if "agg" in mpl.get_backend().lower():
+        fig.canvas.draw()
+        plt.close(fig)
+    else:
+        plt.show()
 
 def plot_stec_change(
     rx_xy=(0.0, 0.0),
@@ -87,7 +100,8 @@ def plot_stec_change(
         "Figure 1. Visualization of STEC change between t0 and t1.",
         ha='center', fontsize=11
     )
-    plt.show()
+    _show_or_close(fig)
+    return fig
 
 
 import numpy as np
@@ -341,4 +355,5 @@ def plot_gix_two_points(
         "Figure 2. Visualization of TEC gradient between pair of IPPs.",
         ha='center', fontsize=11
     )
-    plt.show()
+    _show_or_close(fig)
+    return fig

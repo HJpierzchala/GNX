@@ -12,6 +12,14 @@ from .coordinates import BroadcastInterp, lagrange_emission_interp, lagrange_rec
 from .io import GNSSDataProcessor2, read_sp3, parse_sinex
 from . import DDPreprocessing
 from .session_errors import guarded_session_run
+from .biases import bias_column_m, osb_m
+from .gnss import (
+    CLIGHT,
+    frequency_hz,
+    mode_ionosphere_free_coefficients,
+    mode_signals,
+    signal_spec,
+)
 
 
 @dataclass(slots=True)
@@ -20,6 +28,7 @@ class SPPResult:
     solution: Union["pd.DataFrame",None]  =None
     residuals_gps: Union["pd.DataFrame",None] = None
     residuals_gal: Union["pd.DataFrame",None] = None
+    residuals_bds: Union["pd.DataFrame",None] = None
     covariance_info: Union["pd.DataFrame",None] = None
 
     # Convenience exporters --------------------------------------------------
@@ -32,22 +41,30 @@ class SPPResult:
 class SPPConfig(Config):
     trace_filter: Optional[bool] = False
     solver: Literal["LS"] ="LS"
+    spp_residual_rejection: bool = True
+    spp_residual_rejection_threshold_m: float = 8.0
+    spp_residual_rejection_max_iter: int = 3
+    spp_bds_low_redundancy_max_jump_m: Optional[float] = 30.0
 
 
 
 class SinglePointPositioning:
 
     def __init__(self, config, gps_obs: pd.DataFrame, gal_obs: Union[pd.DataFrame, None], gps_mode, gal_mode,
-                 solver='LSQ', xyz_apr=np.zeros(3)):
+                 solver='LSQ', xyz_apr=np.zeros(3), bds_obs: Union[pd.DataFrame, None] = None,
+                 bds_mode: Optional[str] = None):
         self.config = config
         self.gps_obs = gps_obs
         self.gal_obs = gal_obs
+        self.bds_obs = bds_obs
         self.gps_mode = gps_mode
         self.gal_mode = gal_mode
+        self.bds_mode = bds_mode
         self.solver = solver
-        self.FREQ_DICT = {'L1': 1575.42e06, 'E1': 1575.42e06,
-                          'L2': 1227.60e06, 'E5a': 1176.45e06,
-                          'L5': 1176.450e06, 'E5b': 1207.14e06}
+        self.FREQ_DICT = {
+            signal: frequency_hz(signal)
+            for signal in ('L1', 'L2', 'L5', 'E1', 'E5a', 'E5b', 'B1I', 'B1C', 'B2a', 'B2I', 'B2b', 'B3I')
+        }
         self.xyz_apr = xyz_apr
         self._if_coeff = {
             'L1L2': self._iono_free_coeff('L1', 'L2'),
@@ -85,6 +102,117 @@ class SinglePointPositioning:
                 return df[ncol].to_numpy(dtype='float64', copy=False)
         return np.zeros(n, dtype='float64')
 
+    @staticmethod
+    def _preferred_signal_col(columns: pd.Index, signal: str, kind: Literal["code", "phase"]) -> Optional[str]:
+        spec = signal_spec(signal)
+        prefix = spec.code_prefix if kind == "code" else spec.phase_prefix
+        for suffix in spec.suffix_priority:
+            col = f"{prefix}{suffix}"
+            if col in columns:
+                return col
+        for col in columns:
+            if col.startswith(prefix):
+                return col
+        return None
+
+    @staticmethod
+    def _bds_tgd_column(signal: str) -> Optional[str]:
+        if signal == "B1I":
+            return "TGD1"
+        if signal == "B2I":
+            return "TGD2"
+        return None
+
+    @staticmethod
+    def _bias_col_m(epoch: pd.DataFrame, column: str, n: int) -> Optional[np.ndarray]:
+        return bias_column_m(epoch, column, n)
+
+    def _code_osb_correction_m(self, epoch: pd.DataFrame, code_col: str, n: int) -> np.ndarray:
+        if getattr(self.config, "orbit_type", None) != "precise":
+            return np.zeros(n, dtype='float64')
+        return -osb_m(epoch, code_col, n)
+
+    @classmethod
+    def _dcb_between_m(cls, epoch: pd.DataFrame, obs_a: str, obs_b: str, n: int) -> Optional[np.ndarray]:
+        if obs_a == obs_b:
+            return np.zeros(n, dtype='float64')
+
+        direct = cls._bias_col_m(epoch, f"BIAS_{obs_a}_{obs_b}", n)
+        if direct is not None:
+            return direct
+
+        reverse = cls._bias_col_m(epoch, f"BIAS_{obs_b}_{obs_a}", n)
+        if reverse is not None:
+            return -reverse
+
+        return None
+
+    @staticmethod
+    def _bds_reference_codes(code_col: str) -> Optional[tuple[str, str]]:
+        if code_col in {"C2I", "C6I", "C7I"}:
+            return "C2I", "C6I"
+        if code_col.startswith("C1"):
+            suffix = code_col[-1]
+            return code_col, f"C5{suffix}"
+        if code_col.startswith("C5"):
+            suffix = code_col[-1]
+            return f"C1{suffix}", code_col
+        if code_col.startswith("C7"):
+            suffix = code_col[-1]
+            if suffix == "Z":
+                return "C1X", code_col
+            return f"C1{suffix}", f"C5{suffix}"
+        return None
+
+    @classmethod
+    def _bds_precise_clock_bias_correction_m(
+        cls,
+        epoch: pd.DataFrame,
+        weighted_codes: list[tuple[str, float]],
+        n: int,
+    ) -> np.ndarray:
+        """Return code-bias correction needed when precise BDS clocks are used.
+
+        CODE/CAS MGEX BDS precise clocks are tied to a reference code combination.
+        Raw single-frequency BDS codes must be shifted to that reference. When
+        absolute OSBs for the selected observation are available they are used
+        directly; otherwise DSBs are used to translate the selected BDS code
+        combination to the clock reference combination.
+        """
+        if not weighted_codes:
+            return np.zeros(n, dtype='float64')
+
+        osb_terms = []
+        all_osb_available = True
+        for code_col, coeff in weighted_codes:
+            osb = cls._bias_col_m(epoch, f"OSB_{code_col}", n)
+            if osb is None:
+                all_osb_available = False
+                break
+            osb_terms.append(coeff * osb)
+        if all_osb_available:
+            return -np.sum(osb_terms, axis=0)
+
+        ref = cls._bds_reference_codes(weighted_codes[0][0])
+        if ref is None:
+            return np.zeros(n, dtype='float64')
+
+        anchor, ref_second = ref
+        ref_sig1 = signal_spec("B1C" if anchor.startswith("C1") else "B1I").name
+        ref_sig2 = signal_spec("B2a" if ref_second.startswith("C5") else "B3I").name
+        _, k_ref_second = mode_ionosphere_free_coefficients(ref_sig1 + ref_sig2)
+
+        ref_dcb = cls._dcb_between_m(epoch, anchor, ref_second, n)
+        if ref_dcb is None:
+            return np.zeros(n, dtype='float64')
+
+        corr = k_ref_second * ref_dcb
+        for code_col, coeff in weighted_codes:
+            dcb = cls._dcb_between_m(epoch, anchor, code_col, n)
+            if dcb is not None:
+                corr = corr + coeff * dcb
+        return corr
+
     def _build_obs_base(self, epoch: Optional[pd.DataFrame], system: str, mode: Optional[str]) -> Optional[np.ndarray]:
         if epoch is None or len(epoch) == 0 or mode is None:
             return None
@@ -105,7 +233,8 @@ class SinglePointPositioning:
                 clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
                 TGD_s = self._first_existing_or_zeros(epoch, ['TGD'], n)
                 pco_l1 = self._first_existing_or_zeros(epoch, ['pco_los_l1'], n)
-                return P - tro - ion - dprel + C * (clk_s - TGD_s) + pco_l1
+                bias_corr = self._code_osb_correction_m(epoch, c1, n)
+                return P + bias_corr - tro - ion - dprel + C * (clk_s - TGD_s) + pco_l1
             if mode == 'L2':
                 c1 = self._first_matching_col(cols, ['C2W', 'C2X', 'C2', 'C2P'])
                 if c1 is None:
@@ -117,7 +246,8 @@ class SinglePointPositioning:
                 clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
                 TGD_s = self._first_existing_or_zeros(epoch, ['TGD'], n)
                 pco_l2 = self._first_existing_or_zeros(epoch, ['pco_los_l2'], n)
-                return P - tro - ion - dprel + C * (clk_s - TGD_s) + pco_l2
+                bias_corr = self._code_osb_correction_m(epoch, c1, n)
+                return P + bias_corr - tro - ion - dprel + C * (clk_s - TGD_s) + pco_l2
             if mode == 'L5':
                 c1 = self._first_matching_col(cols, ['C5X', 'C5'])
                 if c1 is None:
@@ -129,7 +259,8 @@ class SinglePointPositioning:
                 clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
                 TGD_s = self._first_existing_or_zeros(epoch, ['TGD'], n)
                 pco_l5 = self._first_existing_or_zeros(epoch, ['pco_los_l5'], n)
-                return P - tro - ion - dprel + C * (clk_s - TGD_s) + pco_l5
+                bias_corr = self._code_osb_correction_m(epoch, c1, n)
+                return P + bias_corr - tro - ion - dprel + C * (clk_s - TGD_s) + pco_l5
             if mode == 'L1L2':
                 c1 = self._first_matching_col(cols, ['C1C', 'C1W', 'C1', 'C1P'])
                 c2 = self._first_matching_col(cols, ['C2W', 'C2L', 'C2P', 'C2'])
@@ -144,7 +275,8 @@ class SinglePointPositioning:
                 pco_l1 = self._first_existing_or_zeros(epoch, ['pco_los_l1'], n)
                 pco_l2 = self._first_existing_or_zeros(epoch, ['pco_los_l2'], n)
                 pco = (k1 * pco_l1 - k2 * pco_l2)
-                return (k1 * P1 - k2 * P2) + C * clk_s - tro - dprel + pco
+                bias_corr = k1 * self._code_osb_correction_m(epoch, c1, n) - k2 * self._code_osb_correction_m(epoch, c2, n)
+                return (k1 * P1 - k2 * P2) + bias_corr + C * clk_s - tro - dprel + pco
             if mode == 'L1L5':
                 c1 = self._first_matching_col(cols, ['C1'])
                 c2 = self._first_matching_col(cols, ['C5'])
@@ -159,7 +291,8 @@ class SinglePointPositioning:
                 pco_l1 = self._first_existing_or_zeros(epoch, ['pco_los_l1'], n)
                 pco_l5 = self._first_existing_or_zeros(epoch, ['pco_los_l5'], n)
                 pco = (k1 * pco_l1 - k2 * pco_l5)
-                return (k1 * P1 - k2 * P2) + C * clk_s - tro - dprel + pco
+                bias_corr = k1 * self._code_osb_correction_m(epoch, c1, n) - k2 * self._code_osb_correction_m(epoch, c2, n)
+                return (k1 * P1 - k2 * P2) + bias_corr + C * clk_s - tro - dprel + pco
             if mode == 'L2L5':
                 c1 = self._first_matching_col(cols, ['C2'])
                 c2 = self._first_matching_col(cols, ['C5'])
@@ -174,7 +307,8 @@ class SinglePointPositioning:
                 pco_l2 = self._first_existing_or_zeros(epoch, ['pco_los_l2'], n)
                 pco_l5 = self._first_existing_or_zeros(epoch, ['pco_los_l5'], n)
                 pco = (k1 * pco_l2 - k2 * pco_l5)
-                return (k1 * P1 - k2 * P2) + C * clk_s - tro - dprel + pco
+                bias_corr = k1 * self._code_osb_correction_m(epoch, c1, n) - k2 * self._code_osb_correction_m(epoch, c2, n)
+                return (k1 * P1 - k2 * P2) + bias_corr + C * clk_s - tro - dprel + pco
             raise ValueError(f"Unknown gps_mode: {mode}")
 
         if system == 'E':
@@ -192,7 +326,8 @@ class SinglePointPositioning:
                 BGD_s = self._first_existing_or_zeros(
                     epoch, ['BGD', 'BGDe5a', 'BGDe5b', 'BGD_E1E5a', 'BGD_E1E5b'], n
                 )
-                return P - tro - ion - dprel + C * (clk_s - BGD_s)
+                bias_corr = self._code_osb_correction_m(epoch, c1, n)
+                return P + bias_corr - tro - ion - dprel + C * (clk_s - BGD_s)
             if mode == 'E5a':
                 c1 = self._first_matching_col(cols, ['C5Q', 'C5X', 'C5'])
                 if c1 is None:
@@ -203,7 +338,8 @@ class SinglePointPositioning:
                 dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
                 clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
                 BGD_s = self._first_existing_or_zeros(epoch, ['BGDe5a'], n)
-                return P - tro - ion - dprel + C * (clk_s - BGD_s)
+                bias_corr = self._code_osb_correction_m(epoch, c1, n)
+                return P + bias_corr - tro - ion - dprel + C * (clk_s - BGD_s)
             if mode == 'E5b':
                 c1 = self._first_matching_col(cols, ['C7'])
                 if c1 is None:
@@ -214,7 +350,8 @@ class SinglePointPositioning:
                 dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
                 clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
                 BGD_s = self._first_existing_or_zeros(epoch, ['BGDe5b'], n)
-                return P - tro - ion - dprel + C * (clk_s - BGD_s)
+                bias_corr = self._code_osb_correction_m(epoch, c1, n)
+                return P + bias_corr - tro - ion - dprel + C * (clk_s - BGD_s)
             if mode == 'E1E5a':
                 c1 = self._first_matching_col(cols, ['C1C', 'C1X', 'C1W', 'C1'])
                 c5 = self._first_matching_col(cols, ['C5Q', 'C5X', 'C5', 'C5A'])
@@ -226,7 +363,8 @@ class SinglePointPositioning:
                 tro = self._first_existing_or_zeros(epoch, ['tro'], n)
                 dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
                 clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
-                return (k1 * P1 - k2 * P5) + C * clk_s - tro - dprel
+                bias_corr = k1 * self._code_osb_correction_m(epoch, c1, n) - k2 * self._code_osb_correction_m(epoch, c5, n)
+                return (k1 * P1 - k2 * P5) + bias_corr + C * clk_s - tro - dprel
             if mode == 'E1E5b':
                 c1 = self._first_matching_col(cols, ['C1C', 'C1X', 'C1W', 'C1'])
                 c5 = self._first_matching_col(cols, ['C7Q', 'C7X', 'C7'])
@@ -238,7 +376,8 @@ class SinglePointPositioning:
                 tro = self._first_existing_or_zeros(epoch, ['tro'], n)
                 dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
                 clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
-                return (k1 * P1 - k2 * P5) + C * clk_s - tro - dprel
+                bias_corr = k1 * self._code_osb_correction_m(epoch, c1, n) - k2 * self._code_osb_correction_m(epoch, c5, n)
+                return (k1 * P1 - k2 * P5) + bias_corr + C * clk_s - tro - dprel
             if mode == 'E5aE5b':
                 c1 = self._first_matching_col(cols, ['C5'])
                 c5 = self._first_matching_col(cols, ['C7'])
@@ -250,13 +389,70 @@ class SinglePointPositioning:
                 tro = self._first_existing_or_zeros(epoch, ['tro'], n)
                 dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
                 clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
-                return (k1 * P1 - k2 * P5) + C * clk_s - tro - dprel
+                bias_corr = k1 * self._code_osb_correction_m(epoch, c1, n) - k2 * self._code_osb_correction_m(epoch, c5, n)
+                return (k1 * P1 - k2 * P5) + bias_corr + C * clk_s - tro - dprel
             raise ValueError(f"Unknown gal_mode: {mode}")
+
+        if system == 'C':
+            signals = mode_signals(mode)
+            tro = self._first_existing_or_zeros(epoch, ['tro'], n)
+            ion = self._first_existing_or_zeros(epoch, ['ion'], n)
+            dprel = self._first_existing_or_zeros(epoch, ['dprel'], n)
+            clk_s = self._first_existing_or_zeros(epoch, ['clk'], n)
+
+            if len(signals) == 1:
+                signal = signals[0]
+                code_col = self._preferred_signal_col(cols, signal, "code")
+                if code_col is None:
+                    spec = signal_spec(signal)
+                    raise ValueError(f"BeiDou {mode}: column {spec.code_prefix}* missing in bds_epoch.")
+                P = epoch[code_col].to_numpy(dtype='float64', copy=False)
+                tgd_col = self._bds_tgd_column(signal)
+                tgd_s = self._first_existing_or_zeros(epoch, [tgd_col], n) if tgd_col else np.zeros(n)
+                pco = self._first_existing_or_zeros(epoch, ['pco_los'], n)
+                bias_corr = np.zeros(n, dtype='float64')
+                if getattr(self.config, "orbit_type", None) == "precise":
+                    bias_corr = self._bds_precise_clock_bias_correction_m(
+                        epoch=epoch,
+                        weighted_codes=[(code_col, 1.0)],
+                        n=n,
+                    )
+                    tgd_s = np.zeros(n, dtype='float64')
+                return P + bias_corr - tro - ion - dprel + C * (clk_s - tgd_s) + pco
+
+            if len(signals) == 2:
+                sig1, sig2 = signals
+                c1 = self._preferred_signal_col(cols, sig1, "code")
+                c2 = self._preferred_signal_col(cols, sig2, "code")
+                if c1 is None or c2 is None:
+                    raise ValueError(f"BeiDou {mode}: required code columns are missing in bds_epoch.")
+                k1, k2 = mode_ionosphere_free_coefficients(mode)
+                P1 = epoch[c1].to_numpy(dtype='float64', copy=False)
+                P2 = epoch[c2].to_numpy(dtype='float64', copy=False)
+                pco_l1 = self._first_existing_or_zeros(epoch, ['pco_los_l1'], n)
+                pco_l2 = self._first_existing_or_zeros(epoch, ['pco_los_l2'], n)
+                pco = k1 * pco_l1 - k2 * pco_l2
+                tgd1_col = self._bds_tgd_column(sig1)
+                tgd2_col = self._bds_tgd_column(sig2)
+                tgd1_s = self._first_existing_or_zeros(epoch, [tgd1_col], n) if tgd1_col else np.zeros(n)
+                tgd2_s = self._first_existing_or_zeros(epoch, [tgd2_col], n) if tgd2_col else np.zeros(n)
+                tgd_if = k1 * tgd1_s - k2 * tgd2_s
+                bias_corr = np.zeros(n, dtype='float64')
+                if getattr(self.config, "orbit_type", None) == "precise":
+                    bias_corr = self._bds_precise_clock_bias_correction_m(
+                        epoch=epoch,
+                        weighted_codes=[(c1, k1), (c2, -k2)],
+                        n=n,
+                    )
+                    tgd_if = np.zeros(n, dtype='float64')
+                return (k1 * P1 - k2 * P2) + bias_corr + C * (clk_s - tgd_if) - tro - dprel + pco
+
+            raise ValueError(f"Unknown bds_mode: {mode}")
 
         raise ValueError(f"Unknown system: {system}")
 
 
-    def hjacobian(self, x, gps_sats=None, gal_sats=None):
+    def hjacobian(self, x, gps_sats=None, gal_sats=None, bds_sats=None):
         """
         Jacobian for SPP LSQ.
 
@@ -267,49 +463,31 @@ class SinglePointPositioning:
         Row ordering in the dual-system case: GPS rows first, then Galileo rows.
         """
 
-        has_gps = gps_sats is not None and len(gps_sats) > 0
-        has_gal = gal_sats is not None and len(gal_sats) > 0
+        active = [
+            ("G", gps_sats),
+            ("E", gal_sats),
+            ("C", bds_sats),
+        ]
+        active = [(system, sats) for system, sats in active if sats is not None and len(sats) > 0]
 
-        if not has_gps and not has_gal:
+        if not active:
             return np.zeros((0, 4), dtype="float64")
 
-        # Decide parameter dimension
-        n_params = 5 if (has_gps and has_gal) else 4
-        n_rows = (len(gps_sats) if has_gps else 0) + (len(gal_sats) if has_gal else 0)
-
+        n_params = 3 + len(active)
+        n_rows = sum(len(sats) for _, sats in active)
         A = np.zeros((n_rows, n_params), dtype="float64")
 
         row0 = 0
-
-        # --- GPS block
-        if has_gps:
-            dxyz = x[:3] - gps_sats  # (N,3)
+        for clock_idx, (_, sats) in enumerate(active, start=3):
+            dxyz = x[:3] - sats
             dnorm = np.linalg.norm(dxyz, axis=1)  # (N,)
-            A[row0:row0 + len(gps_sats), 0:3] = dxyz / dnorm[:, None]
-
-            if n_params == 4:
-                A[row0:row0 + len(gps_sats), 3] = 1.0  # dtr
-            else:
-                A[row0:row0 + len(gps_sats), 3] = 1.0  # dtr_gps
-                # A[:,4] stays 0 for GPS rows
-
-            row0 += len(gps_sats)
-
-        # --- Galileo block
-        if has_gal:
-            dxyz = x[:3] - gal_sats
-            dnorm = np.linalg.norm(dxyz, axis=1)
-            A[row0:row0 + len(gal_sats), 0:3] = dxyz / dnorm[:, None]
-
-            if n_params == 4:
-                A[row0:row0 + len(gal_sats), 3] = 1.0  # dtr (single-system)
-            else:
-                # A[:,3] stays 0 for GAL rows
-                A[row0:row0 + len(gal_sats), 4] = 1.0  # dtr_gal
+            A[row0:row0 + len(sats), 0:3] = dxyz / dnorm[:, None]
+            A[row0:row0 + len(sats), clock_idx] = 1.0
+            row0 += len(sats)
 
         return A
 
-    def hx(self, x, gps_sats=None, gal_sats=None):
+    def hx(self, x, gps_sats=None, gal_sats=None, bds_sats=None):
         """
         Modelled pseudorange (geometry + receiver clock term(s)).
 
@@ -320,38 +498,21 @@ class SinglePointPositioning:
         Output ordering in dual-system: GPS first then Galileo (must match hjacobian()).
         """
 
-        has_gps = gps_sats is not None and len(gps_sats) > 0
-        has_gal = gal_sats is not None and len(gal_sats) > 0
+        active = [
+            ("G", gps_sats),
+            ("E", gal_sats),
+            ("C", bds_sats),
+        ]
+        active = [(system, sats) for system, sats in active if sats is not None and len(sats) > 0]
 
-        if not has_gps and not has_gal:
+        if not active:
             return np.zeros((0,), dtype="float64")
 
-        dual = has_gps and has_gal
-
         out = []
-
-        # --- GPS
-        if has_gps:
-            dxyz = x[:3] - gps_sats
+        for clock_idx, (_, sats) in enumerate(active, start=3):
+            dxyz = x[:3] - sats
             dist = np.linalg.norm(dxyz, axis=1)
-
-            if dual:
-                dist = dist + x[3]  # dtr_gps
-            else:
-                dist = dist + x[3]  # dtr (single-system)
-
-            out.append(dist)
-
-        # --- GAL
-        if has_gal:
-            dxyz = x[:3] - gal_sats
-            dist = np.linalg.norm(dxyz, axis=1)
-
-            if dual:
-                dist = dist + x[4]  # dtr_gal
-            else:
-                dist = dist + x[3]  # dtr (single-system)
-
+            dist = dist + x[clock_idx]
             out.append(dist)
 
         return np.concatenate(out) if len(out) > 1 else out[0]
@@ -381,12 +542,24 @@ class SinglePointPositioning:
         Aw = A * w_sqrt[:, None]
         return np.linalg.pinv(Aw.T @ Aw)
 
+    @staticmethod
+    def _weighted_design_condition(A: np.ndarray, err: np.ndarray) -> float:
+        if A.size == 0:
+            return np.nan
+        w_sqrt = 1.0 / np.sqrt(err)
+        Aw = A * w_sqrt[:, None]
+        try:
+            return float(np.linalg.cond(Aw))
+        except np.linalg.LinAlgError:
+            return np.inf
+
     def code_screening(self, omc, err, n_sigma=2):
-        md = np.median(omc)
-        mask = np.where(np.abs(omc) > n_sigma * md)
-        if len(mask[0]) >= len(omc) / 2:
-            for ind in mask:
-                err[ind] *= 3
+        scale = np.median(np.abs(omc - np.median(omc)))
+        if not np.isfinite(scale) or scale <= 0.0:
+            scale = max(np.median(np.abs(omc)), 1.0)
+        mask = np.abs(omc - np.median(omc)) > n_sigma * scale
+        if np.count_nonzero(mask) < len(omc) / 2:
+            err[mask] *= 3
         return err
 
     def observed(self, gps_epoch, gal_epoch):
@@ -722,252 +895,258 @@ class SinglePointPositioning:
 
     def lsq(self, ref=None):
         results_rows = []
-
         xyz_apr = self.xyz_apr.copy()
+        xyz_origin = self.xyz_apr[:3].copy()
 
-        has_gps = self.gps_obs is not None
-        has_gal = self.gal_obs is not None
+        obs_by_sys = {"G": self.gps_obs, "E": self.gal_obs, "C": self.bds_obs}
+        mode_by_sys = {"G": self.gps_mode, "E": self.gal_mode, "C": self.bds_mode}
+        obs_by_sys = {s: obs for s, obs in obs_by_sys.items() if obs is not None}
 
-        if not has_gps and not has_gal:
-            raise ValueError("No observations: both gps_obs and gal_obs are None.")
+        if not obs_by_sys:
+            raise ValueError("No observations: GPS, Galileo and BeiDou observations are all None.")
 
-        # --- epochs: UNION (nie intersection)
-        gps_epochs = {}
-        gal_epochs = {}
+        for obs in obs_by_sys.values():
+            if "V" not in obs.columns:
+                obs.loc[:, "V"] = np.nan
+            obs.loc[:, "spp_rejected"] = False
+            obs.loc[:, "spp_reject_reason"] = ""
+
+        epoch_groups = {}
         epoch_index = None
-        if has_gps:
-            gps_times = self.gps_obs.index.get_level_values("time").unique()
-            epoch_index = gps_times if epoch_index is None else epoch_index.union(gps_times)
-            gps_epochs = {t: df for t, df in self.gps_obs.groupby(level="time", sort=False)}
-        if has_gal:
-            gal_times = self.gal_obs.index.get_level_values("time").unique()
-            epoch_index = gal_times if epoch_index is None else epoch_index.union(gal_times)
-            gal_epochs = {t: df for t, df in self.gal_obs.groupby(level="time", sort=False)}
+        for system, obs in obs_by_sys.items():
+            times = obs.index.get_level_values("time").unique()
+            epoch_index = times if epoch_index is None else epoch_index.union(times)
+            epoch_groups[system] = {t: df for t, df in obs.groupby(level="time", sort=False)}
         epochs = epoch_index.sort_values() if epoch_index is not None else []
 
+        def _assign_v(system: str, t, values: np.ndarray) -> None:
+            obs = obs_by_sys[system]
+            if not isinstance(obs.index, pd.MultiIndex):
+                return
+            idx = [slice(None)] * obs.index.nlevels
+            idx[obs.index.names.index("time")] = t
+            obs.loc[tuple(idx), "V"] = values
+
+        def _mark_epoch_rejected(system: str, t, reason: str) -> None:
+            obs = obs_by_sys[system]
+            if not isinstance(obs.index, pd.MultiIndex):
+                return
+            idx = [slice(None)] * obs.index.nlevels
+            idx[obs.index.names.index("time")] = t
+            obs.loc[tuple(idx), "spp_rejected"] = True
+            obs.loc[tuple(idx), "spp_reject_reason"] = reason
+
+        def _mark_observation_rejected(system: str, row_key, reason: str) -> None:
+            obs = obs_by_sys[system]
+            obs.loc[row_key, "spp_rejected"] = True
+            obs.loc[row_key, "spp_reject_reason"] = reason
+
+        def _subset_system_dict(values_by_sys: dict[str, np.ndarray], keep_by_sys: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+            return {
+                system: values[keep_by_sys[system]]
+                for system, values in values_by_sys.items()
+                if system in keep_by_sys and np.count_nonzero(keep_by_sys[system]) > 0
+            }
+
+        def _locate_global_row(
+            active_systems: list[str],
+            keep_by_sys: dict[str, np.ndarray],
+            global_idx: int,
+        ) -> tuple[str, int]:
+            cursor = 0
+            for system in active_systems:
+                kept = np.flatnonzero(keep_by_sys[system])
+                n_sys = len(kept)
+                if cursor <= global_idx < cursor + n_sys:
+                    return system, int(kept[global_idx - cursor])
+                cursor += n_sys
+            raise IndexError("Residual row is outside the active SPP design matrix.")
 
         tol = 1e-2
         max_iter = 5
+        residual_rejection = bool(getattr(self.config, "spp_residual_rejection", True))
+        residual_threshold = float(getattr(self.config, "spp_residual_rejection_threshold_m", 8.0))
+        residual_max_iter = int(getattr(self.config, "spp_residual_rejection_max_iter", 3))
+        low_redundancy_jump_limit = getattr(
+            self.config,
+            "spp_bds_low_redundancy_max_jump_m",
+            getattr(self.config, "spp_exact_solution_max_jump_m", 30.0),
+        )
 
         for t in epochs:
-            # --- fetch epoch slices if present
-            gps_epoch = None
-            gal_epoch = None
-            gps_sats = None
-            gal_sats = None
+            epoch_by_sys = {}
+            sats_by_sys = {}
+            base_by_sys = {}
+            err_base_by_sys = {}
 
-            if has_gps:
-                gps_epoch = gps_epochs.get(t)
+            for system, groups in epoch_groups.items():
+                epoch = groups.get(t)
+                if epoch is None or len(epoch) == 0:
+                    continue
+                sats = epoch[["xe", "ye", "ze"]].to_numpy(copy=False)
+                if len(sats) == 0:
+                    continue
+                epoch_by_sys[system] = epoch
+                sats_by_sys[system] = sats
 
-                if gps_epoch is not None and len(gps_epoch) > 0:
-                    gps_sats = gps_epoch[["xe", "ye", "ze"]].to_numpy(copy=False)
-
-            if has_gal:
-                gal_epoch = gal_epochs.get(t)
-
-                if gal_epoch is not None and len(gal_epoch) > 0:
-                    gal_sats = gal_epoch[["xe", "ye", "ze"]].to_numpy(copy=False)
-
-            n_gps = 0 if gps_sats is None else len(gps_sats)
-            n_gal = 0 if gal_sats is None else len(gal_sats)
-
-            # --- minimal observations check (4 params for single-system, 5 for dual)
-            n_params = 0
-            if n_gps > 0 and n_gal > 0:
-                n_params = 5
-            elif n_gps > 0 or n_gal > 0:
-                n_params = 4
-            else:
+            active = [s for s in ("G", "E", "C") if s in sats_by_sys]
+            n_obs = sum(len(sats_by_sys[s]) for s in active)
+            n_params = 3 + len(active)
+            if not active or n_obs < n_params:
                 continue
 
-            if (n_gps + n_gal) < n_params:
-                continue
+            for system in active:
+                base_by_sys[system] = self._build_obs_base(epoch_by_sys[system], system, mode_by_sys[system])
+                ev = epoch_by_sys[system]["ev"].to_numpy(copy=False)
+                sin_el = np.sin(np.deg2rad(ev))
+                err_base_by_sys[system] = 0.5 / (sin_el ** 2)
 
-            # --- design matrix
-            A = self.hjacobian(x=xyz_apr, gps_sats=gps_sats, gal_sats=gal_sats)
+            keep_by_sys = {
+                system: np.ones(len(sats_by_sys[system]), dtype=bool)
+                for system in active
+            }
+            rejected_obs = 0
+            skip_epoch = False
+            reject_reason = ""
 
-            # --- observed vectors
-            gps_base = self._build_obs_base(gps_epoch, 'G', self.gps_mode) if n_gps > 0 else None
-            gal_base = self._build_obs_base(gal_epoch, 'E', self.gal_mode) if n_gal > 0 else None
-            if gps_base is None and gal_base is None:
-                continue
+            for rejection_iter in range(residual_max_iter + 1):
+                active_now = [s for s in active if np.count_nonzero(keep_by_sys[s]) > 0]
+                sats_now = _subset_system_dict(sats_by_sys, keep_by_sys)
+                base_now = _subset_system_dict(base_by_sys, keep_by_sys)
+                err_base_now = _subset_system_dict(err_base_by_sys, keep_by_sys)
+                n_obs_now = sum(len(sats_now[s]) for s in active_now)
+                n_params_now = 3 + len(active_now)
 
-            # --- computed distances + L
-            L_parts = []
-            err_parts = []
+                if not active_now or n_obs_now < n_params_now:
+                    skip_epoch = True
+                    reject_reason = "insufficient_observations_after_spp_rejection"
+                    break
 
-            if n_gps > 0:
-                gps_clock_init = (
-                    gps_epoch["dtr"].to_numpy(dtype='float64', copy=False)
-                    if "dtr" in gps_epoch.columns else 0.0
+                clocks = {system: 0.0 for system in active_now}
+                obl = xyz_apr[:3].copy()
+                X = np.zeros(n_params_now, dtype="float64")
+                err = np.ones(n_obs_now, dtype="float64")
+                it = 0
+
+                for it in range(max_iter):
+                    A = self.hjacobian(
+                        x=obl,
+                        gps_sats=sats_now.get("G"),
+                        gal_sats=sats_now.get("E"),
+                        bds_sats=sats_now.get("C"),
+                    )
+                    L_parts = []
+                    err_parts = []
+                    for system in active_now:
+                        observed = base_now[system] - clocks[system]
+                        computed = calculate_distance(sats_now[system], obl)
+                        L = observed - computed
+                        err_sys = self.code_screening(L, err_base_now[system].copy())
+                        L_parts.append(L)
+                        err_parts.append(err_sys)
+
+                    L_all = np.concatenate(L_parts) if len(L_parts) > 1 else L_parts[0]
+                    err = np.concatenate(err_parts) if len(err_parts) > 1 else err_parts[0]
+                    X = self._weighted_lsq_solution(A, L_all, err)
+                    obl = obl + X[:3]
+                    for offset, system in enumerate(active_now, start=3):
+                        clocks[system] += float(X[offset])
+
+                    if np.max(np.abs(X)) < tol:
+                        break
+
+                A = self.hjacobian(
+                    x=obl,
+                    gps_sats=sats_now.get("G"),
+                    gal_sats=sats_now.get("E"),
+                    bds_sats=sats_now.get("C"),
                 )
-                observed_gps = gps_base - gps_clock_init
-                computed_gps = calculate_distance(gps_sats, xyz_apr[:3])
-                L_gps = observed_gps - computed_gps
-                L_parts.append(L_gps)
-
-                ev_gps = gps_epoch["ev"].to_numpy(copy=False)
-                sin_el_gps = np.sin(np.deg2rad(ev_gps))
-                err_gps = 0.5 / (sin_el_gps ** 2)
-                err_gps = self.code_screening(L_gps, err_gps)
-                err_parts.append(err_gps)
-            else:
-                L_gps = None
-
-            if n_gal > 0:
-                gal_clock_init = (
-                    gal_epoch["dtr_gal"].to_numpy(dtype='float64', copy=False)
-                    if "dtr_gal" in gal_epoch.columns else 0.0
-                )
-                observed_gal = gal_base - gal_clock_init
-                computed_gal = calculate_distance(gal_sats, xyz_apr[:3])
-                L_gal = observed_gal - computed_gal
-                L_parts.append(L_gal)
-
-                ev_gal = gal_epoch["ev"].to_numpy(copy=False)
-                sin_el_gal = np.sin(np.deg2rad(ev_gal))
-                err_gal = 0.5 / (sin_el_gal ** 2)
-                base_err_gal = err_gal.copy()
-                err_gal = self.code_screening(L_gal, err_gal)
-                err_parts.append(err_gal)
-            else:
-                L_gal = None
-
-            L_all = np.concatenate(L_parts) if len(L_parts) > 1 else L_parts[0]
-            err = np.concatenate(err_parts) if len(err_parts) > 1 else err_parts[0]
-
-            # --- LSQ
-            X = self._weighted_lsq_solution(A, L_all, err)
-
-            # --- init update
-            obl = xyz_apr[:3] + X[:3]
-            gps_clock = 0.0
-            gal_clock = 0.0
-
-            # indeksy zegarów w wektorze X:
-            # single-system: X[3] = dtr (dla tego systemu)
-            # dual-system:   X[3] = dtr_gps, X[4] = dtr_gal
-            if n_gps > 0 and n_gal > 0:
-                gps_clock = float(X[3])
-                gal_clock = float(X[4])
-            elif n_gps > 0:
-                gps_clock = float(X[3])
-            elif n_gal > 0:
-                gal_clock = float(X[3])
-
-            # --- iterations
-            it = 0
-            while True:
-                x_prev = X.copy()
-
-                A = self.hjacobian(x=obl, gps_sats=gps_sats, gal_sats=gal_sats)
-
                 L_parts = []
-                err_parts = []
-
-                if n_gps > 0:
-                    observed_gps = gps_base - gps_clock
-                    computed_gps = calculate_distance(gps_sats, obl)
-                    L_gps = observed_gps - computed_gps
-                    err_gps = self.code_screening(L_gps, err_gps)
-                    L_parts.append(L_gps)
-                    err_parts.append(err_gps)
-
-                if n_gal > 0:
-                    observed_gal = gal_base - gal_clock
-                    computed_gal = calculate_distance(gal_sats, obl)
-                    L_gal = observed_gal - computed_gal
-                    err_gal = base_err_gal.copy()
-                    err_gal = self.code_screening(L_gal, err_gal)
-                    L_parts.append(L_gal)
-                    err_parts.append(err_gal)
-
+                for system in active_now:
+                    observed = base_now[system] - clocks[system]
+                    computed = calculate_distance(sats_now[system], obl)
+                    L_parts.append(observed - computed)
                 L_all = np.concatenate(L_parts) if len(L_parts) > 1 else L_parts[0]
-                err = np.concatenate(err_parts) if len(err_parts) > 1 else err_parts[0]
+                V_all = A @ X - L_all
 
-                X = self._weighted_lsq_solution(A, L_all, err)
+                can_reject = (
+                    residual_rejection
+                    and rejection_iter < residual_max_iter
+                    and n_obs_now > n_params_now
+                    and V_all.size > 0
+                    and np.isfinite(V_all).any()
+                )
+                if can_reject:
+                    worst = int(np.nanargmax(np.abs(V_all)))
+                    worst_abs = float(abs(V_all[worst]))
+                    if worst_abs > residual_threshold and n_obs_now - 1 >= n_params_now:
+                        worst_system, worst_local = _locate_global_row(active_now, keep_by_sys, worst)
+                        if np.count_nonzero(keep_by_sys[worst_system]) > 1:
+                            keep_by_sys[worst_system][worst_local] = False
+                            row_key = epoch_by_sys[worst_system].index[worst_local]
+                            _mark_observation_rejected(worst_system, row_key, "postfit_residual")
+                            rejected_obs += 1
+                            continue
 
-                obl = obl + X[:3]
+                break
 
-                # update clocks
-                if n_gps > 0 and n_gal > 0:
-                    gps_clock = float(X[3])
-                    gal_clock = float(X[4])
-                elif n_gps > 0:
-                    gps_clock = float(X[3])
-                elif n_gal > 0:
-                    gal_clock = float(X[3])
+            if skip_epoch:
+                for system in active:
+                    _mark_epoch_rejected(system, t, reject_reason)
+                continue
 
-                it += 1
-                if np.max(np.abs(X - x_prev)) < tol:
-                    break
-                if it >= max_iter:
-                    break
-
-            # --- residuals
-            # zbuduj L_all jeszcze raz w końcowym punkcie (obl i zegary już aktualne)
-            A = self.hjacobian(x=obl, gps_sats=gps_sats, gal_sats=gal_sats)
-
-            L_parts = []
-            if n_gps > 0:
-                observed_gps = gps_base - gps_clock
-                computed_gps = calculate_distance(gps_sats, obl)
-                L_gps = observed_gps - computed_gps
-                L_parts.append(L_gps)
-            if n_gal > 0:
-                observed_gal = gal_base - gal_clock
-                computed_gal = calculate_distance(gal_sats, obl)
-                L_gal = observed_gal - computed_gal
-                L_parts.append(L_gal)
-
-            L_all = np.concatenate(L_parts) if len(L_parts) > 1 else L_parts[0]
-            V_all = A @ X - L_all
             rms_v = float(np.sqrt(np.mean(V_all ** 2))) if V_all.size else np.nan
 
-            # wpisz V do źródłowych df (tylko jeśli istnieją)
-            cursor = 0
-            if n_gps > 0 and has_gps:
-                self.gps_obs.loc[(
-                    (slice(None), t) if np.issubdtype(self.gps_obs.index.levels[1].dtype, np.datetime64) else (t, slice(
-                        None))), "V"] = V_all[cursor:cursor + n_gps]
-                cursor += n_gps
-
-            if n_gal > 0 and has_gal:
-                self.gal_obs.loc[(
-                    (slice(None), t) if np.issubdtype(self.gal_obs.index.levels[1].dtype, np.datetime64) else (t, slice(
-                        None))), "V"] = V_all[cursor:cursor + n_gal]
-                cursor += n_gal
+            for system in active:
+                full_v = np.full(len(sats_by_sys[system]), np.nan, dtype="float64")
+                if system in active_now:
+                    cursor = 0
+                    for s2 in active_now:
+                        n_sys = len(sats_now[s2])
+                        if s2 == system:
+                            full_v[keep_by_sys[system]] = V_all[cursor:cursor + n_sys]
+                            break
+                        cursor += n_sys
+                _assign_v(system, t, full_v)
 
             Q = self._weighted_lsq_covariance(A, err)
+            cond = self._weighted_design_condition(A, err)
             sig = np.sqrt(np.clip(np.diag(Q), 0.0, np.inf))
             sig_x, sig_y, sig_z = sig[0], sig[1], sig[2]
             sig_dtr = sig[3] if len(sig) > 3 else np.nan
 
-            # zegary do raportu
-            dtr_gps = None
-            dtr_gal = None
-            if n_gps > 0 and n_gal > 0:
-                dtr_gps = float(X[3])
-                dtr_gal = float(X[4])
-            elif n_gps > 0:
-                dtr_gps = float(X[3])
-            elif n_gal > 0:
-                dtr_gal = float(X[3])
+            if (
+                active_now == ["C"]
+                and n_obs_now <= n_params_now + 1
+                and low_redundancy_jump_limit is not None
+            ):
+                epoch_step = float(np.linalg.norm(obl - xyz_apr[:3]))
+                origin_step = float(np.linalg.norm(obl - xyz_origin))
+                if (
+                    epoch_step > float(low_redundancy_jump_limit)
+                    or origin_step > float(low_redundancy_jump_limit)
+                ):
+                    _mark_epoch_rejected("C", t, "low_redundancy_bds_geometry_jump")
+                    continue
 
             row = {
                 "time": t,
                 "x": float(obl[0]),
                 "y": float(obl[1]),
                 "z": float(obl[2]),
-                "dtr_gps": dtr_gps,
-                "dtr_gal": dtr_gal,
+                "dtr_gps": clocks.get("G"),
+                "dtr_gal": clocks.get("E"),
+                "dtr_bds": clocks.get("C"),
                 "sig_x": float(sig_x),
                 "sig_y": float(sig_y),
                 "sig_z": float(sig_z),
                 "sig_dtr": float(sig_dtr),
-                "n_gps": int(n_gps),
-                "n_gal": int(n_gal),
-                "iters": int(it),
+                "n_gps": int(np.count_nonzero(keep_by_sys.get("G", []))),
+                "n_gal": int(np.count_nonzero(keep_by_sys.get("E", []))),
+                "n_bds": int(np.count_nonzero(keep_by_sys.get("C", []))),
+                "spp_rejected_obs": int(rejected_obs),
+                "spp_design_cond": cond,
+                "iters": int(it + 1),
                 "rms_v": rms_v,
             }
 
@@ -980,16 +1159,18 @@ class SinglePointPositioning:
                 row.update({"de": float(denu[0]), "dn": float(denu[1]), "du": float(denu[2])})
                 if getattr(self.config, "trace_filter", False):
                     print(f"Epoch: {t} error de: {denu[0]} dn: {denu[1]} du: {denu[2]}")
-                    if n_gps > 0:
-                        print(V_all[:n_gps])
-                    if n_gal > 0:
-                        print(V_all[n_gps:n_gps + n_gal])
+                    print(V_all)
                     print("====" * 30, "\n")
 
             results_rows.append(row)
 
         results_df = pd.DataFrame(results_rows)
-        return results_df, (self.gps_obs if has_gps else None), (self.gal_obs if has_gal else None)
+        return (
+            results_df,
+            obs_by_sys.get("G"),
+            obs_by_sys.get("E"),
+            obs_by_sys.get("C"),
+        )
 
 
 class SPPSession:  # noqa: D101 – docstring below
@@ -1023,7 +1204,9 @@ class SPPSession:  # noqa: D101 – docstring below
             mode=self.config.gps_freq,
             sys=self.config.sys,
             galileo_modes=self.config.gal_freq,
+            beidou_modes=self.config.bds_freq,
             use_gfz=self.config.use_gfz,
+            station_name=self.config.station_name,
         )
 
         # --------- Load observations
@@ -1031,12 +1214,12 @@ class SPPSession:  # noqa: D101 – docstring below
 
         # --------- Validate selected systems and availability
         selected = set(self.config.sys)
-        allowed = {"G", "E"}
+        allowed = {"G", "E", "C"}
         unknown = selected - allowed
         if unknown:
             raise ValueError(f"Unsupported systems in config.sys: {unknown}. Allowed: {allowed}")
 
-        obs_by_sys = {"G": obs_data.gps, "E": obs_data.gal}
+        obs_by_sys = {"G": obs_data.gps, "E": obs_data.gal, "C": obs_data.bds}
         missing = [s for s in selected if obs_by_sys.get(s) is None]
         if missing:
             raise ValueError(
@@ -1052,13 +1235,13 @@ class SPPSession:  # noqa: D101 – docstring below
             broadcast = self._load_nav_data(processor)
 
             if self.config.screen:
-                gps_obs, gal_obs = self._screen_data(
-                    processor, obs_by_sys["G"], obs_by_sys["E"], broadcast
+                gps_obs, gal_obs, bds_obs = self._screen_data(
+                    processor, obs_by_sys["G"], obs_by_sys["E"], obs_by_sys["C"], broadcast
                 )
-                obs_by_sys["G"], obs_by_sys["E"] = gps_obs, gal_obs
+                obs_by_sys["G"], obs_by_sys["E"], obs_by_sys["C"] = gps_obs, gal_obs, bds_obs
 
         # --------- Modes per system
-        mode_by_sys = {"G": self.config.gps_freq, "E": self.config.gal_freq}
+        mode_by_sys = {"G": self.config.gps_freq, "E": self.config.gal_freq, "C": self.config.bds_freq}
 
         # --------- Interpolation + elevation mask
         crd_by_sys = {}
@@ -1082,6 +1265,7 @@ class SPPSession:  # noqa: D101 – docstring below
                     xyz=xyz.copy(),
                     flh=flh.copy(),
                     mode=mode,
+                    sys=sys,
                     degree=self.config.interpolation_degree,
                 )
             else:
@@ -1109,46 +1293,50 @@ class SPPSession:  # noqa: D101 – docstring below
         # --------- Run filter (keep current signature)
         obs_gps_crd = crd_by_sys.get("G")
         obs_gal_crd = crd_by_sys.get("E")
+        obs_bds_crd = crd_by_sys.get("C")
 
         result = self._run_filter(
             obs_data=obs_data,
             obs_gps_crd=obs_gps_crd,
             obs_gal_crd=obs_gal_crd,
+            obs_bds_crd=obs_bds_crd,
             interval=obs_data.interval,
         )
         return result
 
-    def _run_filter(self, obs_data, obs_gps_crd, obs_gal_crd, interval)->SPPResult:
+    def _run_filter(self, obs_data, obs_gps_crd, obs_gal_crd, obs_bds_crd, interval)->SPPResult:
         solver = SinglePointPositioning(config=self.config,gps_obs=obs_gps_crd,gal_obs=obs_gal_crd,
-                                        gps_mode=self.config.gps_freq,gal_mode=self.config.gal_freq,xyz_apr=obs_data.meta[4])
+                                        gps_mode=self.config.gps_freq,gal_mode=self.config.gal_freq,
+                                        bds_obs=obs_bds_crd, bds_mode=self.config.bds_freq,
+                                        xyz_apr=obs_data.meta[4])
         if self.config.sinex_path:
             sta_name = obs_data.meta[0][:4].upper()
             snx = parse_sinex(self.config.sinex_path)
             if sta_name in snx.index:
                 ref = snx.loc[sta_name].to_numpy()
-                result, gps_result, gal_result = solver.lsq(ref=ref)
+                result, gps_result, gal_result, bds_result = solver.lsq(ref=ref)
             else:
-                result, gps_result, gal_result = solver.lsq()
+                result, gps_result, gal_result, bds_result = solver.lsq()
         else:
-            result, gps_result, gal_result = solver.lsq()
-        return SPPResult(solution=result,residuals_gps=gps_result,residuals_gal=gal_result)
+            result, gps_result, gal_result, bds_result = solver.lsq()
+        return SPPResult(solution=result,residuals_gps=gps_result,residuals_gal=gal_result,residuals_bds=bds_result)
 
 
         # return result
     def _load_nav_data(self, processor):
         """ load broadcast navigation messages for screening"""
-        broadcast = processor.load_broadcast_orbit()
+        broadcast = processor.load_broadcast_orbit(tlim=self.config.time_limit)
         return broadcast
 
     # ‑‑‑ private helpers ----------------------------------------------------
     def _load_obs_data(self, processor):  # noqa: D401 – simple phrase OK
         """Read observation & navigation files, apply basic screenings."""
         # Actual implementation should call the GNSS library. Here we only log.
-        obs = processor.load_obs_data()
+        obs = processor.load_obs_data(tlim=self.config.time_limit)
 
         return obs
 
-    def _screen_data(self, processor, gps_obs, gal_obs, broadcast):
+    def _screen_data(self, processor, gps_obs, gal_obs, bds_obs, broadcast):
         if self.config.system_includes('G') and gps_obs is not None:
             gps_nav = processor.screen_navigation_message(broadcast.gps_orb, 'G')
             gps_obs = processor.mark_outages(gps_obs, 'G', gps_nav)
@@ -1160,15 +1348,23 @@ class SPPSession:  # noqa: D101 – docstring below
             gal_obs = processor.mark_outages(gal_obs, 'E', gal_nav)
             gal_obs = gal_obs[(gal_obs.filter(regex=r'^L').gt(0)).all(axis=1)]
 
-        return gps_obs, gal_obs
+        if self.config.system_includes('C') and bds_obs is not None:
+            bds_nav = processor.screen_navigation_message(broadcast.bds_orb, 'C')
+            bds_obs = processor.mark_outages(bds_obs, 'C', bds_nav)
+            bds_obs = bds_obs[bds_obs['bds_outage'] == False]
+            bds_obs = bds_obs[(bds_obs.filter(regex=r'^L').gt(0)).all(axis=1)]
+
+        return gps_obs, gal_obs, bds_obs
 
 
     def _interpolate_broadcast(self, obs_df, xyz, flh,sys,mode, orbit, tolerance):
-        make_ionofree(obs_df,sys,mode)
+        make_ionofree(obs_df=obs_df, mode=mode, sys=sys)
         if sys == 'G':
             orb = orbit.gps_orb
         elif sys == 'E':
             orb = orbit.gal_orb
+        elif sys == 'C':
+            orb = orbit.bds_orb
         else:
             raise ValueError("Invalid sys: %s", sys)
 
@@ -1179,12 +1375,17 @@ class SPPSession:  # noqa: D101 – docstring below
         obs_crd = wrapper.run()
         return obs_crd
 
-    def _interpolate_lgr(self, obs, flh, xyz, mode,degree):
+    def _interpolate_lgr(self, obs, flh, xyz, mode, degree, sys=None):
         obs = obs.swaplevel('sv','time')
+        obs.attrs["mode"] = mode
         start = datetime.now()
-        sp3 = [read_sp3(f) for f in self.config.sp3_path]
+        sp3_systems = (sys,) if sys is not None else ('G', 'E', 'C')
+        sp3 = [read_sp3(f, sys=sp3_systems) for f in self.config.sp3_path]
+        sp3 = [df for df in sp3 if not df.empty]
+        if not sp3:
+            raise ValueError(f"No precise SP3 records found for system {sys}")
         sp3_df = pd.concat(sp3)
-        sp3_df = sp3_df.reset_index().drop_duplicates()
+        sp3_df = sp3_df.reset_index().drop_duplicates(subset=['time', 'sv'], keep='first')
         sp3_df = sp3_df.set_index(['time', 'sv'])
         sp3_df[['x','y','z']]=sp3_df[['x','y','z']].apply(lambda x: x*1e3)
         sp3_df['clk'] = sp3_df['clk'].apply(lambda x: x * 1e-6)

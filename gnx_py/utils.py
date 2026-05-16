@@ -33,7 +33,7 @@ def calculate_distance(points, reference_point):
 
 
 def elevation_azimuth(target_xyz, pos_xyz):
-    pos_flh =  ecef2geodetic(ecef=pos_xyz,deg=True)
+    pos_flh = ecef2geodetic(ecef=pos_xyz, deg=False)
     fi, la, h = pos_flh[0], pos_flh[1], pos_flh[2]
     e = np.array([
         - np.sin(la),
@@ -108,5 +108,4 @@ def elevation_azimuth_geocentric(target_geo, pos_geo):
     az = (az + 2 * np.pi) % (2 * np.pi)  # Azymut w zakresie 0-2π
 
     return ev, az
-
 

@@ -30,6 +30,9 @@ def orbit_stats(
         columns = df.columns
     if isinstance(columns, str):
         columns = [columns]
+    columns = [col for col in columns if col in df.columns]
+    if not columns:
+        raise ValueError("None of the requested columns are present in the input dataframe.")
     
     # Mapowanie nazw statystyk na funkcje
     stat_funcs = {
@@ -48,7 +51,10 @@ def orbit_stats(
     # Wyniki
     result = {}
     for col in columns:
-        grouped = df[col].groupby('sv')
+        series = pd.to_numeric(df[col], errors='coerce').dropna()
+        if series.empty:
+            continue
+        grouped = series.groupby('sv')
         col_stats = {}
         for stat in stats:
             col_stats[stat] = grouped.apply(stat_funcs[stat])
@@ -59,8 +65,9 @@ def orbit_stats(
         result[col] = col_stats_df
 
     # Połącz (jeśli kilka kolumn)
+    if not result:
+        raise ValueError("Requested columns are present, but none contain numeric values.")
     if len(result) == 1:
         return next(iter(result.values()))
     else:
         return pd.concat(result.values(), axis=1)
-

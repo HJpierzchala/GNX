@@ -1,0 +1,40 @@
+% ============================
+% Packages and configuration
+% ============================
+
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{etoolbox}
+\usepackage{graphicx}
+\usepackage{setspace}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{adjustbox}
+\usepackage{makecell}
+\usepackage{float}
+
+\AtBeginEnvironment{longtable}{\small}
+\setcounter{MaxMatrixCols}{30}
+
+% --- Code styling ---
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codekw}{RGB}{0,0,150}
+\definecolor{codestr}{RGB}{150,0,0}
+\definecolor{codecom}{RGB}{0,120,0}
+
+\lstset{
+  frame=single,
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekw}\bfseries,
+  stringstyle=\color{codestr},
+  commentstyle=\color{codecom}\itshape,
+  numbers=left,
+  numberstyle=\tiny,
+  stepnumber=1,
+  breaklines=true,
+  breakatwhitespace=false,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true
+}

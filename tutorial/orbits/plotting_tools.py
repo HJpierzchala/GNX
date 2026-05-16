@@ -6,15 +6,20 @@ from typing import Union
 from pathlib import Path
 time_format = mdates.DateFormatter('%H:%M')
 import matplotlib as mpl
-import seaborn as sns
-# Styl publikacyjny
-sns.set_context("paper", font_scale=1.3)
-sns.set_style("ticks")
+try:
+    import seaborn as sns
+except ImportError:  # pragma: no cover - tutorial convenience fallback
+    sns = None
+
+# Styl publikacyjny. Seaborn jest opcjonalnym dodatkiem tutorialowym; bez niego
+# wykresy nadal działają z paletą matplotlib.
+if sns is not None:
+    sns.set_context("paper", font_scale=1.3)
+    sns.set_style("ticks")
 mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['font.family'] = 'serif'
 mpl.rcParams['font.serif'] = ['Times New Roman']
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -204,7 +209,11 @@ def plot_sisre(df: pd.DataFrame, out_path: Union[Path, str, None], name: Union[s
 
     # Kolory dla PRN
     prns = df.index.get_level_values('sv').unique()
-    palette = sns.color_palette("deep", len(prns))
+    if sns is not None:
+        palette = sns.color_palette("deep", len(prns))
+    else:
+        cmap = plt.get_cmap("tab20")
+        palette = [cmap(i % cmap.N) for i in range(len(prns))]
     color_map = dict(zip(prns, palette))
 
     # Globalny zakres czasu
@@ -304,6 +313,10 @@ def plot_sv_stats(
     if sv_list is not None:
         df = df[df.index.isin(sv_list)]
 
+    if column_stat not in df.columns:
+        available = ", ".join(map(str, df.columns))
+        raise KeyError(f"Column '{column_stat}' not found in stats_df. Available columns: {available}")
+
     y = df[column_stat]
     x = df.index.astype(str)
     
@@ -329,7 +342,8 @@ def plot_sv_stats(
     plt.xticks(rotation=45)
     plt.grid(True, axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plt.show()
+    if "agg" not in mpl.get_backend().lower():
+        plt.show()
     return fig, ax
 
 # ---- PRZYKŁAD UŻYCIA ----

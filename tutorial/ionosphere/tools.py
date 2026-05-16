@@ -8,10 +8,16 @@ from scipy.signal import savgol_filter
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 import matplotlib as mpl
-import seaborn as sns
-# Styl publikacyjny
-sns.set_context("paper", font_scale=1.3)
-sns.set_style("ticks")
+try:
+    import seaborn as sns
+except ImportError:  # pragma: no cover - tutorial convenience fallback
+    sns = None
+
+# Styl publikacyjny. Seaborn jest opcjonalnym dodatkiem tutorialowym; bez niego
+# helpery nadal działają z domyślnym stylem matplotlib.
+if sns is not None:
+    sns.set_context("paper", font_scale=1.3)
+    sns.set_style("ticks")
 mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['font.family'] = 'serif'
 mpl.rcParams['font.serif'] = ['Times New Roman']
@@ -286,7 +292,7 @@ class STECModelComparator:
             fig.suptitle(suptitle, y=1.02)
 
         # fig.tight_layout()
-        if show:
+        if show and "agg" not in mpl.get_backend().lower():
             plt.show()
         return fig, axes
 
@@ -320,7 +326,7 @@ class STECModelComparator:
         if suptitle:
             fig.suptitle(suptitle, y=1.02)
         fig.tight_layout()
-        if show:
+        if show and "agg" not in mpl.get_backend().lower():
             plt.show()
         return fig, axes
 
@@ -439,6 +445,7 @@ class VTECZenithEstimator:
             )
 
             chosen = chosen.merge(cnt, left_on=tcol, right_index=True, how="left")
+            chosen = chosen.rename(columns={"n_sat_ge_thr": "nsat"})
 
         # --- Zwykły DataFrame (time jako kolumna) ---
         else:
@@ -888,7 +895,7 @@ def plot_stec(
     if tight_layout:
         plt.tight_layout()
 
-    plt.show()
-
+    if "agg" not in mpl.get_backend().lower():
+        plt.show()
 
 

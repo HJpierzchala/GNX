@@ -42,11 +42,15 @@ from .utils import get_ipp, get_local_time, stec_mf
 from ..time import gpst2utc, local2gsow
 
 C = 299792458
-PI = 3.1415296535898
+PI = np.pi
 
 def klobuchar(azimuth, elev, fi, lambda_, tow, beta, alfa):
     """
         Compute ionospheric delay using the classic Klobuchar broadcast model.
+
+        Status:
+            Active broadcast-model helper used by preprocessing and model
+            comparison paths. GPS coefficients are required.
 
         This implementation follows the NOAA GPS Toolbox reference implementation.
         The returned delay is a slant ionospheric group delay in meters for a given
@@ -293,6 +297,11 @@ def run_NTCM_for_gps(pos, DOY, ev, az, epoch, gpsa, gpsb):
     """
         Run an NTCM pipeline to estimate STEC for GPS using Klobpar parameter instead of Azpar.
 
+        Status:
+            Active model helper but less exercised than the Galileo NTCM path.
+            Requires GPSA/GPSB broadcast coefficients and validation for new
+            products.
+
         Parameters:
             pos (tuple[float, float]): Receiver geodetic coordinates (lat_deg, lon_deg).
             DOY (int): Day-of-year.
@@ -344,6 +353,10 @@ def ntcm_vtec(pos, DOY, ev, az, epoch, gala, mf_no=1,return_vtec=False):
     """
     Run an NTCM pipeline to estimate STEC for Galileo.
 
+    Status:
+        Active model helper for Galileo-style NTCM comparisons. Treat as
+        model-sensitive: changes require validation against known broadcasts.
+
     Parameters:
         pos (tuple[float, float]): Receiver geodetic coordinates (lat_deg, lon_deg).
         DOY (int): Day-of-year.
@@ -394,6 +407,11 @@ def compute_ntcm_grid(
 ) -> xr.Dataset:
     """
     Calculate VTEC from the NTCM model on a grid (lat, lon, time) and return xarray.Dataset.
+
+    Status
+    ------
+    Experimental grid-generation helper used by tutorials/research workflows.
+    It is not part of the core STEC measurement pipeline.
 
     Parameters
     ----------

@@ -5,13 +5,26 @@ import xarray as xr
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-import seaborn as sns
+try:
+    import seaborn as sns
+except ImportError:  # pragma: no cover - tutorial convenience fallback
+    sns = None
 # Styl publikacyjny
-sns.set_context("paper", font_scale=1.3)
-sns.set_style("ticks")
+if sns is not None:
+    sns.set_context("paper", font_scale=1.3)
+    sns.set_style("ticks")
 mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['font.family'] = 'serif'
 mpl.rcParams['font.serif'] = ['Times New Roman']
+
+
+def _show_or_close(fig):
+    """Show figures interactively, but render and close during headless checks."""
+    if "agg" in mpl.get_backend().lower():
+        fig.canvas.draw()
+        plt.close(fig)
+    else:
+        plt.show()
 def load_dataset(path: str) -> xr.Dataset:
     return xr.open_dataset(path)
 
@@ -62,7 +75,7 @@ def plot_map(ds: xr.Dataset, var: str, t_index: int = 0, title: Optional[str] = 
     plt.title(title)
     if savepath:
         plt.savefig(savepath, dpi=150, bbox_inches="tight")
-    plt.show()
+    _show_or_close(plt.gcf())
 
 def plot_timeseries(ds: xr.Dataset, var: str, lat: float, lon: float,
                     title: Optional[str] = None, savepath: Optional[str] = None) -> None:
@@ -77,7 +90,7 @@ def plot_timeseries(ds: xr.Dataset, var: str, lat: float, lon: float,
     plt.title(title)
     if savepath:
         plt.savefig(savepath, dpi=150, bbox_inches="tight")
-    plt.show()
+    _show_or_close(plt.gcf())
 
 def ss_stats(ds: xr.Dataset, ss_var: str):
     arr = ds[ss_var].values.astype(float)
@@ -118,7 +131,8 @@ def plot_model(
     cbar_aspect: float = 30,              # stosunek długość / szerokość
     cbar_fraction: float | None = None,   # szerokość jako ułamek osi (gdy None -> domyślne)
     cbar_location: str = "right",         # "right", "bottom", ...
-    cbar_kwargs: dict | None = None       # dodatkowe parametry do plt.colorbar
+    cbar_kwargs: dict | None = None,      # dodatkowe parametry do plt.colorbar
+    show: bool = True,
 ):
     """
     Rysuje mapę 'var' na tle mapy dla wybranego indeksu czasu używając Cartopy.
@@ -327,7 +341,11 @@ def plot_model(
         #     pil_kwargs={"compression": "tiff_lzw"}
         # )
 
-    plt.show()
+    if show:
+        _show_or_close(fig)
+    else:
+        fig.canvas.draw()
+        plt.close(fig)
 
     return fig, ax
 
@@ -499,4 +517,3 @@ def compare_plot(
         plt.close()
 
     return fig, ax, mean_abs, median_abs
-

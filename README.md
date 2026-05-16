@@ -31,7 +31,11 @@ The $tutorial$ folder contains Jupyter Notebooks with a guide to the software. D
 ## Features
 
 ### Precise Point Positioning (PPP)
-- PPP with GPS and Galileo 
+- PPP with GPS and Galileo
+- BeiDou PPP for single-system combined/uncombined workflows and two-system uncombined mixed workflows
+- Known limitation: PPP uncombined mixed without ionospheric constraints is still an active validation topic for BeiDou.
+  The current recommended BDS PPP path is combined PPP or BDS-only uncombined PPP with ionospheric constraints;
+  mixed uncombined no-constraints should be treated as experimental until the datum/bias model is revisited.
 - Kalman filter framework (EKF)
 - Satellite and receiver corrections (PCO/PCV, tides, troposphere, relativity)
 
@@ -47,18 +51,27 @@ The $tutorial$ folder contains Jupyter Notebooks with a guide to the software. D
 - Kriging 
 - Ionospheric activity indexes (SIDX, GIX, ROTI) 
 
+### Supported Constellations
+- GPS
+- Galileo
+- BeiDou/BDS for RINEX observation loading, preprocessing, broadcast MEO/IGSO SPP, precise/SIS products, STEC, single-system PPP, and two-system uncombined mixed PPP
+- See `docs/BEIDOU.md` for supported signals and current BDS limitations
+
 ---
 
 ## Repository Structure
 
 ```
 GNX/
+├─ pyproject.toml # Package metadata and dependency declaration
+├─ setup.py       # Compatibility shim for setuptools
 ├─ gnx_py/        # Python package (import gnx_py)
 │   ├─ ppp/
 │   ├─ ionosphere/
 │   ├─ orbits/
 │   └─ core modules
-├─ setup.py       # Package installer
+├─ examples/      # Editable example scripts using sample_data
+├─ sample_data/   # Example input data kept outside the Python package
 └─ README.md
 ```
 
@@ -70,45 +83,123 @@ To take full advantage of the interactive notebooks that make up the GNX-py manu
 
 ## Installation
 
-### Install in development mode
-Recommended Python version: **3.12+**
-```
+GNX-py is installed as the Python package `gnx_py`. After installation, it can
+be imported from any working directory as long as the same virtual environment
+is active, or selected as the interpreter in an IDE.
+
+Recommended Python version: **3.12**.
+
+### macOS / Linux
+
+```bash
 git clone https://github.com/HJpierzchala/GNX.git
 cd GNX
 
-
-
-# Windows
-py -3.12 -m venv .venv
-.venv\Scripts\activate
-python -m pip install -U pip
-
-Option A (recommended, reproducible)
-pip install -e . -c constraints-win.txt
-
-Option B (lets pip choose versions inside allowed ranges)
-pip install -e .
-
-# MacOS
-python3.12 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -U pip
-
-Option A (recommended, reproducible)
-pip install -e . -c constraints-macos.txt
-
-Option B (lets pip choose versions inside allowed ranges)
+python -m pip install --upgrade pip
 pip install -e .
 ```
 
-### Usage example
+For a non-editable install, use:
+
+```bash
+pip install .
+```
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/HJpierzchala/GNX.git
+cd GNX
+
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -e .
+```
+
+For a non-editable install, use:
+
+```powershell
+pip install .
+```
+
+### Verify the Import
+
+From any directory, with the environment active:
+
+```bash
+python -c "import gnx_py; print(gnx_py.__file__)"
+```
+
+The printed path should point to this repository for an editable install, or to
+the environment's `site-packages` directory for a normal install.
+
+### Developer Install
+
+Developer and test tools are available as an optional extra:
+
+```bash
+pip install -e ".[dev]"
+```
+
+The existing `requirements-runtime.txt` and `requirements-dev.txt` files are
+kept for users who prefer requirements-file workflows. Constraint files can be
+used when reproducing a known platform setup:
+
+```bash
+pip install -e . -c constraints-macos.txt
+pip install -e . -c constraints-win.txt
+```
+
+### Usage Example
 
 ```python
 import gnx_py as gnx 
 from gnx_py.ppp import PPPConfig, PPPSession
-from gnx_py.ionosphere import TECConfig TECSession
+from gnx_py.ionosphere import TECConfig, TECSession
 from gnx_py.orbits import SISConfig, SISController
 ```
+
+### Using in IDE
+
+Create and install GNX-py in a virtual environment first, then select that
+environment as the interpreter in your IDE:
+
+- macOS / Linux: `.venv/bin/python`
+- Windows: `.venv\Scripts\python.exe`
+
+After the interpreter is selected, `import gnx_py` works in notebooks, scripts,
+test files, and terminals launched from the IDE.
+
+### Running Examples
+
+Example scripts live in `examples/` and use the repository `sample_data/`
+directory by default. Run them from the repository root after installing the
+package:
+
+```bash
+python examples/run_spp_example.py
+python examples/run_ppp_example.py
+python examples/run_sise_example.py
+python examples/run_stec_example.py
+```
+
+Each script has a `USER SETTINGS` section near the top where you can change
+stations, systems, signal modes, product paths and smoke-test time windows.
+Generated files are written to `examples/output/`, which is ignored by Git.
+
+### Troubleshooting
+
+- If `import gnx_py` fails, check that the intended virtual environment is
+  active.
+- If dependencies are missing, run `pip install -e .` again from the repository
+  root.
+- If an IDE cannot see `gnx_py`, select the `.venv` interpreter created for this
+  repository.
+- If `print(gnx_py.__file__)` points to a different local clone, clear any stale
+  `PYTHONPATH` entry and reinstall in the active environment.
 
 ---
 
@@ -135,7 +226,7 @@ Planned features:
 - PPP-AR full pipeline
 - Regional GIM estimation with Spherical Harmonics + KF 
 - Cython & parallel acceleration
-- Processing of other GNSS systems, especially BeiDou and GLONASS
+- Broader multi-GNSS processing, including three-constellation BeiDou PPP, mixed combined BeiDou PPP, BDS GEO broadcast support, and GLONASS
 
 Contributions and suggestions are welcome. It would be really cool if GNX-py became an easy-to-use, enjoyable tool for research and learning. If you have any ideas, suggestions, or comments, let us know on GitHub. 
 

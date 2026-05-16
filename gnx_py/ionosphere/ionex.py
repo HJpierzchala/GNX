@@ -38,6 +38,12 @@ ArrayLike = Union[Sequence[Number], np.ndarray]
 class TECInterpolator:
     """Interpolate TEC values from a GIM on a thin-shell ionospheric layer.
 
+        Status
+        ------
+        Active utility used by legacy preprocessing tools and GIM-based
+        workflows. Requires validation when changing IPP geometry or mapping
+        function assumptions.
+
         The interpolator provides:
         - Epoch selection from a multi-epoch GIM product.
         - Computation of ionospheric pierce points (IPPs) at a fixed shell radius.
@@ -76,23 +82,22 @@ class TECInterpolator:
         az_deg: Sequence[float] | np.ndarray,
         xyz_m: Sequence[float] | np.ndarray,
     ) -> np.ndarray:
-        """Interpolate VTEC at given geographic coordinates and an optional epoch.
+        """Interpolate slant TEC from GIM for receiver/satellite geometry.
 
                 Parameters
                 ----------
-                lat : ArrayLike
-                    Geographic latitude(s) in degrees, broadcastable to `lon`.
-                lon : ArrayLike
-                    Geographic longitude(s) in degrees, broadcastable to `lat`.
-                t : pandas.Timestamp | None, optional
-                    Epoch to sample. If None, uses the currently selected `epoch`
-                    or the nearest available epoch inferred by `_select_epoch`.
+                ev_deg : ArrayLike
+                    Satellite elevation angle(s) in degrees.
+                az_deg : ArrayLike
+                    Satellite azimuth angle(s) in degrees.
+                xyz_m : ArrayLike
+                    Receiver ECEF coordinates in meters.
 
                 Returns
                 -------
                 numpy.ndarray
-                    Interpolated VTEC values [TECU], with the shape broadcast from
-                    inputs `lat` and `lon`.
+                    Interpolated slant TEC values [TECU] after thin-shell IPP
+                    interpolation and elevation mapping.
 
                 Raises
                 ------
@@ -227,6 +232,10 @@ class TECInterpolator:
 class GIMData:
     """Container for GIM gridded data and metadata.
 
+        Status
+        ------
+        Active data container returned by ``GIMReader``.
+
         Attributes
         ----------
         tec : xr.DataArray | np.ndarray
@@ -295,6 +304,12 @@ class _DCBEntry:
 
 class GIMReader:
     """Reader for IONEX/INX Global Ionosphere Maps and optional DCB products.
+
+        Status
+        ------
+        Active parser used by ionosphere workflows and by PPP when measuring
+        STEC. Requires caution: DCB parsing feeds satellite/station bias policy
+        and currently supports GPS, Galileo and BeiDou records.
 
         This class parses IONEX/INX files to extract:
         - TEC maps (possibly multi-epoch) on a latitude/longitude grid,
@@ -433,6 +448,12 @@ class GIMReader:
     def _parse_dcb(cls, path: Path) -> pd.DataFrame:
         """Parse DCB entries from raw lines.
 
+                Status
+                ------
+                Active and requires caution. The parsed bias table is consumed
+                by STEC bias handling for GPS, Galileo and BeiDou. Format
+                extensions should be covered by product-specific tests.
+
                 Parameters
                 ----------
                 lines : list[str]
@@ -455,9 +476,9 @@ class GIMReader:
             if not p:
                 continue
             key = p[0]
-            if len(key) >= 2 and key[0] in "GE" and key[1].isdigit():
+            if len(key) >= 2 and key[0] in "GEC" and key[1].isdigit():
                 entries.append(_DCBEntry(key[0], key[1:], float(p[1]), float(p[2]), "satellite", key))
-            elif key in "GE" and len(p) >= 3:
+            elif key in "GEC" and len(p) >= 3:
                 try:
                     float(p[2]); prn = p[1]; bias, rms = float(p[2]), float(p[3])
                 except ValueError:

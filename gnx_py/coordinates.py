@@ -7,6 +7,16 @@ import pandas as pd
 import gnx_py.time
 from .utils import calculate_distance
 from typing import Optional, Union
+from .gnss import (
+    CLIGHT,
+    code_prefixes,
+    frequency_hz,
+    is_bds_geo,
+    mode_ionosphere_free_coefficients,
+    mode_layout,
+    mode_signals,
+    signal_spec,
+)
 
 try:
     RankWarning = np.exceptions.RankWarning  # NumPy >=2.0
@@ -25,10 +35,28 @@ except Exception:
         return deco
 
 # ---------------- Stałe ----------------
-C_LIGHT = 299_792_458.0           # [m/s]
+C_LIGHT = CLIGHT           # [m/s]
 DT_VEL  = 5e-6                  # [s] – pół-okno do prędkości (±0.5 µs)
 pi = np.pi
 WEEK = 604800.0
+
+
+def _select_code_column(df: pd.DataFrame, mode: str | None) -> str:
+    mode = mode or ""
+    try:
+        preferred_prefixes = code_prefixes(mode)
+    except ValueError:
+        preferred_prefixes = ("C1", "C2", "C5", "C6", "C7")
+
+    for prefix in preferred_prefixes:
+        matches = [c for c in df.columns if c.startswith(prefix)]
+        if matches:
+            return matches[0]
+
+    fallback = [c for c in df.columns if c.startswith(("C1", "C2", "C5", "C6", "C7"))]
+    if fallback:
+        return fallback[0]
+    raise KeyError(f"No supported code observation column found for mode {mode!r}.")
 
 def _process_satellite_interpolation(args):
     """
@@ -302,9 +330,19 @@ class SP3InterpolatorOptimized:
             }
             tasks.append(task)
 
-        # Równoległe przetwarzanie z użyciem ProcessPoolExecutor
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            results = list(executor.map(_process_satellite_interpolation, tasks))
+        # Równoległe przetwarzanie z użyciem ProcessPoolExecutor.
+        # Some sandboxed validation environments reject process creation; keep
+        # the same worker function and fall back to sequential execution.
+        try:
+            with concurrent.futures.ProcessPoolExecutor() as executor:
+                results = list(executor.map(_process_satellite_interpolation, tasks))
+        except OSError as exc:
+            warnings.warn(
+                f"SP3 interpolation fell back to sequential execution after process-pool failure: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            results = [_process_satellite_interpolation(task) for task in tasks]
 
         # Scal wyniki – results to lista list słowników
         for sat_results in results:
@@ -698,10 +736,7 @@ class CrdWrapper:
 
     def get_emission_epochs(self):
         _c = 299792458
-        if self.mode == 'L1' or self.mode =='L1L2':
-            c1_col = [col for col in self.obs.columns if col.startswith('C1')][0]
-        elif self.mode == 'L5':
-            c1_col = [col for col in self.obs.columns if col.startswith('C5')][0]
+        c1_col = _select_code_column(self.obs, self.mode)
 
         if self.mode == 'L1':
             s = (self.obs[c1_col].values / _c ) - self.obs['dt_clock'].values + self.obs['TGD'].values
@@ -752,7 +787,7 @@ def emission_interp(obs, crd, prev_sp3_df, sp3_df, next_sp3_df):
         t_em = (obs_crd['P3'] / C) + obs_crd['clk']
         obs_crd['t_em'] = t_em
     else:
-        c1_col = [col for col in obs_crd.columns if col.startswith('C')][0]
+        c1_col = _select_code_column(obs_crd, None)
         t_em = (obs_crd[c1_col] / C) + obs_crd['clk']
         obs_crd['t_em'] = t_em
     obs_crd['obs_time'] = obs_crd.index.get_level_values('time')
@@ -780,36 +815,19 @@ def emission_interp(obs, crd, prev_sp3_df, sp3_df, next_sp3_df):
 
 
 def make_ionofree(obs_df,  mode,sys='G'):
-    F1 = 1575.42e06
-    F2 = 1227.60e06
-    FE1a = F1
-    FE5a = 1176.45e06
-    FE5b = 1207.140e06
+    def first_col(prefix):
+        return [c for c in obs_df.columns if c.startswith(prefix)][0]
 
-    # if sys == 'G':
-    if mode in ['L1','L1L2']:
-        c1 = [c for c in obs_df.columns if c.startswith('C1')][0]
-        c2 = [c for c in obs_df.columns if c.startswith('C2')][0]
-        obs_df['P3'] = 2.545 * obs_df[c1] - 1.545 * obs_df[c2]
-    elif mode in ['L1L5','L5']:
-        c1 = [c for c in obs_df.columns if c.startswith('C1')][0]
-        c5 = [c for c in obs_df.columns if c.startswith('C5')][0]
-        obs_df['P3'] = 2.2606 * obs_df[c1] - 1.2606 * obs_df[c5]
-# elif sys =='E':
-    if mode in ['E1','E1E5a','E5a']:
-        K1 = FE1a ** 2 / (FE1a ** 2 - FE5a ** 2)
-        K2 = FE5a ** 2 / (FE1a ** 2 - FE5a ** 2)
-        c1 = [c for c in obs_df.columns if c.startswith('C1')][0]
-        c5 = [c for c in obs_df.columns if c.startswith('C5')][0]
-        obs_df['P3'] = K1 * obs_df[c1] - K2 * obs_df[c5]
-    elif mode in ['E1E5b','E5b']:
-        K1 = FE1a ** 2 / (FE1a ** 2 - FE5b ** 2)
-        K2 = FE5b ** 2 / (FE1a ** 2 - FE5b ** 2)
-        c1 = [c for c in obs_df.columns if c.startswith('C1')][0]
-        c7 = [c for c in obs_df.columns if c.startswith('C7')][0]
-        obs_df['P3'] = K1 * obs_df[c1] - K2 * obs_df[c7]
-    # else:
-    #     raise NotImplementedError('Unknown sys!')
+    signals = mode_signals(mode)
+    if len(signals) == 1:
+        obs_df['P3'] = obs_df[first_col(signal_spec(signals[0]).code_prefix)]
+        return
+
+    sig1, sig2 = signals
+    k1, k2 = mode_ionosphere_free_coefficients(mode)
+    c1 = first_col(signal_spec(sig1).code_prefix)
+    c2 = first_col(signal_spec(sig2).code_prefix)
+    obs_df['P3'] = k1 * obs_df[c1] - k2 * obs_df[c2]
 
 
 def eccentric_anomaly(mk, e, pi):
@@ -1336,10 +1354,61 @@ def gal_numpy_broadcast_interpolation(message_toc, observation_toc, message, wit
         return np.array([x, y, z, dt]), np.array([x_dot, y_dot, z_dot, dt_dot])
 
 
+def bds_numpy_broadcast_interpolation(message_toc, observation_toc, message, with_rel=True, rel_sep=False):
+    """BeiDou broadcast interpolation for BDS MEO/IGSO messages.
+
+    The current broadcast pipeline intentionally skips BDS GEO PRNs before this
+    function is called, because those satellites require the BeiDou GEO-specific
+    coordinate rotation that is not present in the GPS/Galileo propagator.
+    """
+    return gal_numpy_broadcast_interpolation(
+        message_toc=message_toc,
+        observation_toc=observation_toc,
+        message=message,
+        with_rel=with_rel,
+        rel_sep=rel_sep,
+    )
+
+
+def _bds_numpy_broadcast_interpolation_batch(message_toc, observation_toc, messages):
+    return _gal_numpy_broadcast_interpolation_batch(message_toc, observation_toc, messages)
+
+
 
 def _wrap_dist_sow(a_sow: np.ndarray, b_sow: np.ndarray) -> np.ndarray:
     d = np.abs(a_sow[:, None] - b_sow[None, :])
     return np.minimum(d, WEEK - d)
+
+BDS_MINUS_GPS_SECONDS = -14.0
+
+def _obs_toc_for_system(times, system: str):
+    toc = np.asarray(gnx_py.time.datetime2toc(t=times), dtype=float)
+    if system == "C":
+        # BeiDou broadcast Toe/Toc values are expressed in BDT. Mixed RINEX
+        # observation epochs are GPST in the current SPP workflow, and
+        # BDT = GPST - 14 s.
+        toc = np.mod(toc + BDS_MINUS_GPS_SECONDS, WEEK)
+    return toc
+
+def _broadcast_validity_seconds(system: str) -> float:
+    if system == "E":
+        return 14400.0
+    if system == "C":
+        return 14400.0
+    return 7200.0
+
+def _bds_message_types_for_mode(mode: str | None) -> set[str]:
+    try:
+        signals = set(mode_signals(mode or "B1IB3I"))
+    except ValueError:
+        return {"D1", "D2"}
+    if not signals.intersection({"B1C", "B2a", "B2b"}):
+        return {"D1", "D2"}
+    if "B2b" in signals:
+        return {"CNV3"}
+    if "B2a" in signals:
+        return {"CNV2"}
+    return {"CNV1"}
 
 def _wrap_signed(t):
     return (t + WEEK/2) % WEEK - WEEK/2
@@ -1400,9 +1469,10 @@ def _prep_nav_arrays(system: str, nav_block: pd.DataFrame):
 
     orig_iloc = np.arange(len(nav_block), dtype=int)
 
-    # GPS health filter (keep only healthy)
-    if system == 'G' and 'health' in nav_block.columns:
-        good = (nav_block['health'].to_numpy() == 0)
+    # Health filter (keep only healthy broadcast messages where the system exposes it)
+    health_col = 'health' if 'health' in nav_block.columns else 'SatH1' if 'SatH1' in nav_block.columns else None
+    if system in {'G', 'C'} and health_col is not None:
+        good = (nav_block[health_col].to_numpy() == 0)
         toe = toe[good]
         quality = quality[good]
         orig_iloc = orig_iloc[good]
@@ -1419,6 +1489,7 @@ def _pick_nav_rows_pref_future_else_past_with_hold(
     hold_sec: float = None,
     switch_thresh_sec: float = 900.0,
     nearest_h: float | None = None,
+    allow_out_of_window: bool = True,
 ) -> np.ndarray:
     """
     GPS-friendly hybrid:
@@ -1432,7 +1503,7 @@ def _pick_nav_rows_pref_future_else_past_with_hold(
       age < 0  -> Toe in FUTURE
       age > 0  -> Toe in PAST
     """
-    valid_h = 14400.0 if system == 'E' else 7200.0
+    valid_h = _broadcast_validity_seconds(system)
     if hold_sec is None:
         hold_sec = 3600.0 if system == 'G' else 7200.0
     if nearest_h is None:
@@ -1480,6 +1551,8 @@ def _pick_nav_rows_pref_future_else_past_with_hold(
         # 3) nearest: minimal |age| (prefer in-window near_mask; if empty, use all)
         m = near_mask[i]
         if not m.any():
+            if not allow_out_of_window:
+                return -1, 'none'
             m = np.ones(age.shape[1], dtype=bool)
         best_abs = np.min(np.abs(age[i, m]))
         idxs = np.flatnonzero(m & (np.abs(np.abs(age[i]) - best_abs) < 1e-9))
@@ -1550,6 +1623,7 @@ def _pick_nav_rows_pref_past_else_future_with_hold(
     hold_sec: float = None,
     switch_thresh_sec: float = 900.0,
     nearest_h: float | None = None,
+    allow_out_of_window: bool = True,
 ) -> np.ndarray:
     """
     Galileo-friendly hybrid:
@@ -1557,7 +1631,7 @@ def _pick_nav_rows_pref_past_else_future_with_hold(
       2) fallback FUTURE
       3) fallback NEAREST
     """
-    valid_h = 14400.0 if system == 'E' else 7200.0
+    valid_h = _broadcast_validity_seconds(system)
     if hold_sec is None:
         hold_sec = 10800.0 if system == 'E' else 3600.0
     if nearest_h is None:
@@ -1605,6 +1679,8 @@ def _pick_nav_rows_pref_past_else_future_with_hold(
         # 3) nearest: minimal |age|
         m = near_mask[i]
         if not m.any():
+            if not allow_out_of_window:
+                return -1, 'none'
             m = np.ones(age.shape[1], dtype=bool)
         best_abs = np.min(np.abs(age[i, m]))
         idxs = np.flatnonzero(m & (np.abs(np.abs(age[i]) - best_abs) < 1e-9))
@@ -1673,6 +1749,7 @@ def _select_by_toe_for_sat(system, obs_sv, nav_sv, picker='_gps_pref_future'):
             hold_sec=(30 * 60),
             switch_thresh_sec=900.0,
             nearest_h=None,
+            allow_out_of_window=(system != "C"),
         )
     elif picker == '_gal_pref_past':
         choice = _pick_nav_rows_pref_past_else_future_with_hold(
@@ -1682,6 +1759,7 @@ def _select_by_toe_for_sat(system, obs_sv, nav_sv, picker='_gps_pref_future'):
             hold_sec=(30 * 60),
             switch_thresh_sec=900.0,
             nearest_h=None,
+            allow_out_of_window=(system != "C"),
         )
     else:
         raise ValueError(f"Unknown picker: {picker}")
@@ -1727,6 +1805,8 @@ def _run_brdc_interp(mes_toc, obs_toc, messages, interp_fun):
         batch_fun = _numpy_broadcast_interpolation_batch
     elif interp_fun is gal_numpy_broadcast_interpolation:
         batch_fun = _gal_numpy_broadcast_interpolation_batch
+    elif interp_fun is bds_numpy_broadcast_interpolation:
+        batch_fun = _bds_numpy_broadcast_interpolation_batch
 
     if batch_fun is not None:
         try:
@@ -1747,6 +1827,8 @@ def _run_brdc_interp(mes_toc, obs_toc, messages, interp_fun):
             row = _normalize_brdc_interp_result(interp_fun(mt, ot, msg))
         except Exception:
             continue
+        if not np.all(np.isfinite(row)):
+            continue
         rows.append(row)
         lengths.append(row.size)
         valid_mask[idx] = True
@@ -1754,8 +1836,7 @@ def _run_brdc_interp(mes_toc, obs_toc, messages, interp_fun):
     if not rows:
         return None, valid_mask
     if len(set(lengths)) != 1:
-        maxlen = max(lengths)
-        rows = [np.pad(r, (0, maxlen - len(r)), mode='constant') for r in rows]
+        raise ValueError(f"Inconsistent broadcast interpolation output sizes: {sorted(set(lengths))}")
     return np.vstack(rows), valid_mask
 
 class BrdcGenerator:
@@ -1769,6 +1850,11 @@ class BrdcGenerator:
                     'DeltaN', 'M0', 'Cuc', 'Eccentricity', 'Cus', 'sqrtA', 'Toe', 'Cic',
                     'Omega0', 'Cis', 'Io', 'Crc', 'omega', 'OmegaDot', 'IDOT', 'DataSrc',
                     'GALWeek', 'SISA', 'health', 'BGDe5a', 'BGDe5b', 'TransTime']
+    bds_mes_cols = ['SVclockBias', 'SVclockDrift', 'SVclockDriftRate', 'AODE', 'Crs',
+                    'DeltaN', 'M0', 'Cuc', 'Eccentricity', 'Cus', 'sqrtA', 'Toe', 'Cic',
+                    'Omega0', 'Cis', 'Io', 'Crc', 'omega', 'OmegaDot', 'IDOT', 'spare0',
+                    'BDTWeek', 'SVacc', 'SatH1', 'TGD1', 'TGD2', 'TransTime',
+                    'AODC']
 
     def __init__(self, system, interval, mode, nav, tolerance ='1H'):
         self.sys = system
@@ -1799,7 +1885,7 @@ class BrdcGenerator:
         self.tolerance = tolerance
 
     def _add_obs_toc(self):
-        obs_toc = gnx_py.time.datetime2toc(t=self.table.index.get_level_values('time').tolist())
+        obs_toc = _obs_toc_for_system(self.table.index.get_level_values('time').tolist(), self.sys)
         self.table['toc'] = obs_toc
 
     def _add_nav_toc(self):
@@ -1841,7 +1927,7 @@ class BrdcGenerator:
                     nav_sv = df_orb[df_orb['sv'] == sv]
             if nav_sv.empty:
                 return pd.DataFrame()
-            picker = '_gps_pref_future' if self.sys == 'G' else '_gal_pref_past'
+            picker = '_gps_pref_future' if self.sys in {'G', 'C'} else '_gal_pref_past'
             sel = _select_by_toe_for_sat(self.sys, df_obs, nav_sv, picker)
             if sel is None or sel.empty:
                 return pd.DataFrame()
@@ -1855,7 +1941,7 @@ class BrdcGenerator:
                 nav_sv = df_orb[df_orb['sv'] == sv]
                 if nav_sv.empty:
                     continue
-                if self.sys == 'G':
+                if self.sys in {'G', 'C'}:
                     picker = '_gps_pref_future'  # prefer future, fallback past (np. po 22), fallback nearest
                 else:
                     picker = '_gal_pref_past'  # prefer past, fallback future, fallback nearest
@@ -1877,6 +1963,30 @@ class BrdcGenerator:
         freq = self.SEC_TO_FREQ[self.interval]
         if self.sys == 'G':
             sats_av = self.nav.index.get_level_values('sv').unique().tolist()
+        elif self.sys == 'C':
+            if "nav_message" in self.nav.columns:
+                allowed_messages = _bds_message_types_for_mode(self.mode)
+                self.nav = self.nav[self.nav["nav_message"].isin(allowed_messages)]
+                if self.nav.empty:
+                    raise ValueError(
+                        f"No BeiDou navigation messages {sorted(allowed_messages)} available for mode {self.mode}."
+                    )
+            self.nav = self._clear_suffixes(df=self.nav)
+            geo_sats = sorted(
+                sv for sv in self.nav.index.get_level_values('sv').unique().tolist()
+                if is_bds_geo(sv)
+            )
+            if geo_sats:
+                warnings.warn(
+                    "BeiDou broadcast interpolation currently supports BDS MEO/IGSO only; "
+                    f"skipping GEO satellites: {', '.join(geo_sats)}.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self.nav = self.nav[~self.nav.index.get_level_values('sv').map(is_bds_geo)]
+            if 'SatH1' in self.nav.columns:
+                self.nav = self.nav[self.nav['SatH1'] == 0]
+            sats_av = self.nav.index.get_level_values('sv').unique().tolist()
         elif self.sys == 'E':
             self.nav = self._clear_suffixes(df=self.nav)
 
@@ -1897,6 +2007,10 @@ class BrdcGenerator:
                         self.nav['E5a_SHS'].isin([0, 2]) & (self.nav['E5a_DVS'] == 0))
                 self.nav = self.nav[war]
             sats_av = self.nav.index.get_level_values('sv').unique().tolist()
+        if not sats_av:
+            raise ValueError(
+                f"No usable {self.sys} broadcast satellites after system-specific screening."
+            )
         t0 = sorted(self.nav.index.get_level_values('time').unique().tolist())[0].floor(freq='min')
         t1 = sorted(self.nav.index.get_level_values('time').unique().tolist())[-1].floor(freq='min')
         idx = pd.MultiIndex.from_product(
@@ -1906,13 +2020,16 @@ class BrdcGenerator:
 
     def get_coordinates(self):
         output = []
-        picker = '_gps_pref_future' if self.sys == 'G' else '_gal_pref_past'
+        picker = '_gps_pref_future' if self.sys in {'G', 'C'} else '_gal_pref_past'
         if self.sys == 'E':
             needed = self.gal_mes_cols
             interp_fun = gal_numpy_broadcast_interpolation
         elif self.sys == 'G':
             needed = self.mes_cols
             interp_fun = numpy_broadcast_interpolation
+        elif self.sys == 'C':
+            needed = self.bds_mes_cols
+            interp_fun = bds_numpy_broadcast_interpolation
         else:
             raise ValueError(f"Unknown sys: {self.sys}")
 
@@ -1944,7 +2061,7 @@ class BrdcGenerator:
                         toc = df_obs_block['toc'].to_numpy(float)
                         D = _wrap_dist_sow(toc, toe) if toe.size and toc.size else None
                         min_d = np.min(D, axis=1) if D is not None else np.array([])
-                        within = np.sum(min_d <= (7200.0 if self.sys == 'G' else 14400.0)) if min_d.size else 0
+                        within = np.sum(min_d <= _broadcast_validity_seconds(self.sys)) if min_d.size else 0
                         print(f"[diag] {sv}: epochs={len(toc)}, NAV={len(toe)}, in_window={within}")
                     except Exception:
                         pass
@@ -2020,6 +2137,11 @@ class BroadcastInterp:
                     'DeltaN', 'M0', 'Cuc', 'Eccentricity', 'Cus', 'sqrtA', 'Toe', 'Cic',
                     'Omega0', 'Cis', 'Io', 'Crc', 'omega', 'OmegaDot', 'IDOT', 'DataSrc',
                     'GALWeek', 'SISA', 'health', 'BGDe5a', 'BGDe5b', 'TransTime']
+    bds_mes_cols = ['SVclockBias', 'SVclockDrift', 'SVclockDriftRate', 'AODE', 'Crs',
+                    'DeltaN', 'M0', 'Cuc', 'Eccentricity', 'Cus', 'sqrtA', 'Toe', 'Cic',
+                    'Omega0', 'Cis', 'Io', 'Crc', 'omega', 'OmegaDot', 'IDOT', 'spare0',
+                    'BDTWeek', 'SVacc', 'SatH1', 'TGD1', 'TGD2', 'TransTime',
+                    'AODC']
 
     def __init__(self, obs, nav, mode, sys, emission_time=True,tolerance='2H'):
         self.obs = obs
@@ -2038,12 +2160,13 @@ class BroadcastInterp:
         return df
 
     def _add_obs_toc(self, emission=False):
+        self.obs = self.obs.copy()
         if emission:
-            obs_toc = gnx_py.time.datetime2toc(t=self.obs['em_epoch'].tolist())
-            self.obs['toc'] = obs_toc
+            obs_toc = _obs_toc_for_system(self.obs['em_epoch'].tolist(), self.sys)
+            self.obs.loc[:, 'toc'] = obs_toc
         else:
-            obs_toc = gnx_py.time.datetime2toc(t=self.obs.index.get_level_values('time').tolist())
-            self.obs['toc'] = obs_toc
+            obs_toc = _obs_toc_for_system(self.obs.index.get_level_values('time').tolist(), self.sys)
+            self.obs.loc[:, 'toc'] = obs_toc
         return self.obs
 
     def _add_nav_toc(self):
@@ -2079,7 +2202,7 @@ class BroadcastInterp:
                     nav_sv = df_orb[df_orb['sv'] == sv]
             if nav_sv.empty:
                 return pd.DataFrame()
-            picker = '_gps_pref_future' if self.sys == 'G' else '_gal_pref_past'
+            picker = '_gps_pref_future' if self.sys in {'G', 'C'} else '_gal_pref_past'
             sel = _select_by_toe_for_sat(self.sys, df_obs, nav_sv, picker)
             if sel is None or sel.empty:
                 return pd.DataFrame()
@@ -2093,7 +2216,7 @@ class BroadcastInterp:
                 nav_sv = df_orb[df_orb['sv'] == sv]
                 if nav_sv.empty:
                     continue
-                if self.sys == 'G':
+                if self.sys in {'G', 'C'}:
                     picker = '_gps_pref_future'  # prefer future, fallback past (np. po 22), fallback nearest
                 else:
                     picker = '_gal_pref_past'  # prefer past, fallback future, fallback nearest
@@ -2114,13 +2237,16 @@ class BroadcastInterp:
 
     def get_coordinates(self):
         output = []
-        picker = '_gps_pref_future' if self.sys == 'G' else '_gal_pref_past'
+        picker = '_gps_pref_future' if self.sys in {'G', 'C'} else '_gal_pref_past'
         if self.sys == 'E':
             needed = self.gal_mes_cols
             interp_fun = gal_numpy_broadcast_interpolation
         elif self.sys == 'G':
             needed = self.mes_cols
             interp_fun = numpy_broadcast_interpolation
+        elif self.sys == 'C':
+            needed = self.bds_mes_cols
+            interp_fun = bds_numpy_broadcast_interpolation
         else:
             raise ValueError(f"Unknown sys: {self.sys}")
 
@@ -2152,7 +2278,7 @@ class BroadcastInterp:
                         toc = df_obs_block['toc'].to_numpy(float)
                         D = _wrap_dist_sow(toc, toe) if toe.size and toc.size else None
                         min_d = np.min(D, axis=1) if D is not None else np.array([])
-                        within = np.sum(min_d <= (7200.0 if self.sys == 'G' else 14400.0)) if min_d.size else 0
+                        within = np.sum(min_d <= _broadcast_validity_seconds(self.sys)) if min_d.size else 0
                         print(f"[diag] {sv}: epochs={len(toc)}, NAV={len(toe)}, in_window={within}")
                     except Exception:
                         pass
@@ -2212,7 +2338,7 @@ class BroadcastInterp:
         if 'P3' in self.obs.columns:
             ccol='P3'
         else:
-            ccol = [c for c in self.obs.columns if c.startswith('C')][0]
+            ccol = _select_code_column(self.obs, self.mode)
         obs_time = self.obs.index.get_level_values('time')
         self.obs['obs_time'] = obs_time
         t_em = ((self.obs[ccol] / clight) + self.obs['clk'])
@@ -2224,6 +2350,8 @@ class BroadcastInterp:
             self.obs = self.obs.drop(columns=['x', 'y', 'z', 'clk', 'vx', 'vy', 'vz', 'clk_dot'] + self.mes_cols)
         elif self.sys == 'E':
             self.obs = self.obs.drop(columns=['x', 'y', 'z', 'clk', 'vx', 'vy', 'vz', 'clk_dot'] + self.gal_mes_cols)
+        elif self.sys == 'C':
+            self.obs = self.obs.drop(columns=['x', 'y', 'z', 'clk', 'vx', 'vy', 'vz', 'clk_dot'] + self.bds_mes_cols)
         return self.obs
 
     def interpolate(self):
@@ -2250,6 +2378,38 @@ class BroadcastInterp:
             self.nav = self._add_nav_toc()
             result = self.get_coordinates()
             self.obs = pd.merge(left=init_obs,right=result,on=['sv','time'],how='right')
+            if self.emission_time:
+                self.obs = self.grab_emission_time()
+                self._clear_reception_data()
+                self.obs = self._add_obs_toc(emission=True)
+                result = self.get_coordinates()
+        if self.sys == 'C':
+            self.nav = self.nav.dropna(how='any', axis=1).dropna(how='all', axis=0)
+            self.nav = self._clear_suffixes(df=self.nav)
+            geo_sats = sorted(
+                sv for sv in self.nav.index.get_level_values('sv').unique().tolist()
+                if is_bds_geo(sv)
+            )
+            if geo_sats:
+                warnings.warn(
+                    "BeiDou broadcast interpolation currently supports BDS MEO/IGSO only; "
+                    f"skipping GEO satellites: {', '.join(geo_sats)}.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self.nav = self.nav[~self.nav.index.get_level_values('sv').map(is_bds_geo)]
+            if 'SatH1' in self.nav.columns:
+                self.nav = self.nav[self.nav['SatH1'] == 0]
+            if self.nav.empty:
+                raise ValueError(
+                    "BeiDou broadcast interpolation currently supports BDS MEO/IGSO only; "
+                    "GEO PRNs C01-C05/C59-C63 were excluded."
+                )
+            self.obs = self.obs[~self.obs.index.get_level_values('sv').map(is_bds_geo)]
+            self.obs = self._add_obs_toc(emission=False)
+            self.nav = self._add_nav_toc()
+            result = self.get_coordinates()
+            self.obs = pd.merge(left=init_obs, right=result, on=['sv', 'time'], how='right')
             if self.emission_time:
                 self.obs = self.grab_emission_time()
                 self._clear_reception_data()
@@ -2482,6 +2642,10 @@ def lagrange_interp(
         Returns a DataFrame with MultiIndex (time, sv) and columns:
             x, y, z, clk, vx, vy, vz, clk_rel
         """
+    out_cols = ['x', 'y', 'z', 'clk_raw', 'clk', 'vx', 'vy', 'vz', 'clk_rel']
+    if obs.empty:
+        return pd.DataFrame(index=obs.index.copy(), columns=out_cols, dtype=np.float64)
+
     obs = obs.copy(); sp3 = sp3.copy()
     # obs.index = obs.index.set_names(['time', 'sv'])
     obs.index = (
@@ -2576,7 +2740,7 @@ def lagrange_interp(
                          out_vel,
                          out_rel.reshape(-1,1)]),
         index=obs_sorted.index,
-        columns=['x','y','z','clk_raw','clk','vx','vy','vz','clk_rel']
+        columns=out_cols
     )
     return out
 
@@ -2609,27 +2773,42 @@ def lagrange_emission_interp(obs:pd.DataFrame, positions:pd.DataFrame, sp3_df:pd
     :param gap_factor: Optional[Union[float,int]], gap factor for interpolation, default: 3.0
     :return: pd.DataFrame, index: pd.MultiIndex (time, sv), dataframe with observation data, satellite positions and clocks
     """
+    interp_cols = ['x', 'y', 'z', 'clk_raw', 'clk', 'vx', 'vy', 'vz', 'clk_rel']
     obs_crd = obs.join(positions)
     obs_crd.reset_index(inplace=True)
+    obs_crd['__rowid'] = np.arange(len(obs_crd), dtype=np.int64)
     if 'P3' in obs_crd.columns:
         obs_crd['t_em'] = (obs_crd['P3'] / C_LIGHT) + (obs_crd['clk'])
     else:
-        col = [c for c in obs_crd.columns if c.startswith(('C1','C2','C5','C7'))][0]
+        mode = obs.attrs.get("mode")
+        col = _select_code_column(obs_crd, mode)
         obs_crd['t_em'] = (obs_crd[col] / C_LIGHT) + (obs_crd['clk'])
     obs_crd['time_em'] = obs_crd['time'] - pd.to_timedelta(obs_crd['t_em'].values, unit='s')
     obs_crd['time_rec'] = obs_crd['time'].copy()
-    obs_crd['time'] = obs_crd['time_em'].copy()
-    obs_crd.set_index(['time', 'sv'], inplace=True)
-    interp_em = lagrange_interp(
-        obs=obs_crd,
-        sp3=sp3_df,
-        m=degree,
-        gap_factor=gap_factor
-    )
-    obs_final = obs_crd.merge(interp_em, how="left", on=["time", "sv"], suffixes=("_old", ""))
-    obs_final = obs_final.drop([c for c in obs_final.columns if c.endswith("_old")], axis=1)
+
+    obs_for_interp = obs_crd.copy()
+    obs_for_interp['time'] = obs_for_interp['time_em'].copy()
+    obs_for_interp.set_index(['time', 'sv'], inplace=True)
+    valid_time = obs_for_interp.index.get_level_values('time').notna()
+
+    obs_final = obs_crd.drop(columns=[c for c in interp_cols if c in obs_crd.columns])
+    obs_final = obs_final.set_index('__rowid')
+    for col in interp_cols:
+        obs_final[col] = np.nan
+
+    if valid_time.any():
+        interp_input = obs_for_interp.loc[valid_time]
+        interp_em = lagrange_interp(
+            obs=interp_input,
+            sp3=sp3_df,
+            m=degree,
+            gap_factor=gap_factor
+        )
+        rowids = interp_input.sort_index()['__rowid'].to_numpy(dtype=np.int64, copy=False)
+        obs_final.loc[rowids, interp_em.columns] = interp_em.to_numpy(copy=False)
+
     obs_final.reset_index(inplace=True)
     obs_final['time'] = obs_final['time_rec'].copy()
-    obs_final = obs_final.drop(['time_rec', 'time_em'], axis=1)
+    obs_final = obs_final.drop(['__rowid', 'time_rec', 'time_em'], axis=1)
     obs_final.set_index(['time', 'sv'], inplace=True)
     return obs_final

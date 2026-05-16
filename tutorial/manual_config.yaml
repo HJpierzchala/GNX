@@ -1,0 +1,45 @@
+manual:
+  title: "GNX-py User Manual"
+  bibliography: "bibliography.bib"
+  titlepage: "titlepage.tex"
+  preamble: "preamble.tex"
+  references: "references.md"
+  latex_engine: "xelatex"
+  toc: true
+  number_sections: true
+  chapters:
+    - id: "introduction"
+      title: "Introduction"
+      path: "introduction/introduction.ipynb"
+      heavy: false
+      execute: true
+    - id: "ppp"
+      title: "Precise Point Positioning"
+      path: "ppp/precise_point_positioning.ipynb"
+      heavy: false
+      execute: true
+    - id: "orbits"
+      title: "Orbit and SIS Analysis"
+      path: "orbits/orbit_analysis.ipynb"
+      heavy: false
+      execute: true
+    - id: "ionosphere_introduction"
+      title: "Ionosphere Introduction"
+      path: "ionosphere/ionosphere_introduction.ipynb"
+      heavy: false
+      execute: true
+    - id: "calibration"
+      title: "Ionosphere Calibration"
+      path: "ionosphere/calibration.ipynb"
+      heavy: false
+      execute: true
+    - id: "activity_indexes"
+      title: "Ionospheric Activity Indexes"
+      path: "ionosphere/activity_indexes.ipynb"
+      heavy: true
+      execute: true
+    - id: "kriging"
+      title: "Ionosphere Modelling with Kriging"
+      path: "ionosphere/kriging.ipynb"
+      heavy: true
+      execute: true

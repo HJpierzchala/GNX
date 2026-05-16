@@ -1,9 +1,15 @@
 from datetime import datetime, timedelta
 
-import seaborn as sns
 import matplotlib as mpl
-sns.set_context("paper", font_scale=1.6)
-sns.set_style("ticks")
+
+try:
+    import seaborn as sns
+except ModuleNotFoundError:
+    sns = None
+else:
+    sns.set_context("paper", font_scale=1.6)
+    sns.set_style("ticks")
+
 mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['font.family'] = 'serif'
 mpl.rcParams['font.serif'] = ['Times New Roman']
@@ -182,10 +188,16 @@ def plot_residuals(df: pd.DataFrame,
         label = prn if prn not in seen_prns else None
         seen_prns.add(prn)
 
-        # Wybór kolumny
-        col = 'v' if obs_type == 'phase' else 'vc'
-        if col not in gr_filtered.columns:
-            raise KeyError(f"Column '{col}' not found in DataFrame")
+        # Wybór kolumny. Current GNX-py routes expose residuals with either
+        # compact tutorial names (v/vc) or diagnostic names from the filter.
+        candidates = (
+            ['v', 'postfit_phase_res', 'postfit_phase_res_demeaned', 'res', 'vl1']
+            if obs_type == 'phase'
+            else ['vc', 'postfit_code_res', 'postfit_code_res_demeaned', 'vc1']
+        )
+        col = next((candidate for candidate in candidates if candidate in gr_filtered.columns), None)
+        if col is None:
+            raise KeyError(f"No {obs_type} residual column found. Tried: {candidates}")
 
         # Wybór osi X
         if x_axis == 'time':
@@ -205,7 +217,7 @@ def plot_residuals(df: pd.DataFrame,
         ax.set_xlabel("Elevation [deg]")
 
     sys = prn[0] if 'prn' in locals() else '?'
-    title_map = {'G': 'GPS', 'E': 'Galileo', 'phase': 'Carrier-phase', 'code': 'Pseudorange'}
+    title_map = {'G': 'GPS', 'E': 'Galileo', 'C': 'BeiDou', 'phase': 'Carrier-phase', 'code': 'Pseudorange'}
     if title is None:
         ax.set_title(f"{title_map.get(sys, sys)} {title_map[obs_type]} residuals")
     else:
@@ -253,18 +265,27 @@ def plot_positioning_series(sol: pd.DataFrame,
         Ścieżka zapisu do pliku (opcjonalnie).
     """
 
-    required_cols = ['de', 'dn', 'du', 'dtr', 'isb']
-    for col in required_cols:
-        if col not in sol.columns:
-            raise ValueError(f"Missing required column: '{col}'")
-
     # Przycięcie danych
     if cut_init_time > 0:
         sol = sol.iloc[cut_init_time:]
 
-    cols = ['de', 'dn', 'du', 'dtr', 'isb']
-    names = ['East [m]', 'North [m]', 'Up [m]', 'Receiver Clock [m]', 'ISB [m]']
-    fig, ax = plt.subplots(5, 1, figsize=figsize, sharex=True)
+    preferred = [
+        ('de', 'East [m]'),
+        ('dn', 'North [m]'),
+        ('du', 'Up [m]'),
+        ('dtr', 'Receiver Clock [m]'),
+        ('isb', 'ISB [m]'),
+        ('ztd', 'ZTD [m]'),
+        ('ar_fixed', 'Fixed ambiguities [-]'),
+        ('ar_ratio', 'AR ratio [-]'),
+    ]
+    cols, names = zip(*[(col, name) for col, name in preferred if col in sol.columns])
+    if not cols:
+        raise ValueError("No supported positioning columns found in solution DataFrame.")
+
+    fig, ax = plt.subplots(len(cols), 1, figsize=figsize, sharex=True)
+    if len(cols) == 1:
+        ax = [ax]
 
     times = sol.index.to_list()
 
@@ -274,7 +295,7 @@ def plot_positioning_series(sol: pd.DataFrame,
         ax[i].legend(loc='upper right', fontsize=9)
         ax[i].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         if ct is not None:
-            if i <3:
+            if c in {'de', 'dn', 'du'}:
                 ax[i].axvline(x=times[0]+timedelta(minutes=int(ct)))
     ax[-1].set_xlabel("Time (UTC)")
     if title:

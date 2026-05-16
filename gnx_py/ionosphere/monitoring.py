@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import numpy as np
 import pandas as pd
 import matplotlib as mpl
@@ -15,6 +16,8 @@ warnings.filterwarnings(
     "ignore",
     message="The PostScript backend does not support transparency*"
 )
+
+logger = logging.getLogger(__name__)
 
 # --- SIDX, GIX ---
 Re = 6371e3
@@ -116,6 +119,11 @@ def compute_sid(
 ) -> pd.Series:
     """
     SIDX ≈ < dltSTEC / (M·dltt) >  (TECU/min).
+
+    Status:
+        Active monitoring helper. It is unit-sensitive: output is TECU/min, not
+        TECU/s. Use with leveled STEC or a documented scale factor.
+
     Differentiation only within the same link (name, sv) and — if enabled —
     within the same UTC day (no differences across midnight).
     Required columns: name, sv, time, stec, ev, lat_ipp, lon_ipp.
@@ -131,7 +139,7 @@ def compute_sid(
     # elevation mask
     dfa = dfa[dfa['ev'] >= min_elev_deg].copy()
     if dfa.empty:
-        print(f'No data after elevation mask application')
+        logger.info("[IONO MONITOR] metric=SIDX event=no-data-after-elevation-mask")
         return pd.Series(dtype=float, name='SIDX_tecu_per_min')
 
     # units and mapping function
@@ -162,8 +170,8 @@ def compute_sid(
         inreg = region.contains(rate['lat_ipp'].to_numpy(), rate['lon_ipp'].to_numpy())
         rate = rate[inreg]
 
-    # instantaneous indicator for individual links
-    rate['sid_link'] = rate['dSTEC'] / (rate['M'] * rate['dt_s'])  # TECU/s
+    # instantaneous indicator for individual links in TECU/min
+    rate['sid_link'] = (rate['dSTEC'] / (rate['M'] * rate['dt_s'])) * 60.0
 
     # post-epoch aggregation (average/median across links)
     if agg == "median":
@@ -177,9 +185,6 @@ def compute_sid(
     else:
         raise ValueError("agg must be 'median', 'mean', 'max', or 'p95'")
 
-
-    # scaling of units → mTECU/s
-    sid = sid * 1e3
     sid.name = 'SIDX_tecu_per_min'
     return sid
 
@@ -263,6 +268,12 @@ def compute_gix(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Input (required columns): name,time,lat_ipp,lon_ipp,stec,ev,(optional M).
+
+    Status:
+      Active monitoring helper for GIX/GIX-family diagnostics. It can be
+      computationally heavy for dense station networks; pair thinning protects
+      memory/runtime but changes sampling.
+
     Returns:
       - times_df (1 record/epoch) with fields:
         ['time',
@@ -532,6 +543,11 @@ def compute_roti_links(
       ['time','name','sv','lat_ipp','lon_ipp','TEC','ROT_tecu_per_min','ROTI_tecu_per_min']
     ROT calculated for (name, sv) and (optionally) within the same day.
     ROTI = rolling std(ROT) over time (window 'window_min'), ddof=0, min_periods='min_samples'.
+
+    Status:
+      Active monitoring helper. SM coordinate mode depends on
+      ``SolarGeomagneticTransformer`` and should be validated for the target
+      epoch/region.
     """
     need = {'time','stec','vtec','lat_ipp','lon_ipp','name','sv'}
     miss = need - set(df.columns)
@@ -731,12 +747,19 @@ def plot_roti_snapshot(
     extent: Optional[list] = None,   # [lon_min, lon_max, lat_min, lat_max]
     cmap_name: str = "viridis",
 ):
+    """Plot one ROTI snapshot on a geographic or SM grid.
+
+    Status:
+        Active visualization helper. Plotting is intentionally separated from
+        metric computation; missing data is reported through the module logger
+        and does not raise.
+    """
     grid = roti_snapshot_grid(
         roti_df, epoch=epoch, window_min=window_min, mode=mode,
         res_deg=res_deg, min_points=min_points, agg=agg, coord_mode=coord_mode
     )
     if grid.empty:
-        print("No points in the window – I'm skipping drawing.")
+        logger.info("[IONO MONITOR] plot=ROTI event=no-points-in-window")
         return
 
     # skala kolorów
@@ -890,7 +913,8 @@ def make_roti_snapshots(
     - global_scale=True → stała skala kolorów (percentyle z całego zbioru).
     """
     if roti_df.empty:
-        print("Lack of ROTI data."); return
+        logger.info("[IONO MONITOR] plot=ROTI event=no-data")
+        return
 
     # lista epok
     if epochs is None:
@@ -966,6 +990,12 @@ def plot_gix(
 
     save_path: Optional[str] = None,
 ):
+    """Plot GIX pair gradients for one epoch.
+
+    Status:
+        Active visualization helper. Requires Cartopy and raises when the
+        selected epoch has no pair data.
+    """
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
     from matplotlib.colors import LogNorm

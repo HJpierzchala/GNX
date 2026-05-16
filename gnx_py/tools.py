@@ -13,6 +13,31 @@ from .ionosphere.models import klobuchar,ntcm_vtec
 from .troposphere import saastamoinen,niell,tropospheric_delay
 from .ionosphere.ionex import GIMReader, TECInterpolator
 from .corrections import rel_path_corr, process_windup_correction_vectorized
+from .gnss import (
+    CLIGHT,
+    first_signal,
+    frequency_hz,
+    mode_ionosphere_free_coefficients,
+    mode_layout,
+    mode_signals,
+    signal_spec,
+    wavelength_m,
+)
+
+ANTEX_FREQUENCY_HZ = {
+    "G01": frequency_hz("L1"),
+    "G02": frequency_hz("L2"),
+    "G05": frequency_hz("L5"),
+    "E01": frequency_hz("E1"),
+    "E05": frequency_hz("E5a"),
+    "E07": frequency_hz("E5b"),
+    "C01": frequency_hz("B1C"),
+    "C02": frequency_hz("B1I"),
+    "C05": frequency_hz("B2a"),
+    "C06": frequency_hz("B3I"),
+    "C07": frequency_hz("B2I"),
+    "C08": 1191.795e6,
+}
 
 # —————————————————————————————————————————————
 # 3) Metody „wkładalne” do Twojej klasy
@@ -29,55 +54,23 @@ class CSDetector:
         self.M = 5  # interpolation and CS repair window size
         self.dcb = dcb
         self.mode=mode
-        self.F = {'f1': 1575.42e06,
-                  'f2': 1227.60e06,
-                  'f5': 1176.45e06,
-                  'fe1a': 1575.420e06,
-                  'fe5a': 1176.450e06,
-                  'fe5b': 1207.140e06}
-        self.l = {'L1': 299792458 / 1575.42e06,
-                  'L5': 299792458 / 1176.45e06,
-                  'L2': 299792458 / 1227.60e06,
-                  'E5a': 299792458 / 1176.45e06,
-                  'E5b': 299792458 / 1207.140e06}
+        self.F = {signal: frequency_hz(signal) for signal in {
+            'L1', 'L2', 'L5', 'E1', 'E5a', 'E5b', 'B1I', 'B1C', 'B2a', 'B2I', 'B2b', 'B3I'
+        }}
+        self.l = {signal: wavelength_m(signal) for signal in self.F}
         if self.obs.index.get_level_values(0).name == 'time':
             self.obs = self.obs.swaplevel(0, 1)
 
     def make_geometry_free(self):
         try:
-            if self.mode in ['L1', 'L2','L1L2']:
-                p1 = [col for col in self.obs.columns if col.startswith('C1')][0]
-                p2 = [col for col in self.obs.columns if col.startswith('C2')][0]
-                l1 = [col for col in self.obs.columns if col.startswith('L1')][0]
-                l2 = [col for col in self.obs.columns if col.startswith('L2')][0]
-
-            if self.mode =='L1L5' or self.mode =='L5':
-                p1 = [col for col in self.obs.columns if col.startswith('C1')][0]
-                p2 = [col for col in self.obs.columns if col.startswith('C5')][0]
-                l1 = [col for col in self.obs.columns if col.startswith('L1')][0]
-                l2 = [col for col in self.obs.columns if col.startswith('L5')][0]
-            if self.mode =='L2L5':
-                p1 = [col for col in self.obs.columns if col.startswith('C2')][0]
-                p2 = [col for col in self.obs.columns if col.startswith('C5')][0]
-                l1 = [col for col in self.obs.columns if col.startswith('L2')][0]
-                l2 = [col for col in self.obs.columns if col.startswith('L5')][0]
-
-            elif self.mode in ['E1E5a','E1','E5a']:
-                p1 = [col for col in self.obs.columns if col.startswith('C1')][0]
-                p2 = [col for col in self.obs.columns if col.startswith('C5')][0]
-                l1 = [col for col in self.obs.columns if col.startswith('L1')][0]
-                l2 = [col for col in self.obs.columns if col.startswith('L5')][0]
-            elif self.mode == 'E1E5b' or self.mode =='E5b':
-                p1 = [col for col in self.obs.columns if col.startswith('C1')][0]
-                p2 = [col for col in self.obs.columns if col.startswith('C7')][0]
-                l1 = [col for col in self.obs.columns if col.startswith('L1')][0]
-                l2 = [col for col in self.obs.columns if col.startswith('L7')][0]
-            elif self.mode == 'E5aE5b':
-                p1 = [col for col in self.obs.columns if col.startswith('C5')][0]
-                p2 = [col for col in self.obs.columns if col.startswith('C7')][0]
-                l1 = [col for col in self.obs.columns if col.startswith('L5')][0]
-                l2 = [col for col in self.obs.columns if col.startswith('L7')][0]
-
+            signals = mode_signals(self.mode)
+            if len(signals) != 2:
+                raise IndexError('Lack of dual frequency data!')
+            s1, s2 = (signal_spec(signal) for signal in signals)
+            p1 = [col for col in self.obs.columns if col.startswith(s1.code_prefix)][0]
+            p2 = [col for col in self.obs.columns if col.startswith(s2.code_prefix)][0]
+            l1 = [col for col in self.obs.columns if col.startswith(s1.phase_prefix)][0]
+            l2 = [col for col in self.obs.columns if col.startswith(s2.phase_prefix)][0]
         except IndexError:
             raise IndexError('Lack of dual frequency data!')
 
@@ -198,15 +191,10 @@ class CSDetector:
         max_elevation_index = np.argmax(ev)
         indices = []
 
-        if mode in ['L1L2', 'L1']:
-            t = np.abs(l['L2'] - l['L1'])
-        elif mode in ['L1L5', 'L5']:
-            t = np.abs(l['L5'] - l['L1'])
-        elif mode in ['E1E5a', 'E1']:
-            t = np.abs(l['E5a'] - l['L1'])
-        elif mode == 'E1E5b' or mode == 'E5b':
-            t = np.abs(l['E5b'] - l['L1'])
-        else:
+        try:
+            signals = mode_signals(mode)
+            t = abs(wavelength_m(signals[1]) - wavelength_m(signals[0])) if len(signals) == 2 else 0.5
+        except ValueError:
             t = 0.5
 
         # W prawo od max_elevation_index:
@@ -255,6 +243,7 @@ class CSDetector:
 class DefaultConfig:
     gps_freq: str = "L1L2"  # Domyślne wartości
     gal_freq: str = "E1E5a"
+    bds_freq: str = "B1IB3I"
     station_name: Optional[str] = 'Station'
     day_of_year = 1
     gim_path=None
@@ -294,29 +283,25 @@ class DDPreprocessing:
 
         self.doy = self.configuration.day_of_year or 1
         self.SYS = system
-        self.mode = self.configuration.gps_freq if self.SYS=='G' else self.configuration.gal_freq
+        if self.SYS == 'G':
+            self.mode = self.configuration.gps_freq
+        elif self.SYS == 'E':
+            self.mode = self.configuration.gal_freq
+        elif self.SYS == 'C':
+            self.mode = getattr(self.configuration, 'bds_freq', 'B1IB3I')
+        else:
+            raise ValueError(f"Unsupported GNSS system: {self.SYS}")
         self.iono_source = self.configuration.ionosphere_model
         self.antenna_height = antenna_h
         self.phase_shift = phase_shift_dict
         self.pco = sat_pco
         self.rec_pco = rec_pco
 
-        self.F = {
-            'L1': 1575.42e06,
-            'L2': 1227.60e06,
-            'L5': 1176.45e06,
-            'E1': 1575.420e06,
-            'E5a': 1176.450e06,
-            'E5b': 1207.140e06
-        }
+        self.F = {signal: frequency_hz(signal) for signal in {
+            'L1', 'L2', 'L5', 'E1', 'E5a', 'E5b', 'B1I', 'B1C', 'B2a', 'B2I', 'B2b', 'B3I'
+        }}
 
-        self.l = {
-            'L1': 299792458 / 1575.42e06,
-            'L5': 299792458 / 1176.45e06,
-            'L2': 299792458 / 1227.60e06,
-            'E5a': 299792458 / 1176.45e06,
-            'E5b': 299792458 / 1207.140e06
-        }
+        self.l = {signal: wavelength_m(signal) for signal in self.F}
 
         # Wartości pomocnicze (jeśli model wymaga ich użycia)
         self.gpsa = gpsa
@@ -453,6 +438,23 @@ class DDPreprocessing:
                             self.pco[(ind, f'{ind[0]}07')])) / (
                                 fe1a ** 2 - fe5b ** 2)
                     ) / 1000
+        elif self.SYS == 'C':
+            signals = mode_signals(self.mode)
+
+            def _sat_pco(signal: str, sv: str) -> np.ndarray:
+                spec = signal_spec(signal)
+                return np.array(self.pco.get((sv, spec.antex_frequency), [0.0, 0.0, 0.0]))
+
+            pco_dict = {}
+            if len(signals) == 1:
+                for ind in unique_sv:
+                    pco_dict[ind] = _sat_pco(signals[0], ind) / 1000
+            elif len(signals) == 2:
+                k1, k2 = mode_ionosphere_free_coefficients(self.mode)
+                for ind in unique_sv:
+                    pco_dict[ind] = (k1 * _sat_pco(signals[0], ind) - k2 * _sat_pco(signals[1], ind)) / 1000
+            else:
+                raise ValueError(f"Unsupported BeiDou mode for satellite PCO: {self.mode}")
 
         # PCO DF = pco dla danego MODE
         # to co ponizej ,az do funkcji, musi byc wykonane dla kazdego mode
@@ -543,31 +545,12 @@ class DDPreprocessing:
             return pco_los
 
         def process_frequency(freq, unique_sv, ps,k_df, i_df, j_df, e_df, xyz_sat):
-            if freq == 'L1':
-                pco_dict = {}
-                for ind in unique_sv:
-                    pco_dict[ind] = np.array(self.pco[(ind, f'{ind[0]}01')]) / 1000
-            elif freq == 'L2':
-                pco_dict = {}
-                for ind in unique_sv:
-                    pco_dict[ind] = np.array(self.pco[(ind, f'{ind[0]}02')]) / 1000
-            elif freq == 'L5':
-                pco_dict = {}
-                for ind in unique_sv:
-                    val = self.pco.get((ind, f'{ind[0]}05'),[0.0,0.0,0.0])
-                    pco_dict[ind] = np.array(val) / 1000
-            elif freq == 'E1':
-                pco_dict = {}
-                for ind in unique_sv:
-                    pco_dict[ind] = np.array(self.pco[(ind, f'{ind[0]}01')]) / 1000
-            elif freq == 'E5a':
-                pco_dict = {}
-                for ind in unique_sv:
-                    pco_dict[ind] = np.array(self.pco[(ind, f'{ind[0]}05')]) / 1000
-            elif freq == 'E5b':
-                pco_dict = {}
-                for ind in unique_sv:
-                    pco_dict[ind] = np.array(self.pco.get((ind, f'{ind[0]}07'),[0.0,0.0,0.0])) / 1000
+            spec = signal_spec(freq)
+            pco_dict = {}
+            for ind in unique_sv:
+                pco_dict[ind] = np.array(
+                    self.pco.get((ind, spec.antex_frequency), [0.0, 0.0, 0.0])
+                ) / 1000
             pco_df = pd.DataFrame.from_dict(pco_dict, orient='index', columns=['pco1', 'pco2', 'pco3'])
             pco_df.index.name = 'sv'
             ps = ps.reset_index()
@@ -594,63 +577,20 @@ class DDPreprocessing:
             pco_los = pco_LOS(delta=delta, xyz_sat=xyz_sat, xyz_sta=self.xyz.copy())
             self.df[f'sat_pco_los_{freq}'] = pco_los
 
-        if self.mode in ['L1','L2','L5']:
-            process_frequency(freq=self.mode, unique_sv=unique_sv, ps=ps, k_df=k_df, j_df=j_df, i_df=i_df,
+        for freq in mode_signals(self.mode):
+            process_frequency(freq=freq, unique_sv=unique_sv, ps=ps, k_df=k_df, j_df=j_df, i_df=i_df,
                               e_df=e_df, xyz_sat=xyz)
-        elif self.mode in ['E1','E5a','E5b']:
-            process_frequency(freq=self.mode, unique_sv=unique_sv, ps=ps, k_df=k_df, j_df=j_df, i_df=i_df,
-                              e_df=e_df, xyz_sat=xyz)
-        elif self.mode == 'L1L2':
-            for freq in ['L1','L2']:
-                process_frequency(freq=freq,unique_sv=unique_sv,ps=ps,k_df=k_df,j_df=j_df,i_df=i_df,
-                                  e_df=e_df,xyz_sat=xyz)
-        elif self.mode == 'L1L5':
-            for freq in ['L1','L5']:
-                process_frequency(freq=freq,unique_sv=unique_sv,ps=ps,k_df=k_df,j_df=j_df,i_df=i_df,
-                                  e_df=e_df,xyz_sat=xyz)
-        elif self.mode == 'L2L5':
-            for freq in ['L2','L5']:
-                process_frequency(freq=freq,unique_sv=unique_sv,ps=ps,k_df=k_df,j_df=j_df,i_df=i_df,
-                                  e_df=e_df,xyz_sat=xyz)
-
-        elif self.mode == 'E1E5a':
-            for freq in ['E1','E5a']:
-                process_frequency(freq=freq,unique_sv=unique_sv,ps=ps,k_df=k_df,j_df=j_df,i_df=i_df,
-                                  e_df=e_df,xyz_sat=xyz)
-        elif self.mode == 'E1E5b':
-            for freq in ['E1','E5b']:
-                process_frequency(freq=freq,unique_sv=unique_sv,ps=ps,k_df=k_df,j_df=j_df,i_df=i_df,
-                                  e_df=e_df,xyz_sat=xyz)
-        elif self.mode == 'E5aE5b':
-            for freq in ['E5a','E5b']:
-                process_frequency(freq=freq,unique_sv=unique_sv,ps=ps,k_df=k_df,j_df=j_df,i_df=i_df,
-                                  e_df=e_df,xyz_sat=xyz)
 
 
 
 
     def phase2meters(self):
         self.df= self.df.copy()
-        if self.SYS =='G':
-            if self.mode in ['L1L2','L1','L2']:
-                self.df[[col for col in self.df.columns if col.startswith('L1')]] *= self.l['L1']
-                self.df[[col for col in self.df.columns if col.startswith('L2')]] *= self.l['L2']
-            if self.mode in ['L1L5','L5']:
-                self.df[[col for col in self.df.columns if col.startswith('L1')]] *= self.l['L1']
-                self.df[[col for col in self.df.columns if col.startswith('L5')]] *= self.l['L5']
-            if self.mode in ['L2L5']:
-                self.df[[col for col in self.df.columns if col.startswith('L2')]] *= self.l['L2']
-                self.df[[col for col in self.df.columns if col.startswith('L5')]] *= self.l['L5']
-        elif self.SYS == 'E':
-            if self.mode in ['E1E5a','E1','E5a']:
-                self.df[[col for col in self.df.columns if col.startswith('L1')]] *= self.l['L1']
-                self.df[[col for col in self.df.columns if col.startswith('L5')]] *= self.l['E5a']
-            if self.mode in ['E1E5b','E5b']:
-                self.df[[col for col in self.df.columns if col.startswith('L1')]] *= self.l['L1']
-                self.df[[col for col in self.df.columns if col.startswith('L7')]] *= self.l['E5b']
-            if self.mode in ['E5aE5b']:
-                self.df[[col for col in self.df.columns if col.startswith('L5')]] *= self.l['E5a']
-                self.df[[col for col in self.df.columns if col.startswith('L7')]] *= self.l['E5b']
+        for signal in mode_signals(self.mode):
+            spec = signal_spec(signal)
+            cols = [col for col in self.df.columns if col.startswith(spec.phase_prefix)]
+            if cols:
+                self.df.loc[:, cols] = self.df[cols].to_numpy(copy=False) * wavelength_m(signal)
 
 
     def apply_phase_shift(self):
@@ -661,75 +601,15 @@ class DDPreprocessing:
             print('No phase shift applied')
             return
 
-        # Tryb L1L2: rozróżniamy kolumny L1 oraz L2
-        elif self.mode in ['L1L2','L1','L2']:
-            for c in cols:
-                key = f"{self.SYS} {c}"
-                shift = self.phase_shift.get(key, 0.0)
-                # Jeśli kolumna dotyczy L2, używamy długości fali L2, w przeciwnym wypadku L1
-                if c.startswith("L2"):
-                    self.df[c] = self.df[c] + self.l['L2'] * np.float32(shift)
-                elif c.startswith("L1"):
-                    self.df[c] = self.df[c] + self.l['L1'] * np.float32(shift)
-        elif self.mode in ['L1L5','L5']:
-            for c in cols:
-                key = f"{self.SYS} {c}"
-                shift = self.phase_shift.get(key, 0.0)
-
-                # Jeśli kolumna dotyczy L2, używamy długości fali L2, w przeciwnym wypadku L1
-                if c.startswith("L1"):
-                    self.df[c] = self.df[c] + self.l['L1'] * np.float32(shift)
-                elif c.startswith("L5"):
-                    self.df[c] = self.df[c] + self.l['L5'] * np.float32(shift)
-        elif self.mode in ['L2L5']:
-            for c in cols:
-                key = f"{self.SYS} {c}"
-                shift = self.phase_shift.get(key, 0.0)
-
-                # Jeśli kolumna dotyczy L2, używamy długości fali L2, w przeciwnym wypadku L1
-                if c.startswith("L2"):
-                    self.df[c] = self.df[c] + self.l['L2'] * np.float32(shift)
-                elif c.startswith("L5"):
-                    self.df[c] = self.df[c] + self.l['L5'] * np.float32(shift)
-
-        elif self.mode in ['E1E5b','E5b']:
-            for c in cols:
-                key = f"{self.SYS} {c}"
-                shift = self.phase_shift.get(key, 0.0)
-
-                # Jeśli kolumna dotyczy L2, używamy długości fali L2, w przeciwnym wypadku L1
-
-                if c.startswith("L1"):
-                    self.df[c] = self.df[c] + self.l['L1'] * np.float32(shift)
-                elif c.startswith("L7"):
-                    self.df[c] = self.df[c] + self.l['E5b'] * np.float32(shift)
-        elif self.mode in ['E5aE5b']:
-            for c in cols:
-                key = f"{self.SYS} {c}"
-                shift = self.phase_shift.get(key, 0.0)
-
-                # Jeśli kolumna dotyczy L2, używamy długości fali L2, w przeciwnym wypadku L1
-
-                if c.startswith("L5"):
-                    self.df[c] = self.df[c] + self.l['E5a'] * np.float32(shift)
-                elif c.startswith("L7"):
-                    self.df[c] = self.df[c] + self.l['E5b'] * np.float32(shift)
-
-        elif self.mode in ['E1E5a','E1','E5a']:
-            for c in cols:
-                key = f"{self.SYS} {c}"
-                shift = self.phase_shift.get(key, 0.0)
-
-                # Jeśli kolumna dotyczy L2, używamy długości fali L2, w przeciwnym wypadku L1
-
-                if c.startswith("L1"):
-                    self.df[c] = self.df[c] + self.l['L1'] * np.float32(shift)
-                elif c.startswith("L5"):
-                    self.df[c] = self.df[c] + self.l['E5a'] * np.float32(shift)
-
-
         else:
-            print('Unknown mode')
+            for c in cols:
+                key = f"{self.SYS} {c}"
+                shift = self.phase_shift.get(key, 0.0)
+                for signal in mode_signals(self.mode):
+                    spec = signal_spec(signal)
+                    if c.startswith(spec.phase_prefix):
+                        self.df[c] = self.df[c] + wavelength_m(signal) * np.float32(shift)
+                        break
 
     def compute_klobuchar(self):
         self.df = self.df.copy()
@@ -742,37 +622,6 @@ class DDPreprocessing:
         ion = np.array(list(map(lambda row: klobuchar(
             azimuth=row[0], elev=row[1], fi=self.flh[0], lambda_=self.flh[1],
             tow=row[2], beta=self.gpsb, alfa=self.gpsa), zip(az, ev, toc_list))))
-        # default for klobuchar: ionospheric delay for L1 in meters
-        stec = ion/0.162 # TECU
-        K = 40.309
-        if self.mode in ['L1', 'L1L2', 'L1L5']:
-            f = self.F['L1']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        elif self.mode in ['L2', 'L2L5']:
-            f = self.F['L2']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        elif self.mode == 'L5':
-            f = self.F['L5']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-
-
-        elif self.mode in ['E1', 'E1E5a', 'E1E5b']:
-            f = self.F['L1']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        elif self.mode in ['E5a', 'E5aE5b']:
-            f = self.F['E5a']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        elif self.mode == 'E5b':
-            f = self.F['E5b']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        else:
-            raise ValueError('Unkown mode')
         self.df['ion'] = ion
 
     def enu2ecef(self, x):
@@ -837,6 +686,50 @@ class DDPreprocessing:
                 if key[-1] == key_suffix:
                     return np.array(value) / 1000.
             return np.array([0.0, 0.0, 0.0])
+
+        def get_pco_for_signal(signal: str):
+            spec = signal_spec(signal)
+            exact = get_pco(spec.antex_frequency)
+            if np.any(exact):
+                return exact
+
+            target_frequency = frequency_hz(signal)
+            candidates = []
+            for key, value in self.rec_pco.items():
+                freq_code = key[-1]
+                candidate_frequency = ANTEX_FREQUENCY_HZ.get(freq_code)
+                if candidate_frequency is None:
+                    continue
+                candidates.append(
+                    (
+                        abs(candidate_frequency - target_frequency),
+                        0 if freq_code[0] == spec.antex_frequency[0] else 1,
+                        np.array(value) / 1000.,
+                    )
+                )
+            if not candidates:
+                return np.array([0.0, 0.0, 0.0])
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            return candidates[0][2]
+
+        if self.SYS == 'C':
+            layout = mode_layout(self.mode)
+            pco_ecef_by_col = {}
+            pco_by_signal = {}
+            for band in layout:
+                pco = get_pco_for_signal(band["signal"])
+                pco_by_signal[band["signal"]] = pco
+                pco_ecef_by_col[band["rec_pco_col"]] = self.enu2ecef(x=pco)
+
+            if len(layout) == 1:
+                self.df['pco_los'] = e.dot(next(iter(pco_ecef_by_col.values())))
+            else:
+                for col, pco_ecef in pco_ecef_by_col.items():
+                    self.df[col] = e.dot(pco_ecef)
+                k1, k2 = mode_ionosphere_free_coefficients(self.mode)
+                pco_if = k1 * pco_by_signal[layout[0]["signal"]] - k2 * pco_by_signal[layout[1]["signal"]]
+                self.df['pco_los_l3'] = e.dot(self.enu2ecef(x=pco_if))
+            return
 
         # Gałąź dla systemu E
         if self.SYS == 'E':
@@ -966,7 +859,7 @@ class DDPreprocessing:
                 pco_l1 = self.enu2ecef(x=pco_L1)
                 pco_l2 = self.enu2ecef(x=pco_L2)
                 pco_if_ecef = self.enu2ecef(x=pco_if)
-                self.df['pco_los_l2'] = e.dot(pco_l1)
+                self.df['pco_los_l1'] = e.dot(pco_l1)
                 self.df['pco_los_l2'] = e.dot(pco_l2)
                 self.df['pco_los_l3'] = e.dot(pco_if_ecef)
             elif self.mode == 'E1E5b':
@@ -1006,34 +899,8 @@ class DDPreprocessing:
         # Assign the result back to the DataFrame
         stec = result
         K = 40.3 * 10 ** 16
-        if self.mode in ['L1','L1L2','L1L5']:
-            f = self.F['L1']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        elif self.mode in ['L2','L2L5']:
-            f = self.F['L2']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        elif self.mode =='L5':
-            f = self.F['L5']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-
-
-        elif self.mode in ['E1','E1E5a','E1E5b']:
-            f = self.F['L1']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        elif self.mode in ['E5a','E5aE5b']:
-            f = self.F['E5a']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        elif self.mode =='E5b':
-            f = self.F['E5b']
-            ion = K * (stec / (f ** 2))
-            self.df['ion'] = ion
-        else:
-            raise ValueError('Unkown mode')
+        f = frequency_hz(first_signal(self.mode))
+        self.df['ion'] = K * (stec / (f ** 2))
 
     def compute_troposphere_vectorized(self):
         ev = self.df['ev'].to_numpy()
@@ -1043,14 +910,7 @@ class DDPreprocessing:
 
     def read_inx(self):
         K = 40.3 * 10 ** 16
-        if self.mode in ['L1','E1', 'L1L2','E1E5a','L1L5','E1E5b']:
-            f = self.F['L1']
-        elif self.mode in ['L5','E5a','E5aE5b']:
-            f = self.F['E5a']
-        elif self.mode in ['E5b']:
-            f = self.F['E5b']
-        elif self.mode in ['L2','L2L5']:
-            f = self.F['L2']
+        f = frequency_hz(first_signal(self.mode))
 
         parser = GIMReader(tec_path=self.gim_file,dcb_path=self.gim_file)
         data = parser.read(dcb=True)
@@ -1232,4 +1092,3 @@ class DDPreprocessing:
         if self.configuration.solid_tides:
             self.compute_tides()
         return self.df
-
