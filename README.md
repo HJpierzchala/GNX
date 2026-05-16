@@ -1,7 +1,7 @@
 # GNX-py
 
 <p align="center">
-  <img src="GNX_logo_v2.png" width="220" alt="GNX-py logo"/>
+  <img src="assets/GNX_logo_v2.png" width="220" alt="GNX-py logo"/>
 </p>
 
 *A modular Python library for GNSS positioning, signal-in-space analysis, and ionosphere research workflows.*
