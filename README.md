@@ -231,7 +231,6 @@ GNX/
 ├─ examples/           # Small editable user examples using sample_data
 ├─ sample_data/        # Compact example products for smoke tests and tutorials
 ├─ tutorial/           # Jupyter notebooks and manual build tooling
-├─ docs/               # Focused development notes, including BeiDou support notes
 ├─ assets/             # Static repository assets
 ├─ GNX_manual.pdf      # Generated manual/tutorial PDF snapshot
 ├─ pyproject.toml      # Package metadata, dependencies, optional extras
