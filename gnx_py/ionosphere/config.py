@@ -370,7 +370,6 @@ class STECMonitor:
         f1, f2 = self.FREQ_DICT[m1], self.FREQ_DICT[m2]
         return self.GAMMA * ((f1**2*f2**2)/(f1**2-f2**2))
 
-    import numpy as np
 
     def phase_leveling(self, code, phase, elev):
         """Level phase geometry-free observables to code geometry-free observables (JPL-GIM style)."""
@@ -774,6 +773,10 @@ class TECSession:
             monitor =  STECMonitor(obs=obs_gps_crd, mode=mode, config=self.config, sys=self.use_sys, flh=flh,
                                             broadcast=broadcast)
             obs_tec = monitor.run()
+        obs_tec['lat'] = flh[0]
+        obs_tec['lon'] = flh[1]
+        obs_tec['h'] = flh[2]
+        obs_tec['name'] = f"{self.config.station_name}_{self.config.sys}"
         return obs_tec
 
     def _load_obs_data(self, processor):

@@ -165,13 +165,13 @@ def load_stec_folder(
     station_name_len: int = 6,
     unique_id_len: int = 4,
     network_filter: Optional[Iterable[str]] = None,
-    required_columns: Tuple[str, str, str, str, str, str] = ("lat_ipp", "lon_ipp", "leveled_tec", "ev", "sv", "time"),
+    keep_columns: Optional[Iterable[str]] = None,
+    required_columns: Optional[Iterable[str]] = None,
     quiet: bool = False,
     skip_negative:bool=True
 ) -> Tuple[pd.DataFrame, Dict[str, object]]:
     """
-    Load and validate STEC parquet files from a folder, filtering by elevation
-    and rejecting files that contain negative leveled TEC values.
+    Load STEC parquet files from a folder.
 
     Status:
         Active convenience loader for monitoring/kriging workflows. Logging is
@@ -182,10 +182,12 @@ def load_stec_folder(
     For each file:
       1) Extracts a station name (first ``station_name_len`` characters of the filename)
          and a short unique ID (first ``unique_id_len`` characters).
-      2) Reads the parquet into a DataFrame.
-      3) Keeps only rows with elevation ``ev > min_elev_deg`` and only the columns
-         specified by ``required_columns``.
-      4) Rejects the entire file if any ``leveled_tec`` is negative.
+      2) Reads the parquet into a DataFrame. By default all stored columns are
+         retained.
+      3) If an elevation column is available, keeps only rows with
+         ``ev > min_elev_deg``.
+      4) If a TEC column is available and ``skip_negative`` is true, rejects the
+         entire file if any ``leveled_tec`` is negative.
       5) Appends an extra column ``name`` with the station name and collects results.
 
     Parameters
@@ -204,18 +206,34 @@ def load_stec_folder(
     network_filter : Iterable[str] | None, optional
         If provided, keep only files whose short unique ID is in this set/list.
         (Comparison is case-sensitive.)
-    required_columns : tuple[str, str, str, str], optional
-        Columns expected in each parquet file in order: (lat, lon, tec, elevation).
-        Default: ``("lat_ipp", "lon_ipp", "leveled_tec", "ev")``.
+    keep_columns : Iterable[str] | None, optional
+        Optional output/read column subset. When ``None`` (default), all columns
+        stored in each parquet file are loaded and preserved. When provided,
+        pandas is asked to read only these columns plus internal columns needed
+        for filtering/indexing. Missing requested columns are logged as warnings
+        and the available requested columns are returned. If none of the
+        requested columns exists in a file, that file is skipped with a clear
+        error entry in the returned summary.
+    required_columns : Iterable[str] | None, optional
+        Backward-compatible alias for ``keep_columns``. If provided, its first
+        values are also used as legacy role names in the order
+        ``lat, lon, tec, elevation, sv, time``. New code should use
+        ``keep_columns``.
     quiet : bool, optional
         If True, suppress per-file log messages.
+    skip_negative : bool, optional
+        If True and the TEC column is present, skip files containing negative
+        TEC values.
 
     Returns
     -------
     df_all : pandas.DataFrame
-        Concatenated DataFrame of accepted files with columns:
-        ``lat_ipp, lon_ipp, leveled_tec, ev, name``.
-        If no files are accepted, an empty DataFrame with those columns is returned.
+        Concatenated DataFrame of accepted files. With ``keep_columns=None`` all
+        parquet columns are preserved, plus the added ``name`` column. If ``sv``
+        and ``time`` are present, they are used as a MultiIndex while remaining
+        available as columns in the default full-load mode. With
+        ``keep_columns`` only available requested columns plus ``name`` are
+        returned.
     summary : dict
         A dictionary with processing metadata:
         - ``files_scanned`` (int): total files that matched the suffix
@@ -235,7 +253,7 @@ def load_stec_folder(
     Notes
     -----
     * Behavior mirrors the reference snippet: any file with *any* negative
-      ``leveled_tec`` is fully skipped.
+      ``leveled_tec`` is fully skipped when that column is present.
     * Unlike the original code, this function **does not** divide counters by two.
       Instead, it reports counts directly and also lists unique short IDs so you
       can infer pairing at the station level without guessing.
@@ -244,8 +262,33 @@ def load_stec_folder(
     if not folder.is_dir():
         raise FileNotFoundError(f"Folder not found or not a directory: {folder}")
 
-    lat_col, lon_col, tec_col, ev_col, sv_col, time_col = required_columns
+    default_role_columns = ("lat_ipp", "lon_ipp", "leveled_tec", "ev", "sv", "time")
+    role_columns = list(default_role_columns)
+    if required_columns is not None:
+        required_columns = tuple(required_columns)
+        if keep_columns is not None:
+            raise ValueError("Use either keep_columns or required_columns, not both.")
+        if len(required_columns) < 4:
+            raise ValueError("required_columns must contain at least lat, lon, tec and elevation column names.")
+        for i, col in enumerate(required_columns[: len(role_columns)]):
+            role_columns[i] = col
+        keep_columns = required_columns
+
+    keep_columns_tuple = None
+    if keep_columns is not None:
+        keep_columns_tuple = tuple(dict.fromkeys(keep_columns))
+
+    lat_col, lon_col, tec_col, ev_col, sv_col, time_col = role_columns
     dfs: List[pd.DataFrame] = []
+
+    read_columns = None
+    if keep_columns_tuple is not None:
+        internal_columns = [sv_col, time_col]
+        if min_elev_deg is not None:
+            internal_columns.append(ev_col)
+        if skip_negative:
+            internal_columns.append(tec_col)
+        read_columns = tuple(dict.fromkeys(list(keep_columns_tuple) + internal_columns))
 
     files = sorted(p for p in folder.iterdir() if p.name.endswith(file_suffix))
     files_scanned = len(files)
@@ -256,6 +299,27 @@ def load_stec_folder(
 
     rejected_files: List[str] = []
     errors: List[Tuple[str, str]] = []
+
+    def _read_parquet_for_file(fpath: Path) -> pd.DataFrame:
+        if read_columns is None:
+            return pd.read_parquet(fpath)
+
+        try:
+            return pd.read_parquet(fpath, columns=list(read_columns))
+        except Exception as first_error:
+            df_full = pd.read_parquet(fpath)
+            available_keep = [c for c in keep_columns_tuple if c in df_full.columns]
+            missing_keep = [c for c in keep_columns_tuple if c not in df_full.columns]
+            if missing_keep and not quiet:
+                logger.warning(
+                    "[STEC LOAD] file=%s event=missing-keep-columns columns=%s",
+                    fpath.name,
+                    missing_keep,
+                )
+            if not available_keep:
+                raise KeyError(f"None of keep_columns are present in {fpath.name}: {list(keep_columns_tuple)}") from first_error
+            available_read = [c for c in read_columns if c in df_full.columns]
+            return df_full.loc[:, available_read]
 
     for fpath in files:
         try:
@@ -269,24 +333,33 @@ def load_stec_folder(
                     logger.info("[STEC LOAD] file=%s event=skip-network unique_id=%s", fpath.name, unique_id)
                 continue
 
-            df = pd.read_parquet(fpath)
-
-            # Validate required columns early
-            missing = [c for c in (lat_col, lon_col, tec_col, ev_col) if c not in df.columns]
-            if missing:
-                raise KeyError(f"Missing required columns {missing} in {fpath.name}")
+            df = _read_parquet_for_file(fpath)
 
             # Elevation filtering and column selection
-            df = df[df[ev_col] > float(min_elev_deg)]#[[lat_col, lon_col, tec_col, ev_col]]
+            if min_elev_deg is not None:
+                if ev_col in df.columns:
+                    df = df[df[ev_col] > float(min_elev_deg)]
+                elif not quiet:
+                    logger.warning(
+                        "[STEC LOAD] file=%s event=skip-elevation-filter missing_column=%s",
+                        fpath.name,
+                        ev_col,
+                    )
 
             # Reject entire file if any negative TEC
             if skip_negative:
-                if (df[tec_col] < 0).any():
+                if tec_col in df.columns and (df[tec_col] < 0).any():
                     if not quiet:
                         logger.info("[STEC LOAD] file=%s event=reject-negative-tec", fpath.name)
                     rejected_files.append(fpath.name)
                     stations_rejected.add(unique_id)
                     continue
+                if tec_col not in df.columns and not quiet:
+                    logger.warning(
+                        "[STEC LOAD] file=%s event=skip-negative-check missing_column=%s",
+                        fpath.name,
+                        tec_col,
+                    )
 
             if df.empty:
                 if not quiet:
@@ -295,10 +368,20 @@ def load_stec_folder(
                 rejected_files.append(fpath.name)
                 stations_rejected.add(unique_id)
                 continue
-            df[tec_col]/=1e16
             # Add station name column and collect
             df = df.copy()
+            if tec_col in df.columns:
+                df[tec_col] /= 1e16
             df["name"] = name
+
+            if keep_columns_tuple is not None:
+                keep_available = [c for c in keep_columns_tuple if c in df.columns]
+                keep_for_index = [
+                    c
+                    for c in (sv_col, time_col)
+                    if c in df.columns and c not in keep_available
+                ]
+                df = df.loc[:, keep_available + keep_for_index + ["name"]]
 
             dfs.append(df)
             stations_accepted.add(unique_id)
@@ -314,15 +397,29 @@ def load_stec_folder(
 
     # Build final DataFrame
     if dfs:
-        df_all = pd.concat(dfs, axis=0)
-        #df_all = df_all[[lat_col, lon_col, tec_col, ev_col, "name"]]
-        df_all = df_all.reset_index()
-        df_all['time'] = pd.to_datetime(df_all['time'])
-        df_all.set_index(['sv', 'time'], inplace=True)
+        df_all = pd.concat(dfs, axis=0, ignore_index=True)
+        if time_col in df_all.columns:
+            df_all[time_col] = pd.to_datetime(df_all[time_col])
+        if sv_col in df_all.columns and time_col in df_all.columns:
+            drop_index_columns = keep_columns_tuple is not None
+            df_all.set_index([sv_col, time_col], inplace=True, drop=drop_index_columns)
+            if keep_columns_tuple is not None:
+                if sv_col in keep_columns_tuple:
+                    df_all[sv_col] = df_all.index.get_level_values(sv_col)
+                if time_col in keep_columns_tuple:
+                    df_all[time_col] = df_all.index.get_level_values(time_col)
+                ordered_cols = [c for c in keep_columns_tuple if c in df_all.columns]
+                df_all = df_all.loc[:, ordered_cols + ["name"]]
+        elif not quiet:
+            logger.warning(
+                "[STEC LOAD] event=skip-index missing_columns=%s",
+                [c for c in (sv_col, time_col) if c not in df_all.columns],
+            )
     else:
-        empty_cols = list(required_columns) + ["name"]
+        empty_cols = list(keep_columns_tuple or role_columns) + ["name"]
         df_all = pd.DataFrame(columns=empty_cols)
-        df_all = df_all.set_index(["sv", "time"])
+        if sv_col in df_all.columns and time_col in df_all.columns:
+            df_all = df_all.set_index([sv_col, time_col], drop=keep_columns_tuple is not None)
 
     summary = {
         "files_scanned": files_scanned,
