@@ -308,8 +308,9 @@ def load_stec_folder(
             return pd.read_parquet(fpath, columns=list(read_columns))
         except Exception as first_error:
             df_full = pd.read_parquet(fpath)
-            available_keep = [c for c in keep_columns_tuple if c in df_full.columns]
-            missing_keep = [c for c in keep_columns_tuple if c not in df_full.columns]
+            index_names = set(name for name in df_full.index.names if name is not None)
+            available_keep = [c for c in keep_columns_tuple if c in df_full.columns or c in index_names]
+            missing_keep = [c for c in keep_columns_tuple if c not in df_full.columns and c not in index_names]
             if missing_keep and not quiet:
                 logger.warning(
                     "[STEC LOAD] file=%s event=missing-keep-columns columns=%s",
@@ -320,6 +321,17 @@ def load_stec_folder(
                 raise KeyError(f"None of keep_columns are present in {fpath.name}: {list(keep_columns_tuple)}") from first_error
             available_read = [c for c in read_columns if c in df_full.columns]
             return df_full.loc[:, available_read]
+
+    def _restore_index_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """Expose STEC role columns stored as parquet index levels."""
+        missing_index_cols = [
+            col
+            for col in (sv_col, time_col)
+            if col not in df.columns and col in df.index.names
+        ]
+        if missing_index_cols:
+            return df.reset_index(level=missing_index_cols)
+        return df
 
     for fpath in files:
         try:
@@ -333,7 +345,7 @@ def load_stec_folder(
                     logger.info("[STEC LOAD] file=%s event=skip-network unique_id=%s", fpath.name, unique_id)
                 continue
 
-            df = _read_parquet_for_file(fpath)
+            df = _restore_index_columns(_read_parquet_for_file(fpath))
 
             # Elevation filtering and column selection
             if min_elev_deg is not None:

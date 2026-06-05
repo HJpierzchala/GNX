@@ -125,7 +125,16 @@ is experimental and should be validated for the selected system and product set.
 - `compute_roti_links`: ROT/ROTI per station-satellite link.
 - Plotting helpers for ROTI and GIX.
 
-`load_stec_folder` loads processed STEC parquet outputs for network monitoring.
+`load_stec_folder` loads processed STEC parquet outputs for network monitoring,
+including `*_C_STEC.parquet.gzip` BeiDou products generated with `sv/time`
+stored either as columns or as parquet index levels.
+
+The monitoring and kriging functions operate on calibrated STEC/VTEC point
+columns and station-satellite link identifiers, so GPS/Galileo/BeiDou data are
+structurally supported after product loading. Mixed `G/E/C` activity-index and
+kriging runs should still be treated as requiring scientific validation: bias
+policy, signal pair, receiver network and variogram assumptions determine
+whether pooled results are physically comparable.
 
 ## Kriging
 

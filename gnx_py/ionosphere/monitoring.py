@@ -630,12 +630,21 @@ def compute_roti_links(
     # Rolling STD over time (time window) for each group
     # Note: we use rolling(time-based) with min_periods, ddof=0 (population definition)
     def _rolling_std(g: pd.DataFrame, col) -> pd.Series:
-        g = g.set_index('time')
-        # tylko kolumna ROT; lat/lon nie są potrzebne do STD
-        return g[col].rolling(f'{window_min}min', min_periods=min_samples,closed='both').std(ddof=DDOF_POP)
+        # Keep the original row index so groupby.apply always concatenates a
+        # 1-D result, even when multiple links have identical timestamp grids.
+        rolled = (
+            g.set_index('time')[col]
+             .rolling(f'{window_min}min', min_periods=min_samples, closed='both')
+             .std(ddof=DDOF_POP)
+        )
+        return pd.Series(rolled.to_numpy(), index=g.index)
 
-    roti = dfa.groupby(grp_cols, group_keys=False).apply(_rolling_std,'ROT_tecu_per_min')
-    roti_mtecu_s = dfa.groupby(grp_cols, group_keys=False).apply(_rolling_std, 'ROT_mtecu_per_s')
+    roti = dfa.groupby(grp_cols, group_keys=False).apply(
+        _rolling_std, 'ROT_tecu_per_min', include_groups=False
+    )
+    roti_mtecu_s = dfa.groupby(grp_cols, group_keys=False).apply(
+        _rolling_std, 'ROT_mtecu_per_s', include_groups=False
+    )
     dfa['ROTI_tecu_per_min'] = roti.values
     dfa['ROTI_mtecu_per_s'] = roti_mtecu_s.values
 
