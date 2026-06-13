@@ -15,6 +15,8 @@ signal modes, product paths, time windows and output options.
   uncombined routing and precise products.
 - `run_sise_example.py`: signal-in-space error / SISRE / orbit comparison.
 - `run_stec_example.py`: STEC / ionosphere processing with bias policy controls.
+- `run_download_gnss_data_example.py`: GNSS archive candidate generation and
+  dry-run downloading for observation, navigation and SP3 files.
 
 ## Running
 
@@ -31,6 +33,7 @@ python examples/run_spp_example.py
 python examples/run_ppp_example.py
 python examples/run_sise_example.py
 python examples/run_stec_example.py
+python examples/run_download_gnss_data_example.py
 ```
 
 The scripts import the installed `gnx_py` package. They do not modify
