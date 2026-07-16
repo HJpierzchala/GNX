@@ -14,7 +14,6 @@
 
 The library currently focuses on:
 
-- **GNSS positioning** with SPP and PPP workflows.
 - **Precise Point Positioning (PPP)** in combined, uncombined, single-system, and selected mixed-system modes.
 - **Orbit and signal-in-space analysis** including broadcast-vs-precise and SP3-vs-SP3 comparisons.
 - **STEC/TEC and ionosphere processing** using RINEX observations, GIM/IONEX products, empirical models, and bias products.
@@ -296,7 +295,7 @@ If you use GNX-py in research, please cite the project repository and the releva
 
 ## License
 
-The package metadata declares the project license as **MIT** in `pyproject.toml`. A standalone `LICENSE` file is recommended for public releases if one is not included in the repository snapshot.
+The package metadata declares the project license as **MIT** in `pyproject.toml`.
 
 ---
 
