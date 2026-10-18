@@ -1,0 +1,4 @@
+# Data files are stored and checked out byte for byte: no end-of-line conversion (Git for Windows with
+# core.autocrlf=true would otherwise check RINEX, SP3, ANTEX and bias files out with CRLF).
+sample_data/** -text
+tutorial/ionosphere/network/** -text

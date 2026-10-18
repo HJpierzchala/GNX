@@ -214,6 +214,18 @@ def prepare_jupyter_kernel(build_dir: Path, python_executable: Path) -> None:
     os.environ["JUPYTER_PATH"] = jupyter_path + os.pathsep + os.environ.get("JUPYTER_PATH", "")
 
 
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """A link to ``src`` at ``dst``; a copy where links are not allowed (Windows without Developer Mode or
+    administrator rights refuses symbolic links: WinError 1314)."""
+    try:
+        dst.symlink_to(src, target_is_directory=src.is_dir())
+    except OSError:
+        if src.is_dir():
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", ".ipynb_checkpoints"))
+        else:
+            shutil.copy2(src, dst)
+
+
 def copy_tutorial_runtime(runtime_repo: Path) -> None:
     if runtime_repo.exists():
         shutil.rmtree(runtime_repo)
@@ -222,7 +234,7 @@ def copy_tutorial_runtime(runtime_repo: Path) -> None:
     for name in ["gnx_py", "sample_data", "examples"]:
         src = REPO_ROOT / name
         if src.exists():
-            (runtime_repo / name).symlink_to(src, target_is_directory=src.is_dir())
+            _link_or_copy(src, runtime_repo / name)
 
     def ignore(dir_path: str, names: list[str]) -> set[str]:
         ignored = {"_build", "__pycache__", ".ipynb_checkpoints", "output", "figures"}
@@ -235,7 +247,7 @@ def copy_tutorial_runtime(runtime_repo: Path) -> None:
     src_network = TUTORIAL_DIR / "ionosphere" / "network"
     dst_network = runtime_repo / "tutorial" / "ionosphere" / "network"
     if src_network.exists():
-        dst_network.symlink_to(src_network, target_is_directory=True)
+        _link_or_copy(src_network, dst_network)
 
 
 def execution_source(chapter: Chapter, runtime_repo: Path) -> Path:
@@ -572,6 +584,77 @@ def compact_long_text_outputs(nb: nbformat.NotebookNode) -> int:
     return compacted
 
 
+def local_path_replacements(build_dir: Path) -> list[tuple[str, str]]:
+    """Machine-specific path prefixes and their neutral labels, longest first.
+
+    Notebook outputs (warnings, tracebacks, object representations) can print absolute paths of the
+    build machine: the isolated runtime copy, the repository checkout or the user's home directory
+    (virtual environment, caches). The PDF shows them as ``<repo>`` and ``~``.
+    """
+    runtime = build_dir / "runtime_repo"
+    pairs = {
+        str(runtime): "<repo>",
+        str(runtime.resolve()): "<repo>",
+        str(REPO_ROOT): "<repo>",
+        str(Path.home()): "~",
+    }
+    return sorted(((old, new) for old, new in pairs.items() if len(old) > 1), key=lambda p: -len(p[0]))
+
+
+def _replace_paths(text: str, replacements: list[tuple[str, str]]) -> str:
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+
+
+#: stderr lines of the build environment, not of the tutorial (the build uses a fresh MPLCONFIGDIR)
+BUILD_NOISE_LINES = ("Matplotlib is building the font cache; this may take a moment.",)
+
+
+def sanitize_local_paths(nb: nbformat.NotebookNode, replacements: list[tuple[str, str]]) -> int:
+    """Replace machine-specific path prefixes in the outputs of the exported notebook copy and drop the
+    build-environment lines of ``BUILD_NOISE_LINES`` from stderr."""
+    changed = 0
+
+    def fix(value: Any) -> Any:
+        nonlocal changed
+        if isinstance(value, list):
+            return [fix(item) for item in value]
+        if isinstance(value, str):
+            new_value = _replace_paths(value, replacements)
+            if new_value != value:
+                changed += 1
+            return new_value
+        return value
+
+    for cell in nb.cells:
+        if cell.cell_type != "code":
+            continue
+        kept = []
+        for output in cell.get("outputs", []):
+            if output.get("output_type") == "stream" and output.get("name") == "stderr":
+                text = "".join(output.get("text", ""))
+                lines = [line for line in text.splitlines() if line.strip() not in BUILD_NOISE_LINES]
+                if not any(line.strip() for line in lines):
+                    continue
+                output["text"] = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+            kept.append(output)
+        cell["outputs"] = kept
+        for output in cell.get("outputs", []):
+            if "text" in output:
+                output["text"] = fix(output["text"])
+            if "traceback" in output:
+                output["traceback"] = fix(output["traceback"])
+            if "evalue" in output:
+                output["evalue"] = fix(output["evalue"])
+            data = output.get("data")
+            if isinstance(data, dict):
+                for key in ("text/plain", "text/html", "text/markdown", "text/latex"):
+                    if key in data:
+                        data[key] = fix(data[key])
+    return changed
+
+
 def strip_yaml_frontmatter(markdown: str) -> str:
     if markdown.startswith("---\n"):
         end = markdown.find("\n---", 4)
@@ -652,19 +735,19 @@ def make_manual_chapter_markdown(markdown: str, chapter: Chapter) -> str:
 
 FIGURE_CAPTIONS: dict[str, dict[str, str]] = {
     "introduction": {
-        "output_44_1.png": "SPP position-error time series for BRUX using GPS broadcast navigation.",
+        "output_46_1.png": "SPP position-error time series for BRUX using GPS broadcast navigation.",
     },
     "ppp": {
-        "output_27_0.png": "GPS phase post-fit residuals plotted against satellite elevation.",
-        "output_28_0.png": "Galileo phase post-fit residuals plotted against satellite elevation.",
-        "output_36_0.png": "Combined PPP positioning errors and estimated parameters for the short tutorial window.",
-        "output_47_0.png": "Uncombined PPP positioning errors and estimated parameters for the short tutorial window.",
-        "output_52_0.png": "Uncombined PPP phase residual diagnostics for the selected GPS observations.",
+        "output_29_0.png": "GPS phase post-fit residuals plotted against satellite elevation.",
+        "output_30_0.png": "Galileo phase post-fit residuals plotted against satellite elevation.",
+        "output_38_0.png": "Combined PPP positioning errors and estimated parameters for the full-day tutorial run.",
+        "output_49_0.png": "Uncombined PPP positioning errors and estimated parameters for the full-day tutorial run.",
+        "output_54_0.png": "Uncombined PPP phase innovations (prefit residuals) of the GPS observations, one panel per band.",
     },
     "orbits": {
-        "output_18_0.png": "GPS broadcast-versus-precise SIS components over the tutorial interval.",
-        "output_21_0.png": "Per-satellite GPS SIS statistics used to identify satellite-specific behaviour.",
-        "output_40_0.png": "Per-satellite statistics for the SP3-versus-SP3 comparison example.",
+        "output_19_0.png": "GPS broadcast-versus-precise SIS components over the tutorial interval.",
+        "output_22_0.png": "Per-satellite GPS SIS statistics used to identify satellite-specific behaviour.",
+        "output_55_0.png": "Per-satellite statistics for the SP3-versus-SP3 comparison example.",
     },
     "ionosphere_introduction": {
         "output_25_1.png": "Number of usable observations per satellite arc after preprocessing.",
@@ -682,17 +765,23 @@ FIGURE_CAPTIONS: dict[str, dict[str, str]] = {
         "output_31_0.png": "ROTI summary statistics over the selected regional network window.",
         "output_33_0.png": "ROTI snapshot rendered from the generated tutorial figure file.",
         "output_40_0.png": "SIDX time series after removing invalid or missing epochs.",
-        "output_46_0.png": "GIX family diagnostics for several spatial-gradient summaries.",
-        "output_50_0.png": "Spatial GIX example for one selected epoch.",
+        "output_42_0.png": "The same SIDX series drawn directly with pandas Series.plot.",
+        "output_48_0.png": "GIX family diagnostics for several spatial-gradient summaries.",
+        "output_52_0.png": "Spatial GIX example for one selected epoch.",
     },
     "kriging": {
         "output_19_0.png": "Regional VTEC map estimated with the GNX-py kriging workflow.",
         "output_19_1.png": "Formal kriging variance for the same VTEC map epoch.",
         "output_27_0.png": "Absolute VTEC difference between the kriging map and GIM at a common epoch.",
         "output_27_1.png": "Absolute VTEC difference between the NTCM grid and GIM at a common epoch.",
-        "output_29_0.png": "Mean absolute VTEC difference against GIM for kriging and NTCM maps.",
+        "output_29_0.png": "Mean absolute VTEC difference against GIM for the kriging, NTCM and BDGIM maps.",
     },
 }
+
+
+#: figures without a configured caption (chapter id, file name); the build prints them, because a key of
+#: FIGURE_CAPTIONS goes stale when cells are added before the figure (the number in the key is the cell index)
+UNCAPTIONED_FIGURES: list[tuple[str, str]] = []
 
 
 def caption_for_image(chapter: Chapter, image_path: str) -> str:
@@ -700,6 +789,7 @@ def caption_for_image(chapter: Chapter, image_path: str) -> str:
     configured = FIGURE_CAPTIONS.get(chapter.id, {}).get(filename)
     if configured:
         return configured
+    UNCAPTIONED_FIGURES.append((chapter.id, filename))
     title = chapter.title.rstrip(".")
     return f"{title} tutorial figure generated by the notebook."
 
@@ -730,8 +820,15 @@ def caption_markdown_images(markdown: str, chapter: Chapter) -> str:
     return "\n".join(lines)
 
 
-def export_markdown(notebook_path: Path, chapter: Chapter, chapters_dir: Path, index: int) -> Path:
+def export_markdown(
+    notebook_path: Path,
+    chapter: Chapter,
+    chapters_dir: Path,
+    index: int,
+    path_replacements: list[tuple[str, str]] | None = None,
+) -> Path:
     nb = nbformat.read(notebook_path, as_version=4)
+    sanitized_paths = sanitize_local_paths(nb, path_replacements or [])
     converted_tables = normalize_table_outputs(nb)
     compacted_text = compact_long_text_outputs(nb)
     exporter = MarkdownExporter()
@@ -749,12 +846,13 @@ def export_markdown(notebook_path: Path, chapter: Chapter, chapters_dir: Path, i
     body = caption_markdown_images(body, chapter)
     md_path = chapters_dir / f"{index:02d}_{chapter.id}.md"
     md_path.write_text(body, encoding="utf-8")
-    if converted_tables or compacted_text:
+    if converted_tables or compacted_text or sanitized_paths:
         (chapters_dir / f"{index:02d}_{chapter.id}.tables.log").write_text(
             "\n".join(
                 [
                     f"Converted pandas/HTML tables to LaTeX tables: {converted_tables}",
                     f"Compacted long text/plain outputs: {compacted_text}",
+                    f"Outputs with local path prefixes replaced: {sanitized_paths}",
                     "",
                 ]
             ),
@@ -956,6 +1054,7 @@ def build() -> int:
 
     markdown_paths: list[Path] = []
     executed_status: dict[str, str] = {}
+    path_replacements = local_path_replacements(build_dir)
     for idx, chapter in enumerate(chapters, 1):
         executed_path = dirs["executed"] / f"{idx:02d}_{chapter.id}.ipynb"
         if execute and chapter.execute:
@@ -967,7 +1066,7 @@ def build() -> int:
             log(f"[copy] {chapter.id}: no execution", verbose=args.verbose)
             copy_without_execution(chapter.path, executed_path)
             executed_status[chapter.id] = "not-executed"
-        md_path = export_markdown(executed_path, chapter, dirs["chapters"], idx)
+        md_path = export_markdown(executed_path, chapter, dirs["chapters"], idx, path_replacements)
         markdown_paths.append(md_path)
 
     titlepage, preamble = prepare_latex_inputs(config, build_dir)
@@ -998,6 +1097,7 @@ def build() -> int:
     report = {
         **selected_report,
         "status": "ok",
+        "uncaptioned_figures": [f"{cid}/{name}" for cid, name in UNCAPTIONED_FIGURES],
         "output_pdf": str(output_pdf),
         "output_size_bytes": output_pdf.stat().st_size if output_pdf.exists() else None,
         "pages": maybe_pdf_pages(output_pdf),
@@ -1007,6 +1107,9 @@ def build() -> int:
     print(f"Built manual: {output_pdf}")
     print(f"Size: {report['output_size_bytes']} bytes")
     print(f"Pages: {report['pages']}")
+    if UNCAPTIONED_FIGURES:
+        print("Figures with the generic caption (no FIGURE_CAPTIONS entry): "
+              + ", ".join(f"{cid}/{name}" for cid, name in UNCAPTIONED_FIGURES))
     print(f"Report: {dirs['logs'] / 'build_report.json'}")
     return 0
 

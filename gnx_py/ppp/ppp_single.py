@@ -2,35 +2,47 @@
 
 The classes in this module cover single-system PPP variants where all active
 observations belong to one constellation. Combined dual-frequency filters use
-ionosphere-free observables; single-frequency filters estimate a float
-single-frequency ambiguity without ionospheric constraints. Uncombined dual-
-frequency constrained models live in ``ppp_uduc.py``.
+ionosphere-free observables; the single-frequency filter without ionospheric
+constraints uses the ionosphere-free code/phase average of one signal
+(GRAPHIC) with a float ambiguity per arc. Uncombined dual-frequency and
+constrained models live in ``ppp_uduc.py``.
 """
 
 import warnings
 
 import numpy as np
 import pandas as pd
-from filterpy.kalman import ExtendedKalmanFilter
+from .ppp_helpers import GNXExtendedKalmanFilter as ExtendedKalmanFilter
 
-from ..conversion import ecef_to_enu
-from ..utils import calculate_distance
-from ..configuration import PPPConfig
+from ..core.conversion import ecef_to_enu
+from ..core.utils import calculate_distance
+from ..core.configuration import PPPConfig
 from .ppp_helpers import (
+    ar_phase_kwargs,
+    clock_priors,
     code_screening as ppp_code_screening,
+    convergence_hours,
+    finish_solution,
     phase_residuals_outliers,
+    epoch_process_noise,
+    random_walk_variance,
+    residual_frames,
     trace_epoch_summary as ppp_trace_epoch,
     trace_message as ppp_trace,
 )
 from .pppar import (
     PPPARSettings,
     advance_arc_age,
+    ar_eligible_mask,
     apply_conventional_pppar,
     arc_age_array,
     combined_if_pppar_enabled,
+    keep_float_state,
     pppar_diagnostic_columns,
+    restore_float_state,
 )
-from ..gnss import SIGNALS, frequency_hz, mode_ionosphere_free_coefficients, mode_layout, mode_signals, signal_spec
+from ..core.gnss import SIGNALS, frequency_hz, mode_ionosphere_free_coefficients, mode_layout, mode_signals, signal_spec
+from ..models.biases import unmoved_code_variance_m2
 
 FREQ_DICT_ALL = {name: spec.frequency_hz for name, spec in SIGNALS.items()}
 
@@ -38,37 +50,58 @@ class PPPSingleFreqSingleGNSS:
     """Single-frequency, single-system PPP filter without ionospheric constraints.
 
     Purpose:
-        Legacy/compatibility float PPP path for one constellation and one
-        signal. It is selected for uncombined single-frequency operation when
-        ``PPPConfig.use_iono_constr`` is false.
-
-    Status:
-        Legacy compatibility path, but still reachable from session routing and
-        covered by tests. Prefer ``PPPUducSFSingleGNSS`` for constrained
-        single-frequency work. This is a deprecated-candidate only after a
-        replacement strategy exists for no-constraint single-frequency runs.
+        Float PPP for one constellation and one signal without any external
+        ionosphere information. It is selected for uncombined single-frequency
+        operation when ``PPPConfig.use_iono_constr`` is false.
 
     Model:
-        Uses one code and one phase observable per satellite. The ionospheric
-        delay is not estimated as a separate state and is not constrained by
-        external STEC/GIM data in this class.
+        GRAPHIC (GRoup And PHase Ionospheric Correction; Yunck 1993,
+        Montenbruck 2003): the average of code and phase of the same signal,
+        ``G = (P + L) / 2 = rho + dtr + m_w * ZWD + B + e``, is free of the
+        first-order ionosphere because the delay of the code and the advance
+        of the phase are equal (``P = rho + I``, ``L = rho - I + lambda N``).
+        ``B`` = (lambda N + phase/code biases) / 2 is a float constant per
+        phase arc (a new arc after a cycle slip). The noise of ``G`` is half
+        the code noise, so the solution converges like float PPP with a
+        decimetre-noise observable: on the validation data (6 h static, precise
+        products, L1/E1/B1I, 36 cases) 2-27 cm 3D after 6 h (median 8-10 cm)
+        and 0.15-0.19 m after 1 h (median), against 0.18-4.8 m (median
+        0.9-1.1 m) with the former model.
+        The ``ion`` column of an ionosphere model, when present, is not used:
+        it is not needed and its error (GIM 1-3 TECU, Klobuchar about 50 %)
+        would bias the solution. Before v1.0.0 this class subtracted the model
+        ionosphere from code and phase and weighted the phase at 3 cm: the
+        time-varying model error went straight into the position (0.9 m L1 at
+        BRUX after 6 h) and a run without an ``ion`` column failed with
+        ``KeyError('ion')``.
+        Corrections as in the uncombined filters: satellite/receiver PCO,
+        troposphere model, antenna height, relativistic path, solid-earth
+        tides (``tides_los``) and the phase wind-up ``lambda * phw`` (``phw``
+        is in cycles); a missing correction column counts as 0.
 
     State vector:
-        ``[x, y, z, dtr, ztd?, N_s1, ..., N_sn]`` where ``ztd`` is present when
-        ``tro=True`` and ``N_si`` is the float phase ambiguity in meters for
-        satellite ``si``.
+        ``[x, y, z, dtr, ztd?, B_s1, ..., B_sn]`` where ``ztd`` is present when
+        ``tro=True`` and ``B_si`` is the GRAPHIC ambiguity in metres of arc
+        ``si``.
+
+    Weights and screening:
+        ``var(G) = (var(P) + var(L)) / 4`` with ``var(P) = uncombined_code_var
+        / sin(el)`` and ``var(L) = uncombined_phase_var / sin(el)``. A GRAPHIC
+        observation whose prefit residual (clock removed with the median over
+        the satellites) departs by more than ``max(3 m, 5 sigma)`` is skipped
+        for that epoch once the ambiguity of its arc is known to 1 m.
 
     Supported systems/modes:
         Any single-frequency mode known to ``gnx_py.gnss`` for GPS, Galileo or
         BeiDou, provided the input observation columns match the selected mode.
 
     PPP-AR support:
-        Not applied here.
+        Not applied: ``B`` is half an ambiguity plus biases, not an integer.
 
     Limitations:
-        This path is useful for compatibility and simple smoke runs, but it is
-        weaker than constrained uncombined single-frequency PPP because the
-        ionosphere is not modeled independently.
+        The noise of ``G`` is the code noise / 2: the convergence takes hours
+        (static) and kinematic positions are at the code-noise level. Code
+        multipath is not averaged out within a short arc.
     """
 
     def __init__(self, config:PPPConfig, obs, mode, ekf, tro=False, pos0=None, interval=0.5):
@@ -92,6 +125,10 @@ class PPPSingleFreqSingleGNSS:
         self.base_dim = 5 if self.tro else 4
         self.pos0 = pos0
         self.interval=interval
+        self.system = signal_spec(mode_signals(mode)[0]).system
+
+    #: columns the filter adds to the observation rows in its residual frame
+    RESIDUAL_COLUMNS = ("dtr", "ztd", "L3", "P3", "Nif", "res", "p_if")
 
     def HJacobian(self, x, gps_satellites):
         """
@@ -101,29 +138,17 @@ class PPPSingleFreqSingleGNSS:
 =       :return: Hjacobian matrix
         """
         num_gps = len(gps_satellites)
-        N = num_gps
-        # State: x,y,z, dt_gps, tro, isb, N1...Nn
-        dim_state = self.base_dim + N
-
+        # State: x, y, z, dtr, ztd?, B1...Bn; one GRAPHIC row per satellite
+        dim_state = self.base_dim + num_gps
         receiver = x[:3]
-        # GPS PART
-        H1 = np.zeros((2 * num_gps, dim_state))
+        H1 = np.zeros((num_gps, dim_state))
         distances_gps = np.linalg.norm(gps_satellites[:, :3] - receiver, axis=1)
-        for i in range(num_gps):
-            # Code observation (wiersz i)
-            H1[i, 0:3] = (receiver - gps_satellites[i, :3]) / distances_gps[i]
-            H1[i, 3] = 1.0  # clock
-            if self.tro:
-                H1[i, 4] = gps_satellites[i, -1]
-
-            # Phase observation (wiersz N+i)
-            H1[num_gps + i, 0:3] = (receiver - gps_satellites[i, :3]) / distances_gps[i]
-            H1[num_gps + i, 3] = 1.0  # clock
-            if self.tro:
-                H1[num_gps+i, 4] = gps_satellites[i,-1]
-
-            H1[num_gps + i, self.base_dim + i] = 1  # AMB
-
+        idx = np.arange(num_gps)
+        H1[:, 0:3] = (receiver - gps_satellites[:, :3]) / distances_gps[:, None]
+        H1[:, 3] = 1.0  # clock
+        if self.tro:
+            H1[:, 4] = gps_satellites[:, -1]
+        H1[idx, self.base_dim + idx] = 1.0  # GRAPHIC ambiguity
         return H1
 
     def Hx(self, x ,gps_satellites):
@@ -140,13 +165,10 @@ class PPPSingleFreqSingleGNSS:
             tro = gps_satellites[:, -1] * x[4]
         else:
             tro = 0.0
-        # GPS prediction
+        # GRAPHIC prediction
         distances_gps = np.linalg.norm(gps_satellites[:, :3] - receiver, axis=1)
-        h_code_gps = distances_gps + clock + tro
         ambiguities_gps = x[self.base_dim:self.base_dim + num_gps]
-        h_phase_gps = distances_gps + clock + tro + ambiguities_gps
-
-        return np.concatenate((h_code_gps, h_phase_gps))
+        return distances_gps + clock + tro + ambiguities_gps
 
     def rebuild_state(self, x_old, P_old, Q_old, prev_sats, curr_sats, base_dim=6):
         """
@@ -213,7 +235,7 @@ class PPPSingleFreqSingleGNSS:
         # Nowym satelitom daj Q = 0
         for sat in new_sats:
             i_new = base_dim + curr_map[sat]
-            new_Q[i_new, i_new] = self.cfg.q_amb
+            new_Q[i_new, i_new] = random_walk_variance(self.cfg.q_amb, self.interval)
 
         return new_x, new_P, new_Q
 
@@ -230,10 +252,10 @@ class PPPSingleFreqSingleGNSS:
     
 
         gps0 = obs0.index.get_level_values('sv').tolist()
-        N0 = len(gps0) 
+        N0 = len(gps0)
 
         dimx = self.base_dim + N0
-        dimz = 2 * N0
+        dimz = N0  # one GRAPHIC observation per satellite
         # x
         if self.pos0 is None:
 
@@ -251,21 +273,22 @@ class PPPSingleFreqSingleGNSS:
         self.ekf._I = np.eye(self.ekf.dim_x)
 
         self.ekf.x = initial_state.copy()
-        # Q
-        self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim), np.zeros(N0))))
-        self.ekf.Q[:3, :3] = self.cfg.q_crd
+        # Q (ambiguities: random-walk rate q_amb, 0.0 by default)
+        self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim),
+                                             np.full(N0, random_walk_variance(self.cfg.q_amb, self.interval)))))
+        self.ekf.Q[:3, :3] = np.eye(3) * self.cfg.q_crd  # independent random walk per axis
         self.ekf.Q[3, 3] = self.cfg.q_dt
 
 
         # P
         self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, self.cfg.p_crd), np.full(N0, self.cfg.p_amb))))
         if self.pos0 is None:
-            self.ekf.P[:3, :3] = 1e12
+            self.ekf.P[:3, :3] = np.eye(3) * 1e12
         self.ekf.P[3, 3] = self.cfg.p_dt
 
         if self.tro:
             self.ekf.P[4,4] = self.cfg.p_tro
-            self.ekf.Q[4, 4] = self.cfg.q_tro
+            self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_tro, self.interval)
 
         # F
         self.ekf.F = np.eye(dimx)
@@ -285,7 +308,7 @@ class PPPSingleFreqSingleGNSS:
         N0 = len(gps0)
 
         dimx = self.base_dim + N0
-        dimz = 2 * N0
+        dimz = N0  # one GRAPHIC observation per satellite
         # x
         if self.pos0 is None:
 
@@ -303,20 +326,21 @@ class PPPSingleFreqSingleGNSS:
         self.ekf._I = np.eye(self.ekf.dim_x)
 
         self.ekf.x = initial_state.copy()
-        # Q
-        self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim), np.zeros(N0))))
-        self.ekf.Q[:3, :3] = self.cfg.q_crd
+        # Q (ambiguities: random-walk rate q_amb, 0.0 by default)
+        self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim),
+                                             np.full(N0, random_walk_variance(self.cfg.q_amb, self.interval)))))
+        self.ekf.Q[:3, :3] = np.eye(3) * self.cfg.q_crd  # independent random walk per axis
         self.ekf.Q[3, 3] = self.cfg.q_dt
 
         # P
         self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, self.cfg.p_crd), np.full(N0, self.cfg.p_amb))))
         if self.pos0 is None:
-            self.ekf.P[:3, :3] = 1e12
+            self.ekf.P[:3, :3] = np.eye(3) * 1e12
         self.ekf.P[3, 3] = self.cfg.p_dt
 
         if self.tro:
             self.ekf.P[4, 4] = self.cfg.p_tro
-            self.ekf.Q[4, 4] = self.cfg.q_tro
+            self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_tro, self.interval)
 
         # F
         self.ekf.F = np.eye(dimx)
@@ -324,6 +348,28 @@ class PPPSingleFreqSingleGNSS:
         old_sats = gps0
 
         return old_sats
+
+    def _graphic_observations(self, epoch, code_col, phase_col):
+        """Corrected code ``P``, phase ``L`` [m] and the GRAPHIC average ``(P + L) / 2`` of one epoch.
+
+        A missing correction column (``windup``/``rel_path``/``solid_tides``/``antenna_h`` disabled,
+        no ionosphere model) counts as 0. ``phw`` (phase wind-up) is in cycles.
+        """
+        n = len(epoch)
+
+        # a missing column is no correction; a NaN value (no clock, no bias record for the satellite, ...)
+        # stays NaN and run_filter leaves the satellite out of the epoch
+        def col(name):
+            return epoch[name].to_numpy(dtype=float) if name in epoch.columns else np.zeros(n)
+
+        lam = self.CLIGHT / self.FREQ_DICT[self.mode]
+        common = (col('clk') * self.CLIGHT - col('tro') - col('ah_los') + col(f'sat_pco_los_{self.mode}')
+                  - col('dprel') - col('pco_los') - col('tides_los'))
+        osb_c = col(f'OSB_{code_col}') * 1e-09 * self.CLIGHT
+        osb_l = col(f'OSB_{phase_col}') * 1e-09 * self.CLIGHT
+        code = epoch[code_col].to_numpy(dtype=float) - osb_c + common
+        phase = epoch[phase_col].to_numpy(dtype=float) - osb_l + common - lam * col('phw')
+        return code, phase, 0.5 * (code + phase)
 
     def _prepare_obs(self):
         signals = mode_signals(self.mode)
@@ -344,6 +390,39 @@ class PPPSingleFreqSingleGNSS:
         Screening of code observations for outliers.
         """
         return ppp_code_screening(x=x, satellites=satellites, code_obs=code_obs, thr=thr)
+
+    #: GRAPHIC prefit gate: max(GRAPHIC_GATE_M, GRAPHIC_GATE_SIGMA * sigma) once the arc's ambiguity sigma
+    #: is below GRAPHIC_GATE_AMB_SIGMA_M (an arc just started cannot be checked)
+    GRAPHIC_GATE_M = 3.0
+    GRAPHIC_GATE_SIGMA = 5.0
+    GRAPHIC_GATE_AMB_SIGMA_M = 1.0
+
+    def _graphic_screening(self, z, satellites, var_z):
+        """Mask of the GRAPHIC observations kept this epoch (iono-model free outlier gate).
+
+        Prefit residual ``z - h(x)`` with the predicted state; the receiver clock (free every epoch) is
+        removed with the median over the satellites whose ambiguity is known to
+        ``GRAPHIC_GATE_AMB_SIGMA_M``; at least three such satellites are needed. If more than half of
+        them fail, all observations are kept (the prediction, not the data, is wrong).
+        """
+        n = len(z)
+        keep = np.ones(n, dtype=bool)
+        if n == 0 or self.ekf.x.size < self.base_dim + n:
+            return keep
+        p_amb = np.diag(self.ekf.P)[self.base_dim:self.base_dim + n]
+        known = np.isfinite(p_amb) & (p_amb < self.GRAPHIC_GATE_AMB_SIGMA_M ** 2)
+        if known.sum() < 3:
+            return keep
+        v = z - self.Hx(self.ekf.x, satellites)
+        v = v - np.median(v[known])
+        # position uncertainty of the prediction (kinematic: q_crd per axis and epoch)
+        var_pos = float(np.trace(self.ekf.P[:3, :3])) + 3.0 * float(self.cfg.q_crd)
+        gate = np.maximum(self.GRAPHIC_GATE_M, self.GRAPHIC_GATE_SIGMA * np.sqrt(var_z + p_amb + var_pos))
+        bad = known & (np.abs(v) > gate)
+        if bad.sum() > known.sum() / 2:
+            return keep
+        keep[bad] = False
+        return keep
 
     def phase_residuals_screening(self, sat_list, phase_residuals_dict,num,thr=10,sys='G',len_gps=None):
         """
@@ -380,7 +459,8 @@ class PPPSingleFreqSingleGNSS:
 
         :param add_dcb: bool, whether to add dcb
         :param trace_filter:bool, whether to trace filter
-        :param reset_every: int, number of epochs to reset filter
+        :param reset_every: int, reset period [min] (PPPConfig.reset_every: the filter is reset when
+            the epoch index x interval [min] is a multiple of it), 0 = never
         :return: tuple(pd.Dataframe, pd.Dataframe, pd.Dataframe, float), solution, gps&gal residuals, convergence time
         """
         old_sats, epochs = self.init_filter()
@@ -391,7 +471,9 @@ class PPPSingleFreqSingleGNSS:
         result = []
         result_gps = []
         ar_cfg = PPPARSettings(
-            enabled=bool(getattr(self.cfg, "pppar_enabled", False)),
+            # the GRAPHIC ambiguity is half a carrier ambiguity plus code/phase biases, not an integer:
+            # AR is off here (PPPSession warns when pppar_enabled is set)
+            enabled=False,
             warmup_epochs=int(getattr(self.cfg, "pppar_warmup_epochs", 60)),
             min_ambiguities=int(getattr(self.cfg, "pppar_min_ambiguities", 4)),
             ratio_threshold=float(getattr(self.cfg, "pppar_ratio_threshold", 2.0)),
@@ -400,9 +482,10 @@ class PPPSingleFreqSingleGNSS:
             min_lock_epochs=getattr(self.cfg, "pppar_min_lock_epochs", None),
             min_candidate_elevation_deg=getattr(self.cfg, "pppar_min_candidate_elevation_deg", None),
             use_float_ratio_covariance=bool(getattr(self.cfg, "pppar_use_float_ratio_covariance", True)),
-            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", False)),
+            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", True)),
             partial_min_ambiguities=getattr(self.cfg, "pppar_partial_min_ambiguities", None),
             wide_lane_max_frac_cycles=getattr(self.cfg, "pppar_wide_lane_max_frac_cycles", 0.25),
+            hold=bool(getattr(self.cfg, "pppar_fix_and_hold", False)),
         )
         self.obs = self.obs.sort_values(by='sv')
         obs_epochs = {t: df for t, df in self.obs.groupby(level=1, sort=False)}
@@ -410,18 +493,24 @@ class PPPSingleFreqSingleGNSS:
         xyz = None
         T0 = epochs[0]
         conv_time = None
-        arc_age = {sv: 0 for sv in old_sats}
+        arc_age: dict = {}  # PPP-069: the first advance_arc_age gives 0
         for num, t in enumerate(epochs):
             reset_epoch = False
             if reset_every != 0:
                 if ((num * self.interval) % reset_every == 0) and (num != 0):
                     old_sats = self.reset_filter(epoch=t)
-                    arc_age = {sv: 0 for sv in old_sats}
+                    arc_age = {}  # PPP-069: every arc restarts at age 0
                     reset_epoch = True
                     T0 = t
             gps_epoch = obs_epochs.get(t)
             if gps_epoch is None:
                 continue
+            GP3_code, GL3_phase, z_all = self._graphic_observations(gps_epoch, gps_c1, gps_l1)
+            finite = np.isfinite(z_all) & np.isfinite(gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy(dtype=float)).all(axis=1)
+            if not finite.all():
+                # no bias record / missing observation: the satellite is left out of this epoch
+                gps_epoch = gps_epoch[finite].copy()
+                GP3_code, GL3_phase, z_all = GP3_code[finite], GL3_phase[finite], z_all[finite]
             if len(gps_epoch)<4:
                 ppp_trace(
                     trace_filter,
@@ -439,52 +528,32 @@ class PPPSingleFreqSingleGNSS:
                 new_x, new_P, new_Q = self.rebuild_state(self.ekf.x.copy(), self.ekf.P.copy(), self.ekf.Q.copy(),
                                                          old_sats, curr_sats,
                                                          self.base_dim)
+                # a new arc starts from its first code/phase difference (the prior p_amb stays)
+                prev = set(old_sats)
+                for j, sv in enumerate(curr_sats):
+                    if sv not in prev:
+                        new_x[self.base_dim + j] = 0.5 * (GL3_phase[j] - GP3_code[j])
                 self.ekf.x, self.ekf.P, self.ekf.Q = new_x, new_P, new_Q
                 self.ekf.F = np.eye(len(self.ekf.x))
                 self.ekf.dim_x = len(self.ekf.x)
-                self.ekf.dim_z = 2 * len(curr_sats)
+                self.ekf.dim_z = len(curr_sats)
                 self.ekf._I = np.eye(self.ekf.dim_x)
+            elif num == 0:
+                self.ekf.x[self.base_dim:] = 0.5 * (GL3_phase - GP3_code)
             old_sats = curr_sats
-            arc_age = {sv: arc_age.get(sv, 0) for sv in curr_sats}
-            gps_clk, gps_tro, gps_ah_los, gps_sat_pco_los, gps_dprel, gps_pco1, gps_ion, gps_phw = [
-                gps_epoch[col].to_numpy()
-                for col in
-                ['clk', 'tro', 'ah_los',
-                 f'sat_pco_los_{self.mode}',
-                 'dprel', 'pco_los', 'ion', 'phw']]
 
-            gps_osb_c1 = np.asarray(gps_epoch.get(f'OSB_{gps_c1}',0.0)) * 1e-09 * self.CLIGHT
-            gps_osb_c2 = np.asarray(gps_epoch.get(f'OSB_{gps_l1}',0.0)) * 1e-09 * self.CLIGHT
-
-
-            GP3_code = (
-                    (gps_epoch[f'{gps_c1}'].to_numpy() - gps_pco1-gps_osb_c1)
-                    + gps_clk * self.CLIGHT - gps_tro - gps_ah_los + gps_sat_pco_los - gps_dprel 
-                    - gps_ion
-            )
-
-            GL3_phase = (
-                    (gps_epoch[f'{gps_l1}'].to_numpy() - gps_pco1-gps_osb_c2)
-                    + gps_clk * self.CLIGHT - gps_tro - gps_ah_los + gps_sat_pco_los - gps_dprel
-                    + gps_ion -  ((self.CLIGHT / self.FREQ_DICT[self.mode]) / (2 * np.pi)) * gps_epoch['phw'].to_numpy()
-            )
-
-
-            z = np.concatenate((GP3_code, GL3_phase))
+            z = z_all
             self.ekf.dim_z = len(z)
-            sat_positions_gps = gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
+            sat_positions_gps = gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy(dtype=float)
 
-            mask = self.code_screening(x=self.ekf.x[:3].copy(), code_obs=GP3_code,satellites=sat_positions_gps[:,:3],
-                                       thr=3)
-            mask2 = np.concatenate((mask,mask))
-            ev_gps = gps_epoch['ev'].to_numpy(copy=False)
-            sin_el = np.sin(np.deg2rad(ev_gps))
-            inv_sin2 = 1.0 / np.square(sin_el)
-            sigma_code_gps = 0.5 + 0.0025 * inv_sin2
-            sigma_phase_gps = 9e-4 + 0.00025 * inv_sin2
-            R_vec = np.concatenate((sigma_code_gps, sigma_phase_gps))
-            if num > 30:
-                R_vec[~mask2] = 1e12
+            ev_gps = gps_epoch['ev'].to_numpy(dtype=float) if 'ev' in gps_epoch.columns else np.full(len(z), 45.0)
+            inv_sin = 1.0 / np.clip(np.sin(np.deg2rad(ev_gps)), 1e-3, None)
+            var_code = float(self.cfg.uncombined_code_var) * inv_sin
+            # NQ-SPP-33 (author decision 2026-10-15): BDS-3 codes not moved to the clock datum are down-weighted
+            var_code = var_code + unmoved_code_variance_m2(self.cfg, self.system, gps_epoch)
+            var_phase = float(self.cfg.uncombined_phase_var) * inv_sin
+            R_vec = 0.25 * (var_code + var_phase)
+            R_vec[~self._graphic_screening(z, sat_positions_gps, R_vec)] = 1e12
 
             m = R_vec.size
             R = r_cache.get(m)
@@ -496,8 +565,12 @@ class PPPSingleFreqSingleGNSS:
             R.flat[::m + 1] = R_vec
             self.ekf.R = R
 
-            self.ekf.predict_update(z=z, HJacobian=self.HJacobian, args=(sat_positions_gps),
-                                    Hx=self.Hx, hx_args=(sat_positions_gps))
+            # receiver clock prior from the GRAPHIC residuals (each arc's B starts at (L - P) / 2, so a GRAPHIC
+            # residual without the clock is the code-based clock), RTKLIB udclk_ppp (bug-fix stage 13b, A1(b))
+            self.ekf.state_priors = clock_priors(self.cfg.clock_prior_sigma_m, np.arange(m))
+            with epoch_process_noise(self.ekf, t, self.interval):
+                self.ekf.predict_update(z=z, HJacobian=self.HJacobian, args=(sat_positions_gps),
+                                        Hx=self.Hx, hx_args=(sat_positions_gps))
             arc_age = advance_arc_age(arc_age, curr_sats)
             ar_age = arc_age_array(arc_age, curr_sats)
             gps_ev = gps_epoch['ev'].to_numpy(copy=False) if 'ev' in gps_epoch.columns else np.full(
@@ -567,32 +640,29 @@ class PPPSingleFreqSingleGNSS:
             result.append(df_epoch)
             gps_epoch['dtr'] = dtr
             gps_epoch['ztd'] = tro
+            # L3 / P3: corrected phase and code [m]; Nif: GRAPHIC ambiguity B [m]; res: GRAPHIC innovation
             gps_epoch['L3'] = GL3_phase
             gps_epoch['P3'] = GP3_code
             gps_epoch['Nif'] = self.ekf.x[self.base_dim:self.base_dim + len(gps_epoch)].copy()
-            gps_epoch['res'] = self.ekf.y[len(gps_epoch):2 * len(gps_epoch)]
+            gps_epoch['res'] = np.asarray(self.ekf.y, dtype=float).ravel()[:len(gps_epoch)]
             gps_epoch['p_if'] = np.diag(self.ekf.P[self.base_dim:self.base_dim + len(gps_epoch),
                                         self.base_dim:self.base_dim + len(gps_epoch)])
 
             result_gps.append(gps_epoch)
-        df_gps = pd.concat(result_gps)
-        df_result = pd.concat(result)
-        if conv_time is not None:
-            if trace_filter:
-                ppp_trace(
-                    trace_filter,
-                    self.__class__.__name__,
-                    "convergence",
-                    threshold_m=0.005,
-                    minutes=conv_time.total_seconds() / 60,
-                    hours=conv_time.total_seconds() / 3600,
-                )
-
-            ct = conv_time.total_seconds() / 3600
-        else:
-            ct = None
-        df_result['ct_min'] = ct
-        return df_result, df_gps, None, None
+        if conv_time is not None and trace_filter:
+            ppp_trace(
+                trace_filter,
+                self.__class__.__name__,
+                "convergence",
+                threshold_m=0.005,
+                minutes=conv_time.total_seconds() / 60,
+                hours=conv_time.total_seconds() / 3600,
+            )
+        # contracts C1 / C2 (bug-fix stage 13b, PPP-033 / PPP-034, Q55): {system: residual frame}, ct_min in minutes
+        # and the convergence time returned as by the other routes (it was None here)
+        df_result = finish_solution(pd.concat(result) if result else None, conv_time)
+        residuals = residual_frames({self.system: result_gps}, {self.system: self.obs}, self.RESIDUAL_COLUMNS)
+        return df_result, residuals, None, convergence_hours(conv_time)
 
 
 class PPPDualFreqSingleGNSS:
@@ -622,9 +692,9 @@ class PPPDualFreqSingleGNSS:
         ``E1E5a`` or ``B1IB3I``.
 
     PPP-AR support:
-        Conventional IF AR can be attempted through ``pppar.py`` only when the
-        configuration explicitly enables it. Combined IF AR is experimental and
-        guarded by ``pppar_combined_if_ar_enabled``.
+        The AR step (``pppar.apply_conventional_pppar``, gated by
+        ``pppar_combined_if_ar_enabled``) fixes no ambiguity: the IF
+        ambiguity is not an integer without the wide lane.
         BeiDou combined AR is blocked in this class until BDS phase-bias
         handling is validated.
 
@@ -666,6 +736,13 @@ class PPPDualFreqSingleGNSS:
         self.if_wavelength = None
         self.obs_columns = None
         self.rec_pco_columns = None
+
+    #: columns the filter adds to the observation rows in its residual frame
+    RESIDUAL_COLUMNS = (
+        "dtr", "ztd", "L3", "P3", "Nif", "prefit_code_res", "prefit_phase_res", "postfit_code_res",
+        "postfit_phase_res", "postfit_code_res_demeaned", "postfit_phase_res_demeaned", "res", "code_bias_corr",
+        "phase_bias_corr", "p_if",
+    )
 
     def HJacobian(self, x, gps_satellites):
         """
@@ -780,7 +857,7 @@ class PPPDualFreqSingleGNSS:
         # Nowym satelitom daj Q = 0
         for sat in new_sats:
             i_new = base_dim + curr_map[sat]
-            new_Q[i_new, i_new] = self.cfg.q_amb
+            new_Q[i_new, i_new] = random_walk_variance(self.cfg.q_amb, self.interval)
 
         return new_x, new_P, new_Q
 
@@ -809,16 +886,18 @@ class PPPDualFreqSingleGNSS:
         self.ekf._I = np.eye(self.ekf.dim_x)
         self.ekf.x = initial_state.copy()
 
-        # Q
-        self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim), np.zeros(N0))))
-        self.ekf.Q[:3, :3] = self.cfg.q_crd
+        # Q (ambiguities: random-walk rate q_amb, 0.0 by default; the first satellites had Q = 0 until bug-fix
+        # stage 13b, PPP-064)
+        self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim),
+                                             np.full(N0, random_walk_variance(self.cfg.q_amb, self.interval)))))
+        self.ekf.Q[:3, :3] = np.eye(3) * self.cfg.q_crd  # independent random walk per axis
         self.ekf.Q[3, 3] = self.cfg.q_dt
-        self.ekf.Q[4, 4] = self.cfg.q_tro
+        self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_tro, self.interval)
 
         # P
         self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, self.cfg.p_crd), np.full(N0, self.cfg.p_amb))))
         if self.pos0 is None:
-            self.ekf.P[:3, :3] = 1e12
+            self.ekf.P[:3, :3] = np.eye(3) * 1e12
         self.ekf.P[3, 3] = self.cfg.p_dt
         self.ekf.P[4, 4] = self.cfg.p_tro
 
@@ -853,16 +932,18 @@ class PPPDualFreqSingleGNSS:
         self.ekf._I = np.eye(self.ekf.dim_x)
         self.ekf.x = initial_state.copy()
 
-        # Q
-        self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim), np.zeros(N0))))
-        self.ekf.Q[:3, :3] = self.cfg.q_crd
+        # Q (ambiguities: random-walk rate q_amb, 0.0 by default; the first satellites had Q = 0 until bug-fix
+        # stage 13b, PPP-064)
+        self.ekf.Q = np.diag(np.concatenate((np.zeros(self.base_dim),
+                                             np.full(N0, random_walk_variance(self.cfg.q_amb, self.interval)))))
+        self.ekf.Q[:3, :3] = np.eye(3) * self.cfg.q_crd  # independent random walk per axis
         self.ekf.Q[3, 3] = self.cfg.q_dt
-        self.ekf.Q[4, 4] = self.cfg.q_tro
+        self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_tro, self.interval)
 
         # P
         self.ekf.P = np.diag(np.concatenate((np.full(self.base_dim, self.cfg.p_crd), np.full(N0, self.cfg.p_amb))))
         if self.pos0 is None:
-            self.ekf.P[:3, :3] = 1e12
+            self.ekf.P[:3, :3] = np.eye(3) * 1e12
         self.ekf.P[3, 3] = self.cfg.p_dt
         self.ekf.P[4, 4] = self.cfg.p_tro
 
@@ -1037,7 +1118,8 @@ class PPPDualFreqSingleGNSS:
         :param ref: np.ndarray, reference position in ECEF
         :param flh: np.ndarray, reference position in BLH
         :param trace_filter:bool, whether to trace filter
-        :param reset_every: int, number of epochs to reset filter
+        :param reset_every: int, reset period [min] (PPPConfig.reset_every: the filter is reset when
+            the epoch index x interval [min] is a multiple of it), 0 = never
         :return: tuple(pd.Dataframe, pd.Dataframe, pd.Dataframe, float), solution, gps&gal residuals, convergence time
         """
         old_sats, epochs = self.init_filter()
@@ -1057,9 +1139,10 @@ class PPPDualFreqSingleGNSS:
             min_lock_epochs=getattr(self.cfg, "pppar_min_lock_epochs", None),
             min_candidate_elevation_deg=getattr(self.cfg, "pppar_min_candidate_elevation_deg", None),
             use_float_ratio_covariance=bool(getattr(self.cfg, "pppar_use_float_ratio_covariance", True)),
-            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", False)),
+            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", True)),
             partial_min_ambiguities=getattr(self.cfg, "pppar_partial_min_ambiguities", None),
             wide_lane_max_frac_cycles=getattr(self.cfg, "pppar_wide_lane_max_frac_cycles", 0.25),
+            hold=bool(getattr(self.cfg, "pppar_fix_and_hold", False)),
         )
         if self.system == "C" and ar_cfg.enabled:
             warnings.warn(
@@ -1088,13 +1171,17 @@ class PPPDualFreqSingleGNSS:
         xyz = None
         conv_time = None
         T0 = epochs[0]
-        arc_age = {sv: 0 for sv in old_sats}
+        arc_age: dict = {}  # PPP-069: the first advance_arc_age gives 0
+        ar_float_state = None
         for num, t in enumerate(epochs):
+            # the previous epoch was reported fixed; without fix-and-hold the filter continues float
+            restore_float_state(self.ekf, ar_float_state)
+            ar_float_state = None
             reset_epoch = False
             if reset_every != 0:
                 if ((num * self.interval) % reset_every == 0) and (num != 0):
                     old_sats = self.reset_filter(epoch=t)
-                    arc_age = {sv: 0 for sv in old_sats}
+                    arc_age = {}  # PPP-069: every arc restarts at age 0
                     reset_epoch = True
                     T0 = t
             gps_epoch = gps_epochs.get(t)
@@ -1113,7 +1200,6 @@ class PPPDualFreqSingleGNSS:
                 self.ekf.dim_z = 2 * len(curr_sats)
                 self.ekf._I = np.eye(self.ekf.dim_x)
             old_sats = curr_sats
-            arc_age = {sv: arc_age.get(sv, 0) for sv in curr_sats}
             gps_clk, gps_tro, gps_ah_los, gps_dprel, gps_pco1, gps_pco2 = [
                 np.asarray(gps_epoch.get(col, 0.0))
                 for col in ['clk', 'tro', 'ah_los', 'dprel', pco_col1, pco_col2]
@@ -1152,7 +1238,7 @@ class PPPDualFreqSingleGNSS:
                      bgps * (gps_epoch[f'{gps_l2}'].to_numpy() - gps_pco2))
                     + phase_if_bias_corr
                     + gps_clk * self.CLIGHT - gps_tro - gps_ah_los + gps_sat_pco_los - gps_dprel - gps_tides_los
-                    - (self.LAMBDA_DICT[self.gps_mode] / (2 * np.pi)) * gps_epoch['phw'].to_numpy()
+                    - self.LAMBDA_DICT[self.gps_mode] * gps_epoch['phw'].to_numpy()  # lambda_IF = c/(f1+f2), phw in cycles
             )
 
 
@@ -1213,6 +1299,8 @@ class PPPDualFreqSingleGNSS:
             sin_el = np.sin(np.deg2rad(ev_gps))
             inv_sin2 = 1.0 / np.square(sin_el)
             sigma_code_gps = 9 + 0.0025 * inv_sin2
+            # NQ-SPP-33 (author decision 2026-10-15): BDS-3 codes not moved to the clock datum are down-weighted
+            sigma_code_gps = sigma_code_gps + unmoved_code_variance_m2(self.cfg, self.system, gps_epoch)
             sigma_phase_gps = 9e-4 + 0.0003 * inv_sin2
             R_vec = np.concatenate((sigma_code_gps, sigma_phase_gps))
             R_vec[~mask_gps2] = 1e12
@@ -1227,8 +1315,11 @@ class PPPDualFreqSingleGNSS:
             R.flat[::m + 1] = R_vec
             self.ekf.R = R
 
-            self.ekf.predict_update(z=z, HJacobian=self.HJacobian, args=sat_positions_gps,
-                                    Hx=self.Hx, hx_args=sat_positions_gps)
+            # receiver clock prior from the ionosphere-free code rows, RTKLIB udclk_ppp (bug-fix stage 13b, A1(b))
+            self.ekf.state_priors = clock_priors(self.cfg.clock_prior_sigma_m, np.arange(len(gps_epoch)))
+            with epoch_process_noise(self.ekf, t, self.interval):
+                self.ekf.predict_update(z=z, HJacobian=self.HJacobian, args=sat_positions_gps,
+                                        Hx=self.Hx, hx_args=sat_positions_gps)
             arc_age = advance_arc_age(arc_age, curr_sats, phase_reset_svs)
             ar_age = arc_age_array(arc_age, curr_sats)
             innovation = np.asarray(self.ekf.y, dtype=float)
@@ -1261,6 +1352,10 @@ class PPPDualFreqSingleGNSS:
             ar_diag = None
             if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
                 lam = self.LAMBDA_DICT[self.gps_mode]
+                # float phase residuals and weights of the IF phase rows (contract C3, NQ-PPP-20)
+                ar_inputs = ar_phase_kwargs(postfit, np.diag(self.ekf.R),
+                                            n_obs + np.arange(n_obs), self.base_dim + np.arange(n_obs))
+                ar_float_state = keep_float_state(self.ekf, ar_cfg)
                 self.ekf.x, self.ekf.P, ar_diag = apply_conventional_pppar(
                     x=self.ekf.x,
                     P=self.ekf.P,
@@ -1273,6 +1368,8 @@ class PPPDualFreqSingleGNSS:
                     lambda_gal=lam,
                     settings=ar_cfg,
                     gps_age=ar_age,
+                    gps_eligible=ar_eligible_mask(gps_epoch),
+                    **ar_inputs,
                 )
 
             dtr = self.ekf.x[3]
@@ -1347,22 +1444,17 @@ class PPPDualFreqSingleGNSS:
 
             result_gps.append(gps_epoch)
 
-        df_result = pd.concat(result)
-        df_obs_gps = pd.concat(result_gps)
-
-        if trace_filter:
-            if conv_time:
-                ppp_trace(
-                    trace_filter,
-                    self.__class__.__name__,
-                    "convergence",
-                    threshold_m=0.05,
-                    minutes=conv_time.total_seconds() / 60,
-                    hours=conv_time.total_seconds() / 3600,
-                )
-                ct = conv_time.total_seconds() / 3600
-            else:
-                ct = None
-        else:
-            ct = None if conv_time is None else conv_time.total_seconds() / 3600
-        return df_result, df_obs_gps,None, ct
+        if trace_filter and conv_time:
+            ppp_trace(
+                trace_filter,
+                self.__class__.__name__,
+                "convergence",
+                threshold_m=0.05,
+                minutes=conv_time.total_seconds() / 60,
+                hours=conv_time.total_seconds() / 3600,
+            )
+        # contracts C1 / C2 (bug-fix stage 13b, PPP-033 / PPP-034): {system: residual frame} (a Galileo-only run
+        # returned its residuals in the GPS slot), ct_min [min] (missing on this route before)
+        df_result = finish_solution(pd.concat(result) if result else None, conv_time)
+        residuals = residual_frames({self.system: result_gps}, {self.system: self.gps_obs}, self.RESIDUAL_COLUMNS)
+        return df_result, residuals, None, convergence_hours(conv_time)

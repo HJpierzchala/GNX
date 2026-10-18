@@ -13,6 +13,13 @@ from .config import *
 # Active orbits/SIS public API.
 _CORE_API = [
     "SISConfig",
+    "SISSession",
+]
+
+# Deprecated alias kept so old code (and `from gnx_py import *`) keeps working:
+# `SISController` is the former name of `SISSession`; instantiating it emits a
+# DeprecationWarning. It will be removed only in a future major release.
+_DEPRECATED_API = [
     "SISController",
 ]
 
@@ -55,4 +62,4 @@ _COMPATIBILITY_EXPORTS = [
     "warnings",
 ]
 
-__all__ = _CORE_API + _CONSTANT_API + _COMPATIBILITY_EXPORTS
+__all__ = _CORE_API + _DEPRECATED_API + _CONSTANT_API + _COMPATIBILITY_EXPORTS

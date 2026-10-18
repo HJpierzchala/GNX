@@ -10,31 +10,53 @@ models directly, changes should be backed by focused regression tests.
 
 import numpy as np
 import pandas as pd
-from filterpy.kalman import ExtendedKalmanFilter
+from .ppp_helpers import GNXExtendedKalmanFilter as ExtendedKalmanFilter
 from typing import Sequence
 
-from ..conversion import ecef_to_enu
-from ..utils import calculate_distance
-from ..configuration import PPPConfig
-from ..biases import (
+from ..core.conversion import ecef_to_enu
+from ..core.utils import calculate_distance
+from ..core.configuration import PPPConfig
+from ..models.biases import (
     bias_column_m,
     has_satellite_osb,
     osb_m,
     split_dual_code_dsb_corrections_m,
+    unmoved_code_variance_m2,
 )
-from ..gnss import MODE_SIGNALS as GNSS_MODE_SIGNALS, SIGNALS, frequency_hz
+from ..core.gnss import MODE_SIGNALS as GNSS_MODE_SIGNALS, SIGNALS, frequency_hz
+from ..core import _notes
+# private aliases: ``gnx_py.ppp`` star-imports this module (bug-fix stage 13d, D6)
+from pathlib import Path as _Path
+from ..models.biases import NS_TO_M as _NS_TO_M
+from ..core.gnss import code_signal as _code_signal
+from ..ionosphere.ionex import IONEX_DEFAULT_DCB_REFERENCE as _IONEX_DEFAULT_DCB_REFERENCE
+from ..ionosphere.ionex import GIMReader as _GIMReader
 from .ppp_helpers import (
+    ar_phase_kwargs,
+    clock_priors,
+    convergence_hours,
+    finish_solution,
     phase_residuals_outliers,
+    epoch_process_noise,
+    gap_scaled_process_noise,
+    random_walk_variance,
+    reset_prior_states,
+    residual_frames,
     trace_epoch_summary as ppp_trace_epoch,
     trace_message as ppp_trace,
+    used_rows,
 )
 from .pppar import (
     PPPARSettings,
     advance_arc_age,
+    ar_eligible_mask,
     apply_indexed_uncombined_pppar,
     apply_uncombined_pppar,
     arc_age_array,
+    float_position,
+    keep_float_state,
     pppar_diagnostic_columns,
+    restore_float_state,
 )
 
 FREQ_DICT_ALL = {name: spec.frequency_hz for name, spec in SIGNALS.items()}
@@ -50,7 +72,12 @@ def _unit_vectors_and_ranges(sat_xyz: np.ndarray, rec_xyz: np.ndarray) -> tuple[
 
 
 def _covariance_measurement_update(P: np.ndarray, H: np.ndarray, R: np.ndarray) -> np.ndarray:
-    """Apply a covariance-only EKF measurement update for AR ratio covariance."""
+    """Apply a covariance-only EKF measurement update for AR ratio covariance.
+
+    Rows with ``R >= REJECTED_R`` are left out, as in the filter's own update (A1(a))."""
+    keep = used_rows(R)
+    if keep.size != H.shape[0]:
+        H, R = H[keep], R[np.ix_(keep, keep)]
     if H.size == 0:
         return P
     PHt = P @ H.T
@@ -65,6 +92,17 @@ def _covariance_measurement_update(P: np.ndarray, H: np.ndarray, R: np.ndarray) 
     return 0.5 * (P_new + P_new.T)
 
 
+def _init_coordinate_states(ekf, cfg) -> None:
+    """Initial covariance and process noise of the receiver coordinates (states 0-2).
+
+    ``p_crd`` and ``q_crd`` are per-axis variances [m^2]: the three axes start and
+    move independently (``q_crd`` per epoch, 0.0 static, > 0 kinematic random walk),
+    as in the combined filters.
+    """
+    ekf.P[:3, :3] = np.eye(3) * float(cfg.p_crd)
+    ekf.Q[:3, :3] = np.eye(3) * float(cfg.q_crd)
+
+
 def _reset_covariance_states(P: np.ndarray, indices: Sequence[int], variance: float) -> None:
     """Reset covariance rows/columns for selected state indices in place."""
     for idx in indices:
@@ -75,32 +113,85 @@ def _reset_covariance_states(P: np.ndarray, indices: Sequence[int], variance: fl
         P[idx, idx] = variance
 
 
+def _carry_over_states(
+    x_old: np.ndarray,
+    P_old: np.ndarray,
+    Q_old: np.ndarray,
+    x_new: np.ndarray,
+    P_new: np.ndarray,
+    Q_new: np.ndarray,
+    old_idx: Sequence[int],
+    new_idx: Sequence[int],
+) -> None:
+    """Copy retained states with their full joint covariance block, in place.
+
+    On a satellite-set change a filter keeps the receiver states, the states of
+    the satellites still tracked and any receiver bias states. ``old_idx`` and
+    ``new_idx`` list all of them in matching order; copying their covariance
+    block in one go keeps every correlation between them (satellite-satellite,
+    satellite-receiver, bias-anything). Copying it block by block drops some of
+    those correlations and leaves an inconsistent covariance matrix.
+    """
+    old_idx = np.asarray(old_idx, dtype=int)
+    new_idx = np.asarray(new_idx, dtype=int)
+    if old_idx.size == 0:
+        return
+    x_new[new_idx] = x_old[old_idx]
+    P_new[np.ix_(new_idx, new_idx)] = P_old[np.ix_(old_idx, old_idx)]
+    Q_new[np.ix_(new_idx, new_idx)] = Q_old[np.ix_(old_idx, old_idx)]
+
+
+def _ramp_plus_ion_rms(ramp, ion_rms, fallback: float) -> np.ndarray:
+    """Variance [m^2] of the ionospheric pseudo-observation with the model error: ``ramp + ion_rms**2``.
+
+    ``ramp``: the constraint variance of the ``sigma_iono_0`` -> ``sigma_iono_end`` ramp [m^2] (scalar or one per
+    satellite); ``ion_rms``: the model error [m] (GIM RMS map, or the modelled error of a broadcast model); a
+    non-finite ``ion_rms`` takes ``fallback`` [m^2]. Variances of independent errors add, as in RTKLIB, which sums the
+    model variances into the observation variance (ppp.c ``res_ppp``; ``iontec``: the RMS map squared, broadcast
+    ``SQR(ERR_BRDCI * ion)``). Shared by ``_iono_constraint_sigma`` (R7, R2, single frequency) and R4c (before v1.0.0 it was ``ion_rms * ramp``, a metre times a variance).
+    """
+    ion_rms = np.asarray(ion_rms, dtype=float)
+    finite = np.isfinite(ion_rms)
+    return np.where(finite, ramp + np.square(np.where(finite, ion_rms, 0.0)), float(fallback))
+
+
 def _iono_constraint_sigma(
     epoch: pd.DataFrame,
-    num: int,
+    num,
     interval: float,
     use_iono_rms: bool,
     sigma_iono_0: float,
     sigma_iono_end: float,
     t_end: int,
 ) -> np.ndarray:
-    """Return per-satellite ionospheric constraint sigma for one epoch.
+    """Return the per-satellite variance [m^2] of the ionospheric pseudo-observation for one epoch.
 
-    The sigma ramps from ``sigma_iono_0`` to ``sigma_iono_end`` over ``t_end``
-    minutes/epochs as encoded by the existing model and can be scaled by
-    ``ion_rms`` when available.
+    The ramp goes from ``sigma_iono_0`` to ``sigma_iono_end`` over ``t_end``
+    minutes/epochs; its values are variances [m^2]. With ``use_iono_rms`` and an
+    ``ion_rms`` column [m] (the GIM RMS map, or the modelled broadcast error) the
+    variance is ``ramp + ion_rms**2``, the model error added to the ramp as
+    RTKLIB adds the variance of its ionosphere model (``iontec``: RMS map
+    squared; broadcast ``SQR(ERR_BRDCI * ion)``). Before v1.0.0
+    it was ``ion_rms * ramp`` (a metre times a variance), 2-3x
+    tighter at BRUX and slower: C-COD static UCi t_c10 224.5 min.
+    ``num`` is the epoch count since the start (one ramp for all satellites) or
+    an array with one count per satellite of ``epoch`` (one ramp per arc from
+    its own start). A non-finite ``ion_rms`` takes ``sigma_iono_end``.
     """
     interval = max(float(interval), 1e-12)
     sigma_iono_0 = 1.1 if sigma_iono_0 is None else sigma_iono_0
     sigma_iono_end = 3.0 if sigma_iono_end is None else sigma_iono_end
     t_end = 30 if t_end is None else t_end
     t_end_epochs = max(float(t_end) / interval, 1.0)
-    frac = min(float(num), t_end_epochs) / t_end_epochs
+    if np.ndim(num):
+        # per-satellite epoch counts (the age of each arc's ionosphere state, PPPUducSFSingleGNSS)
+        frac = np.minimum(np.asarray(num, dtype=float), t_end_epochs) / t_end_epochs
+    else:
+        frac = min(float(num), t_end_epochs) / t_end_epochs
     sigma = float(sigma_iono_0) + (float(sigma_iono_end) - float(sigma_iono_0)) * frac
 
     if use_iono_rms and 'ion_rms' in epoch.columns:
-        ion_sigma = epoch['ion_rms'].to_numpy(copy=False).astype(float, copy=False) * sigma
-        ion_sigma = np.where(np.isfinite(ion_sigma), ion_sigma, float(sigma_iono_end))
+        ion_sigma = _ramp_plus_ion_rms(sigma, epoch['ion_rms'].to_numpy(copy=False), sigma_iono_end)
     else:
         ion_sigma = np.full(len(epoch), sigma, dtype=float)
 
@@ -158,17 +249,6 @@ def _dual_mode_columns(obs: pd.DataFrame, mode: str):
     )
 
 
-def _p4_to_iono_state(p4: np.ndarray, mode: str) -> np.ndarray:
-    """Convert geometry-free code combination to the modeled ionosphere state."""
-    sig1, sig2 = _dual_mode_signals(mode)
-    f1 = frequency_hz(sig1)
-    f2 = frequency_hz(sig2)
-    scale = (f1 / f2) ** 2 - 1.0
-    if np.isclose(scale, 0.0):
-        return np.zeros_like(np.asarray(p4, dtype=float))
-    return np.asarray(p4, dtype=float) / scale
-
-
 def _dual_rec_pco_columns(mode: str) -> tuple[str, str]:
     """Return receiver PCO columns used by the selected dual-frequency mode."""
     if mode in {"E1E5b", "E5aE5b"}:
@@ -198,856 +278,278 @@ def _elevation_variance_scale(ev_deg: np.ndarray) -> np.ndarray:
     return 1.0 / np.clip(np.sin(np.deg2rad(ev)), 1e-3, None)
 
 
-def _apply_uncombined_measurement_variances(
-    r_diag: np.ndarray,
-    code_masks: list[np.ndarray],
-    phase_masks: list[np.ndarray],
-    ev_deg: np.ndarray,
-    rows_per_sat: int,
-    code_var: float = 1.0,
-    phase_var: float = 1.0,
-) -> None:
-    """Fill uncombined code/phase variances in an epoch R diagonal."""
-    scale = _elevation_variance_scale(ev_deg)
-    for band_idx, code_mask in enumerate(code_masks):
-        code_row = 2 * band_idx
-        phase_row = code_row + 1
-        phase_mask = phase_masks[band_idx]
-        r_diag[code_row::rows_per_sat] = np.where(code_mask, code_var * scale, 1e12)
-        r_diag[phase_row::rows_per_sat] = np.where(phase_mask, phase_var * scale, 1e12)
+def _uncombined_obs_variances(cfg, ev_deg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Code and phase variances [m^2] of the uncombined filters without the legacy weighting.
 
-
-class PPPUducSFMultiGNSS:
-    """Legacy mixed GPS/Galileo single-frequency uncombined PPP.
-
-    Purpose:
-        Compatibility path for mixed single-frequency GPS/Galileo processing.
-        It predates the generic mixed uncombined implementation and remains
-        reachable from routing for selected G/E single-frequency no-constraint
-        scenarios.
-
-    Status:
-        Legacy/reachable class. It is still selected by ``PPPSession`` for
-        specific GPS+Galileo single-frequency no-constraint routing and is not
-        safe to remove without replacing that route and its regression tests.
-
-    Model:
-        Uses code and phase observables per satellite without forming
-        ionosphere-free combinations. The state carries one receiver clock, one
-        Galileo ISB, optional ZTD, and per-satellite ionosphere/ambiguity
-        blocks.
-
-    State vector:
-        ``[x, y, z, dtr_G, isb_E, ztd?, (I, N)_G..., (I, N)_E...]``.
-
-    Supported systems:
-        GPS and Galileo only.
-
-    Limitations:
-        Legacy G/E-specific class. Prefer ``PPPUdGenericMixedGNSS`` for new
-        mixed no-constraint work and ``PPPFilterMultiGNSSIonConstGEC`` for
-        constrained G/E/C validation.
+    ``uncombined_code_var`` and ``uncombined_phase_var`` are the zenith variances of one
+    undifferenced observation, scaled by 1/sin(elevation).
     """
-
-    def __init__(self, config:PPPConfig, gps_obs, gps_mode, gal_obs, gal_mode, ekf, pos0, tro=True, interval=0.5):
-        self.cfg=config
-        self.gps_obs = gps_obs
-        self.gps_mode = gps_mode
-        self.gal_obs = gal_obs
-        self.gal_mode = gal_mode
-        self.tro = tro
-        self.ekf = ekf
-        self.FREQ_DICT = dict(FREQ_DICT_ALL)
-        self.LAMBDA_DICT = {}
-        self.CLIGHT = 299792458
-        self.base_dim = 6 if self.tro else 5
-        self.pos0 = pos0
-        self.interval=interval
-
-    def Hjacobian(self, x, gps_satellites, gal_satellites):
-        C = self.CLIGHT
-        # Częstotliwości GPS
-        F1_GPS = self.FREQ_DICT[self.gps_mode]
-        L1 = C / F1_GPS
-        MU1 = 1.0
-
-        # Częstotliwości Galileo
-        F1_GAL = self.FREQ_DICT[self.gal_mode]
-        E1 = C / F1_GAL
-        MU1_GAL = 1.0
-
-        n_gps = gps_satellites.shape[0]
-        n_gal = gal_satellites.shape[0]
-        rec_xyz = x[:3].copy()
-
-        e_gps, _ = _unit_vectors_and_ranges(gps_satellites[:, :3], rec_xyz)
-        e_gal, _ = _unit_vectors_and_ranges(gal_satellites[:, :3], rec_xyz)
-        m_wet_gps = gps_satellites[:, 3]
-        m_wet_gal = gal_satellites[:, 3]
-
-        # Parametry wspólne: XYZ, clk_gps, ISB_galileo, ZTD
-        COL_X, COL_Y, COL_Z = 0, 1, 2
-        COL_CLK = 3
-        COL_ISB = 4
-        COL_ZTD = 5 if self.tro else None
-
-        base_dim = self.base_dim
-
-        # 2 równania na każdy satelita: P1, L1, P2, L2
-        H = np.zeros((2 * (n_gps + n_gal), base_dim + 2 * (n_gps + n_gal)))
-
-        # ---------------- GPS ----------------
-        if n_gps:
-            gps_rows = slice(0, 2 * n_gps)
-            H[gps_rows, [COL_X, COL_Y, COL_Z]] = np.repeat(e_gps, 2, axis=0)
-            H[gps_rows, COL_CLK] = 1.0
-            if self.tro:
-                H[gps_rows, COL_ZTD] = np.repeat(m_wet_gps, 2)
-
-            idx = np.arange(n_gps)
-            row0 = 2 * idx
-            row1 = row0 + 1
-            col_iono = base_dim + 2 * idx
-            H[row0, col_iono] = MU1
-            H[row1, col_iono] = -MU1
-            H[row1, col_iono + 1] = L1
-
-        # ---------------- Galileo ----------------
-        if n_gal:
-            gal_rows = slice(2 * n_gps, 2 * (n_gps + n_gal))
-            H[gal_rows, [COL_X, COL_Y, COL_Z]] = np.repeat(e_gal, 2, axis=0)
-            H[gal_rows, COL_CLK] = 1.0
-            H[gal_rows, COL_ISB] = 1.0
-            if self.tro:
-                H[gal_rows, COL_ZTD] = np.repeat(m_wet_gal, 2)
-
-            idx = np.arange(n_gal)
-            row0 = 2 * (n_gps + idx)
-            row1 = row0 + 1
-            col_iono = base_dim + 2 * (n_gps + idx)
-            H[row0, col_iono] = MU1_GAL
-            H[row1, col_iono] = -MU1_GAL
-            H[row1, col_iono + 1] = E1
-
-        return H
-
-    def Hx(self, x: np.ndarray, gps_satellites: np.ndarray, gal_satellites: np.ndarray) -> np.ndarray:
-        x_state = x.copy()
-        C = self.CLIGHT
-        # GPS
-        F1_GPS = self.FREQ_DICT[self.gps_mode]
-        L1 = C / F1_GPS
-        MU1 = 1.0
-
-        # Galileo
-        F1_GAL = self.FREQ_DICT[self.gal_mode]
-        E1 = C / F1_GAL
-        MU1_GAL = 1.0
-
-        clk = x_state[3]
-        isb = x_state[4]  # inter-sys bias (dla Galileo)
-        zwd = x_state[5] if self.tro else 0.0
-
-        base_dim = self.base_dim
-        n_gps = gps_satellites.shape[0]
-        n_gal = gal_satellites.shape[0]
-
-        z_hat = np.empty(2 * (n_gps + n_gal))
-
-        if n_gps:
-            gps_state = x_state[base_dim:base_dim + 2 * n_gps].reshape(n_gps, 2)
-            I_gps = gps_state[:, 0]
-            N1_gps = gps_state[:, 1]
-            _, rho_gps = _unit_vectors_and_ranges(gps_satellites[:, :3], x_state[:3])
-            mw_gps = gps_satellites[:, 3]
-            geom = rho_gps
-            gps_block = np.column_stack((
-                geom + clk + mw_gps * zwd + MU1 * I_gps,
-                geom + clk + mw_gps * zwd - MU1 * I_gps + L1 * N1_gps,
-            ))
-            z_hat[:2 * n_gps] = gps_block.reshape(-1)
-
-        if n_gal:
-            gal_state = x_state[base_dim + 2 * n_gps:base_dim + 2 * (n_gps + n_gal)].reshape(n_gal, 2)
-            I_gal = gal_state[:, 0]
-            N1_gal = gal_state[:, 1]
-            _, rho_gal = _unit_vectors_and_ranges(gal_satellites[:, :3], x_state[:3])
-            mw_gal = gal_satellites[:, 3]
-            geom = rho_gal
-            gal_block = np.column_stack((
-                geom + clk + isb + mw_gal * zwd + MU1_GAL * I_gal,
-                geom + clk + isb + mw_gal * zwd - MU1_GAL * I_gal + E1 * N1_gal,
-            ))
-            start = 2 * n_gps
-            z_hat[start:start + 2 * n_gal] = gal_block.reshape(-1)
-
-        return z_hat
-
-    def rebuild_state(self, x_old, P_old, Q_old,
-                      prev_gps, prev_gal, curr_gps, curr_gal,
-                      P4_gps_dict: dict, P4_gal_dict: dict):
-        """
-        Aktualizuje stan filtra Kalman w sytuacji, gdy zmienia się widoczność satelitów GPS i Galileo.
-        Dla nowych satelitów inicjalizuje I_s na podstawie obserwacji P4.
-
-        Parametry:
-        - prev_gps / prev_gal: listy satelitów poprzedniej epoki
-        - curr_gps / curr_gal: listy satelitów bieżącej epoki
-        - P4_gps_dict: słownik {sv: P4} dla GPS
-        - P4_gal_dict: słownik {sv: P4} dla Galileo
-
-        Zakładamy:
-        - self.base_dim = 6 (X, Y, Z, clk_GPS, ISB_GAL, ZTD)
-        """
-
-        base_dim = self.base_dim
-        n_prev = len(prev_gps) + len(prev_gal)
-        n_curr = len(curr_gps) + len(curr_gal)
-
-        old_dim = base_dim + 2 * n_prev
-        new_dim = base_dim + 2 * n_curr
-
-        x_new = np.zeros(new_dim)
-        x_new[:base_dim] = x_old[:base_dim]
-
-        P_new = np.zeros((new_dim, new_dim))
-        P_new[:base_dim, :base_dim] = P_old[:base_dim, :base_dim]
-
-        Q_new = np.zeros((new_dim, new_dim))
-        Q_new[:base_dim, :base_dim] = Q_old[:base_dim, :base_dim]
-
-        # Oznaczenia systemowe, np. G:G01, E:E11
-        def tag(system: str, sv: str) -> str:
-            return f"{system}:{sv}"
-
-        prev_all = [tag("G", sv) for sv in prev_gps] + [tag("E", sv) for sv in prev_gal]
-        curr_all = [tag("G", sv) for sv in curr_gps] + [tag("E", sv) for sv in curr_gal]
-
-        prev_map = {prn: i for i, prn in enumerate(prev_all)}
-        curr_map = {prn: i for i, prn in enumerate(curr_all)}
-        common = [prn for prn in curr_all if prn in prev_map]
-
-        if common:
-            prev_idx = np.fromiter((prev_map[prn] for prn in common), dtype=int)
-            curr_idx = np.fromiter((curr_map[prn] for prn in common), dtype=int)
-            offsets = np.arange(2)
-            old_state_idx = (base_dim + 2 * prev_idx[:, None] + offsets[None, :]).ravel()
-            new_state_idx = (base_dim + 2 * curr_idx[:, None] + offsets[None, :]).ravel()
-
-            x_new[new_state_idx] = x_old[old_state_idx]
-            base_idx = np.arange(base_dim)
-            P_new[np.ix_(new_state_idx, base_idx)] = P_old[np.ix_(old_state_idx, base_idx)]
-            P_new[np.ix_(base_idx, new_state_idx)] = P_old[np.ix_(base_idx, old_state_idx)]
-            Q_new[np.ix_(new_state_idx, base_idx)] = Q_old[np.ix_(old_state_idx, base_idx)]
-            Q_new[np.ix_(base_idx, new_state_idx)] = Q_old[np.ix_(base_idx, old_state_idx)]
-            P_new[np.ix_(new_state_idx, new_state_idx)] = P_old[np.ix_(old_state_idx, old_state_idx)]
-            Q_new[np.ix_(new_state_idx, new_state_idx)] = Q_old[np.ix_(old_state_idx, old_state_idx)]
-
-        # --- nowe satelity: zainicjalizuj I_s z P4 ---
-        new_only = set(curr_all) - set(prev_all)
-        for prn in new_only:
-            j = curr_map[prn]
-            idx_I = base_dim + 2 * j
-            idx_N1 = idx_I + 1
-
-            # Domyślny init
-            x_new[idx_I] = 0.0
-
-            # Próba inicjalizacji z P4
-            if prn.startswith("G:"):
-                sv = prn[2:]
-                if sv in P4_gps_dict:
-                    x_new[idx_I] = P4_gps_dict[sv]
-            elif prn.startswith("E:"):
-                sv = prn[2:]
-                if sv in P4_gal_dict:
-                    x_new[idx_I] = P4_gal_dict[sv]
-
-            # Ustaw P, Q
-            P_new[idx_I, idx_I] = self.cfg.p_iono
-            Q_new[idx_I, idx_I] = self.cfg.q_iono*(self.interval*60)/3600
-            P_new[idx_N1, idx_N1] = self.cfg.p_amb
-
-        return x_new, P_new, Q_new
-
-    def reset_filter(self, epoch, clk0: float = 0.0, zwd0: float = 0.0):
-        # Lista satelitów GPS i Galileo w pierwszej epoce
-        gps_sats = self.gps_obs.loc[(slice(None), epoch), :].index.get_level_values('sv').tolist()
-        gal_sats = self.gal_obs.loc[(slice(None), epoch), :].index.get_level_values('sv').tolist()
-
-        n_gps = len(gps_sats)
-        n_gal = len(gal_sats)
-
-        # Wymiary wektora stanu i obserwacji
-        base_dim = self.base_dim  # X, Y, Z, clk_gps, isb_galileo, ztd
-        dim_x = base_dim + 2 * (n_gps + n_gal)
-        dim_z = 2 * (n_gps + n_gal)
-
-        # Wektor stanu
-        x0 = np.zeros(dim_x)
-        x0[0:3] = self.pos0  # XYZ
-        x0[3] = clk0  # clk_gps
-        x0[4] = 0.0  # ISB dla Galileo
-        if self.tro:
-            x0[5] = zwd0  # ZTD
-
-        # Inicjalizacja EKF
-        self.ekf = ExtendedKalmanFilter(dim_x=dim_x, dim_z=dim_z)
-        self.ekf._I = np.eye(dim_x)
-        self.ekf.x = x0.copy()
-        self.ekf.P = np.eye(dim_x) * 1e2
-        self.ekf.P[3, 3] = self.cfg.p_dt  # clk
-        self.ekf.P[4, 4] = self.cfg.p_isb  # isb galileo
-        if self.tro:
-            self.ekf.P[5, 5] = self.cfg.p_tro  # zwd
-
-        self.ekf.Q = np.zeros_like(self.ekf.P)
-        self.ekf.Q[3, 3] = self.cfg.q_dt
-        self.ekf.Q[4, 4] = self.cfg.q_isb
-        if self.tro:
-            self.ekf.Q[5, 5] = self.cfg.q_tro
-
-        self.ekf.F = np.eye(dim_x)
-        self.ekf.F[3, 3] = 0.0  # model zegara: zresetuj co epokę (opcjonalnie)
-
-        # Inicjalizacja GPS: I_s, N1, N2
-        P4_gps = self.gps_obs.loc[(slice(None), epoch), 'P4'].to_numpy()
-        for i, sv in enumerate(gps_sats):
-            idx_I = base_dim + 2 * i
-            idx_N1 = idx_I + 1
-
-            I_init = P4_gps[i]  # zakładamy P4 ≈ I_s * (MU2 - 1)
-
-            self.ekf.x[idx_I] = I_init
-            self.ekf.P[idx_I, idx_I] = self.cfg.p_iono
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
-
-            self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
-
-        # Inicjalizacja Galileo: I_s, N1, N2
-        P4_gal = self.gal_obs.loc[(slice(None), epoch), 'P4'].to_numpy()
-        for j, sv in enumerate(gal_sats):
-            k = n_gps + j  # Galileo są po GPS
-            idx_I = base_dim + 2 * k
-            idx_N1 = idx_I + 1
-
-            I_init = P4_gal[j]  # analogicznie jak dla GPS
-
-            self.ekf.x[idx_I] = I_init
-            self.ekf.P[idx_I, idx_I] = self.cfg.p_iono
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
-
-            self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
-
-        return gps_sats, gal_sats
-
-    def init_filter(self, clk0: float = 0.0, zwd0: float = 0.0):
-        # Częstotliwości do przeliczenia P4 → I
-
-
-        # Wspólna pierwsza epoka
-        all_times = sorted(set(self.gps_obs.index.get_level_values('time').unique()) &
-                           set(self.gal_obs.index.get_level_values('time').unique()))
-        first_ep = all_times[0]
-
-        # Lista satelitów GPS i Galileo w pierwszej epoce
-        gps_sats = self.gps_obs.loc[(slice(None), first_ep), :].index.get_level_values('sv').tolist()
-        gal_sats = self.gal_obs.loc[(slice(None), first_ep), :].index.get_level_values('sv').tolist()
-
-        n_gps = len(gps_sats)
-        n_gal = len(gal_sats)
-
-        # Wymiary wektora stanu i obserwacji
-        base_dim = self.base_dim  # X, Y, Z, clk_gps, isb_galileo, ztd
-        dim_x = base_dim + 2 * (n_gps + n_gal)
-        dim_z = 2 * (n_gps + n_gal)
-
-        # Wektor stanu
-        x0 = np.zeros(dim_x)
-        x0[0:3] = self.pos0  # XYZ
-        x0[3] = clk0  # clk_gps
-        x0[4] = 0.0  # ISB dla Galileo
-        if self.tro:
-            x0[5] = zwd0  # ZTD
-
-        # Inicjalizacja EKF
-        self.ekf = ExtendedKalmanFilter(dim_x=dim_x, dim_z=dim_z)
-        self.ekf._I = np.eye(dim_x)
-        self.ekf.x = x0.copy()
-        self.ekf.P = np.eye(dim_x) * 1e2
-        self.ekf.P[3, 3] = self.cfg.p_dt  # clk
-        self.ekf.P[4, 4] = self.cfg.p_isb  # isb galileo
-        if self.tro:
-            self.ekf.P[5, 5] = self.cfg.p_tro  # zwd
-
-        self.ekf.Q = np.zeros_like(self.ekf.P)
-        self.ekf.Q[3, 3] = self.cfg.q_dt
-        self.ekf.Q[4, 4] = self.cfg.q_isb
-        if self.tro:
-            self.ekf.Q[5, 5] = self.cfg.q_tro
-
-        self.ekf.F = np.eye(dim_x)
-        self.ekf.F[3, 3] = 0.0  # model zegara: zresetuj co epokę (opcjonalnie)
-
-        # Inicjalizacja GPS: I_s, N1, N2
-        P4_gps = self.gps_obs.loc[(slice(None), first_ep), 'P4'].to_numpy()
-        for i, sv in enumerate(gps_sats):
-            idx_I = base_dim + 2 * i
-            idx_N1 = idx_I + 1
-
-            I_init = P4_gps[i]  # zakładamy P4 ≈ I_s * (MU2 - 1)
-
-            self.ekf.x[idx_I] = I_init
-            self.ekf.P[idx_I, idx_I] = self.cfg.p_iono
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
-
-            self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
-
-        # Inicjalizacja Galileo: I_s, N1, N2
-        P4_gal = self.gal_obs.loc[(slice(None), first_ep), 'P4'].to_numpy()
-        for j, sv in enumerate(gal_sats):
-            k = n_gps + j  # Galileo są po GPS
-            idx_I = base_dim + 2 * k
-            idx_N1 = idx_I + 1
-
-            I_init = P4_gal[j]  # analogicznie jak dla GPS
-
-            self.ekf.x[idx_I] = I_init
-            self.ekf.P[idx_I, idx_I] = self.cfg.p_iono
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
-
-            self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
-
-        return gps_sats, gal_sats, all_times
-
-
-    def _prepare_obs(self):
-        if self.gps_mode == 'L1':
-            GF1 = self.FREQ_DICT['L1']
-            gps_c1_col = [c for c in self.gps_obs.columns if c.startswith('C1')][0]
-            gps_l1_col = [c for c in self.gps_obs.columns if c.startswith('L1')][0]
-
-        if self.gal_mode == 'E1':
-            GF1 = self.FREQ_DICT['E1']
-            gal_c1_col = [c for c in self.gal_obs.columns if c.startswith('C1')][0]
-            gal_l1_col = [c for c in self.gal_obs.columns if c.startswith('L1')][0]
-
-        if self.gps_mode == 'L2':
-            GF1 = self.FREQ_DICT['L2']
-            gps_c1_col = [c for c in self.gps_obs.columns if c.startswith('C2')][0]
-            gps_l1_col = [c for c in self.gps_obs.columns if c.startswith('L2')][0]
-
-        if self.gal_mode == 'E5a':
-            GF1 = self.FREQ_DICT['E5a']
-            gal_c1_col = [c for c in self.gal_obs.columns if c.startswith('C5')][0]
-            gal_l1_col = [c for c in self.gal_obs.columns if c.startswith('L5')][0]
-        if self.gps_mode == 'L5':
-            GF1 = self.FREQ_DICT['L5']
-            gps_c1_col = [c for c in self.gps_obs.columns if c.startswith('C5')][0]
-            gps_l1_col = [c for c in self.gps_obs.columns if c.startswith('L5')][0]
-
-        if self.gal_mode == 'E5b':
-            GF1 = self.FREQ_DICT['E5b']
-            gal_c1_col = [c for c in self.gal_obs.columns if c.startswith('C7')][0]
-            gal_l1_col = [c for c in self.gal_obs.columns if c.startswith('L7')][0]
-
-
-        gps_data = (gps_c1_col, gps_l1_col)
-        gal_data = (gal_c1_col, gal_l1_col)
-        self.gps_obs = self.gps_obs.copy()
-
-        if 'pco_los_l1' not in self.gps_obs.columns.tolist():
-            self.gps_obs.loc[:, 'pco_los_l1'] = 0.0
-
-
-        if 'pco_los_l1' not in self.gal_obs.columns.tolist():
-            self.gal_obs.loc[:, 'pco_los_l1'] = 0.0
-
-
-        return gps_data, gal_data
-
-    def extract_ambiguities(self, x, P, n_sats, base_dim=5):
-        """
-        Wyciąga wektor ambiguł N1, N2 oraz ich macierz kowariancji z pełnego stanu i macierzy P.
-
-        Parameters:
-            x        -- wektor stanu EKF (1D array)
-            P        -- macierz kowariancji (2D array)
-            n_sats   -- liczba satelitów (czyli bloków [I_s, N1_s, N2_s])
-            base_dim -- liczba parametrów globalnych (default=5)
-
-        Returns:
-            N_vec    -- wektor [N1_1, N2_1, N1_2, N2_2, ..., N1_n, N2_n]
-            P_N      -- macierz kowariancji odpowiadająca N_vec
-        """
-        offsets = np.array([1, 2])
-        idxs_N = (base_dim + 2 * np.arange(n_sats)[:, None] + offsets[None, :]).ravel()
-        N_vec = x[idxs_N]
-        P_N = P[np.ix_(idxs_N, idxs_N)]
-
-        return N_vec, P_N
-
-    def code_screening(self, x, satellites, code_obs, thr=1):
-        sat_xyz = np.asarray(satellites, dtype=float)
-        ref_xyz = np.asarray(x, dtype=float)
-        dist = np.linalg.norm(sat_xyz - ref_xyz, axis=1)
-        prefit = code_obs-dist
-        median_prefit = np.median(prefit)
-        mask = (prefit >= (median_prefit - thr)) & (prefit <= (median_prefit + thr))
-        n_sat = len(prefit)
-        n_bad = np.count_nonzero(~mask)
-        if n_bad >n_sat/2:
-            mask = np.ones(n_sat,dtype=bool)
-        return mask
-
-    def run_filter(self, clk0=0.0, ref=None, flh=None, zwd0=0.0, trace_filter=False, reset_every=0):
-        old_gps_sats, old_gal_sats, all_times = self.init_filter(clk0=clk0, zwd0=zwd0)
-        gps_data, gal_data = self._prepare_obs()
-        gps_c1, gps_l1 = gps_data
-        gal_c1, gal_l1 = gal_data
-        result_rows = []
-        result_times = []
-        e, g = [], []
-        self.gps_obs = self.gps_obs.sort_values(by='sv')
-        self.gal_obs = self.gal_obs.sort_values(by='sv')
-        gps_epochs = {
-            t: df for t, df in self.gps_obs.groupby(level=1, sort=False)
-        }
-        gal_epochs = {
-            t: df for t, df in self.gal_obs.groupby(level=1, sort=False)
-        }
-        gps_osb_c1_col = f'OSB_{gps_c1}'
-        gps_osb_l1_col = f'OSB_{gps_l1}'
-        gal_osb_c1_col = f'OSB_{gal_c1}'
-        gal_osb_l1_col = f'OSB_{gal_l1}'
-        gps_has_osb_c1 = gps_osb_c1_col in self.gps_obs.columns
-        gps_has_osb_l1 = gps_osb_l1_col in self.gps_obs.columns
-        gal_has_osb_c1 = gal_osb_c1_col in self.gal_obs.columns
-        gal_has_osb_l1 = gal_osb_l1_col in self.gal_obs.columns
-        r_cache = {}
-        xyz = None
-        conv_time = None
-        T0 = all_times[0]
-        gps_arc_age = {sv: 0 for sv in old_gps_sats}
-        gal_arc_age = {sv: 0 for sv in old_gal_sats}
-        ar_cfg = PPPARSettings(
-            enabled=bool(getattr(self.cfg, "pppar_enabled", False)),
-            warmup_epochs=int(getattr(self.cfg, "pppar_warmup_epochs", 60)),
-            min_ambiguities=int(getattr(self.cfg, "pppar_min_ambiguities", 4)),
-            ratio_threshold=float(getattr(self.cfg, "pppar_ratio_threshold", 2.0)),
-            constraint_sigma_cycles=float(getattr(self.cfg, "pppar_constraint_sigma_cycles", 1e-3)),
-            constraint_sigma_floor_cycles=getattr(self.cfg, "pppar_constraint_sigma_floor_cycles", 1e-3),
-            min_lock_epochs=getattr(self.cfg, "pppar_min_lock_epochs", None),
-            min_candidate_elevation_deg=getattr(self.cfg, "pppar_min_candidate_elevation_deg", None),
-            use_float_ratio_covariance=bool(getattr(self.cfg, "pppar_use_float_ratio_covariance", True)),
-            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", False)),
-            partial_min_ambiguities=getattr(self.cfg, "pppar_partial_min_ambiguities", None),
-            wide_lane_max_frac_cycles=getattr(self.cfg, "pppar_wide_lane_max_frac_cycles", 0.25),
-        )
-        if self.system == "C" and ar_cfg.enabled:
-            import warnings
-            warnings.warn(
-                "PPP-AR is disabled for BeiDou uncombined PPP until BDS phase-bias handling is validated.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            ar_cfg = PPPARSettings(
-                enabled=False,
-                warmup_epochs=ar_cfg.warmup_epochs,
-                min_ambiguities=ar_cfg.min_ambiguities,
-                ratio_threshold=ar_cfg.ratio_threshold,
-                constraint_sigma_cycles=ar_cfg.constraint_sigma_cycles,
-            )
-        for num, t in enumerate(all_times):
-            reset_epoch = False
-            if reset_every != 0:
-                if ((num * self.interval) % reset_every == 0) and (num != 0):
-                    old_gps_sats, old_gal_sats = self.reset_filter(epoch=t)
-                    gps_arc_age = {sv: 0 for sv in old_gps_sats}
-                    gal_arc_age = {sv: 0 for sv in old_gal_sats}
-                    reset_epoch = True
-                    T0 = t
-            gps_epoch = gps_epochs.get(t)
-            gal_epoch = gal_epochs.get(t)
-            if gps_epoch is None or gal_epoch is None:
-                continue
-
-            def safe_get(df, col, length=None):
-                """Zwraca kolumnę jako numpy, a jeśli brak – wektor zer o podanej długości."""
-                if col in df.columns:
-                    return df[col].to_numpy(copy=False)
-                elif length is not None:
-                    return np.zeros(length)
-                else:
-                    return np.zeros(len(df))
-
-            # --- GPS ---
-            gps_cols = [
-                'clk', 'tro', 'ah_los',
-                'dprel', 'pco_los_l1', 'pco_los_l2',
-                f'sat_pco_los_{self.gps_mode}',
-                'phw', 'me_wet'
-            ]
-            gps_len = len(gps_epoch)
-            (gps_clk, gps_tro, gps_ah_los, gps_dprel, gps_pco1, gps_pco2,
-             sat_pco_L1, phw, mwet) = [safe_get(gps_epoch, c, gps_len) for c in gps_cols]
-
-            # --- Galileo ---
-            gal_cols = [
-                'clk', 'tro', 'ah_los',
-                'dprel', 'pco_los_l1', 'pco_los_l5',
-                f'sat_pco_los_{self.gal_mode}',
-                'phw'
-            ]
-            gal_len = len(gal_epoch)
-            (gal_clk, gal_tro, gal_ah_los, gal_dprel, gal_pco1, gal_pco2,
-             sat_pco_E1, gal_phw) = [safe_get(gal_epoch, c, gal_len) for c in gal_cols]
-
-            curr_gps_sats = gps_epoch.index.get_level_values('sv').tolist()
-            curr_gal_sats = gal_epoch.index.get_level_values('sv').tolist()
-            if (curr_gps_sats != old_gps_sats) or (curr_gal_sats != old_gal_sats):
-                # Tworzymy słowniki P4 dla nowej epoki
-                P4_gps_dict = gps_epoch['P4'].to_dict()
-                P4_gal_dict = gal_epoch['P4'].to_dict()
-
-                # Aktualizacja stanu filtra EKF
-                self.ekf.x, self.ekf.P, self.ekf.Q = self.rebuild_state(
-                    x_old=self.ekf.x,
-                    P_old=self.ekf.P,
-                    Q_old=self.ekf.Q,
-                    prev_gps=old_gps_sats,
-                    prev_gal=old_gal_sats,
-                    curr_gps=curr_gps_sats,
-                    curr_gal=curr_gal_sats,
-                    P4_gps_dict=P4_gps_dict,
-                    P4_gal_dict=P4_gal_dict
-                )
-
-                self.ekf.dim_x = len(self.ekf.x)
-                self.ekf.dim_z = 2 * len(curr_gps_sats) + 2 * len(curr_gal_sats)
-                self.ekf._I = np.eye(self.ekf.dim_x)
-                self.ekf.F = np.eye(self.ekf.dim_x)
-
-            old_gps_sats = curr_gps_sats
-            old_gal_sats = curr_gal_sats
-
-            tides = gps_epoch['tides_los'].to_numpy(copy=False)
-            gps_satellites = gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
-
-            gps_p1_c1 = osb_m(gps_epoch, gps_c1, gps_len)
-            gps_pl1_l1 = osb_m(gps_epoch, gps_l1, gps_len)
-            C1 = gps_epoch[gps_c1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p1_c1 - tides
-            L1 = gps_epoch[gps_l1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl1_l1 - tides - (
-                self.CLIGHT / self.FREQ_DICT[self.gps_mode]) * phw
-
-            gal_tides = gal_epoch['tides_los'].to_numpy(copy=False)
-            gal_satellites = gal_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
-
-            gal_p1_c1 = osb_m(gal_epoch, gal_c1, gal_len)
-            gal_pl1_l1 = osb_m(gal_epoch, gal_l1, gal_len)
-
-            EC1 = gal_epoch[gal_c1].to_numpy(copy=False) - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_p1_c1 - gal_tides
-            EL1 = gal_epoch[gal_l1].to_numpy(copy=False) - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_pl1_l1 - gal_tides - (
-                self.CLIGHT / self.FREQ_DICT[self.gal_mode]) * gal_phw
-
-            ZGPS = np.empty(2 * len(C1))
-            ZGPS[0::2] = C1
-            ZGPS[1::2] = L1
-            ZGAL = np.empty(2 * len(EC1))
-            ZGAL[0::2] = EC1
-            ZGAL[1::2] = EL1
-
-            Z = np.concatenate((ZGPS, ZGAL))
-            if not np.all(np.isfinite(Z)):
-                if trace_filter:
-                    ppp_trace(
-                        trace_filter,
-                        self.__class__.__name__,
-                        "non-finite-observation",
-                        epoch=num,
-                        time=t,
-                    )
-                continue
-            if not np.all(np.isfinite(Z)):
-                if trace_filter:
-                    ppp_trace(
-                        trace_filter,
-                        self.__class__.__name__,
-                        "non-finite-observation",
-                        epoch=num,
-                        time=t,
-                    )
-                continue
-            gps_c1_mask = self.code_screening(x=self.ekf.x[:3],code_obs=C1,thr=30,satellites=gps_satellites[:,:3])
-            gal_c1_mask = self.code_screening(x=self.ekf.x[:3], code_obs=EC1, thr=30, satellites=gal_satellites[:,:3])
-
-            # WEIGHTS GPS
-            ev_gps = np.deg2rad(gps_epoch['ev'].to_numpy(copy=False))
-            inv_sin_gps = 1.0 / np.sin(ev_gps)
-            R = np.empty(2 * len(C1))
-            R[0::2] = np.where(gps_c1_mask, inv_sin_gps, 1e12)
-            R[1::2] = 0.001 * inv_sin_gps
-
-            # WEIGHTS GAL
-            ev_gal = np.deg2rad(gal_epoch['ev'].to_numpy(copy=False))
-            inv_sin_gal = 1.0 / np.sin(ev_gal)
-            RG = np.empty(2 * len(EC1))
-            RG[0::2] = np.where(gal_c1_mask, inv_sin_gal, 1e12)
-            RG[1::2] = 0.001 * inv_sin_gal
-
-            r_diag = np.concatenate((R, RG))
-            r_diag = np.nan_to_num(r_diag, nan=1e12, posinf=1e12, neginf=1e12)
-            m = r_diag.size
-            R = r_cache.get(m)
-            if R is None:
-                R = np.zeros((m, m), dtype=np.float64)
-                r_cache[m] = R
-            else:
-                R.fill(0.0)
-            R.flat[::m + 1] = r_diag
-            self.ekf.R = R
-            updated = False
-            for k in range(5):
-                try:
-                    self.ekf.predict_update(
-                        z=Z,
-                        HJacobian=self.Hjacobian,
-                        args=(gps_satellites, gal_satellites),
-                        Hx=self.Hx,
-                        hx_args=(gps_satellites, gal_satellites),
-                    )
-                    updated = True
-                    break
-                except np.linalg.LinAlgError:
-                    jitter = 1e-6 * (10.0 ** k)
-                    self.ekf.R.flat[::m + 1] += jitter
-            if not updated:
-                if trace_filter:
-                    ppp_trace(
-                        trace_filter,
-                        self.__class__.__name__,
-                        "singular-update-reset",
-                        epoch=num,
-                        time=t,
-                    )
-                old_gps_sats, old_gal_sats = self.reset_filter(epoch=t)
-                gps_arc_age = {sv: 0 for sv in old_gps_sats}
-                gal_arc_age = {sv: 0 for sv in old_gal_sats}
-                continue
-            gps_arc_age = advance_arc_age(gps_arc_age, curr_gps_sats)
-            gal_arc_age = advance_arc_age(gal_arc_age, curr_gal_sats)
-            gps_ar_age = arc_age_array(gps_arc_age, curr_gps_sats)
-            gal_ar_age = arc_age_array(gal_arc_age, curr_gal_sats)
-            ar_diag = None
-            if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
-                groups = []
-                if curr_gps_sats:
-                    gps_idx = np.arange(len(curr_gps_sats))
-                    groups.append(
-                        {
-                            "n1_idx": self.base_dim + 2 * gps_idx + 1,
-                            "n2_idx": None,
-                            "ev": gps_epoch['ev'].to_numpy(copy=False),
-                            "age": gps_ar_age,
-                        }
-                    )
-                if curr_gal_sats:
-                    gal_idx = len(curr_gps_sats) + np.arange(len(curr_gal_sats))
-                    groups.append(
-                        {
-                            "n1_idx": self.base_dim + 2 * gal_idx + 1,
-                            "n2_idx": None,
-                            "ev": gal_epoch['ev'].to_numpy(copy=False),
-                            "age": gal_ar_age,
-                        }
-                    )
-                self.ekf.x, self.ekf.P, ar_diag = apply_indexed_uncombined_pppar(
-                    x=self.ekf.x,
-                    P=self.ekf.P,
-                    ambiguity_groups=groups,
-                    settings=ar_cfg,
-                )
-            if not reset_epoch or reset_every == 0:
-                if xyz is not None:
-                    position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
-
-                    # If convergence time is not set and position difference is small, set the convergence time
-                    if conv_time is None and position_diff < 0.005:
-                        conv_time = t - T0  # Set the convergence time
-                    elif position_diff > 0.005:  # Reset convergence time if position change exceeds threshold
-                        conv_time = None  # Reset the convergence time
-
-            xyz = self.ekf.x[:3].copy()
-            dtr = self.ekf.x[3]
-            isb = self.ekf.x[4]
-            ztd = self.ekf.x[5]
-            stec = self.ekf.x[self.base_dim:][::2]
-            n1 = self.ekf.x[self.base_dim:][1::2]
-
-            gps_stec = stec[:len(curr_gps_sats)]
-            gal_stec = stec[len(curr_gps_sats):]
-            n1_gps = n1[:len(curr_gps_sats)]
-
-            n1_gal = n1[len(curr_gps_sats):]
-
-            gps_epoch['stec'] = gps_stec
-            gps_epoch['n1'] = n1_gps
-
-
-            gal_epoch['stec'] = gal_stec
-            gal_epoch['n1'] = n1_gal
-
-            g.append(gps_epoch)
-            e.append(gal_epoch)
-            if ref is not None and flh is not None:
-                dx = ref - self.ekf.x[:3]
-                enu = np.array(ecef_to_enu(dXYZ=dx, flh=flh, degrees=True)).flatten()
-            else:
-                enu = np.zeros(3)
-            result_rows.append({
-                'de': enu[0],
-                'dn': enu[1],
-                'du': enu[2],
-                'dtr': dtr,
-                'ztd': ztd,
-                'x': xyz[0],
-                'y': xyz[1],
-                'z': xyz[2],
-                'isb': isb,
-                'ar_fixed': 0 if ar_diag is None else ar_diag.fixed_ambiguities,
-                'ar_ratio': np.nan if ar_diag is None or ar_diag.ratio_min is None else ar_diag.ratio_min,
-                'ar_ok': False if ar_diag is None else ar_diag.accepted,
-                'ar_gps_min_age': int(np.min(gps_ar_age)) if gps_ar_age.size else np.nan,
-                'ar_gal_min_age': int(np.min(gal_ar_age)) if gal_ar_age.size else np.nan,
-            })
-            result_rows[-1].update(pppar_diagnostic_columns(ar_diag))
-            result_times.append(t)
-            if trace_filter:
-                ppp_trace_epoch(
-                    trace_filter,
-                    self.__class__.__name__,
-                    epoch=num,
-                    time=t,
-                    row=result_rows[-1],
-                )
-        if conv_time is not None:
-            if trace_filter:
-                ppp_trace(
-                    trace_filter,
-                    self.__class__.__name__,
-                    "convergence",
-                    threshold_m=0.005,
-                    minutes=conv_time.total_seconds() / 60,
-                    hours=conv_time.total_seconds() / 3600,
-                )
-            ct = conv_time.total_seconds() / 3600
-        else:
-            ct = None
-        gps_result = pd.concat(g)
-        gal_result = pd.concat(e)
-        result = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time'))
-        result['ct_min']=ct
-        return result, gps_result, gal_result, ct
+    scale = _elevation_variance_scale(ev_deg)
+    return (float(getattr(cfg, "uncombined_code_var", 1.0)) * scale,
+            float(getattr(cfg, "uncombined_phase_var", 1e-4)) * scale)
+
+
+def _code_zenith_var_by_system(cfg, system: str) -> float:
+    """Zenith code variance [m^2] of ``system`` from ``uncombined_iono_code_var_by_system`` (default G 0.3, E 0.3,
+    C 1.0 m^2, ``PPPConfig.CODE_VAR_BY_SYSTEM_DEFAULT``): the code weight of every route with ionospheric constraints,
+    dual-frequency (``_constrained_obs_variances``) and single-frequency (``PPPUducSFSingleGNSS``)."""
+    by_system = getattr(cfg, "uncombined_iono_code_var_by_system", None) or PPPConfig.CODE_VAR_BY_SYSTEM_DEFAULT
+    given = by_system.get(system, PPPConfig.CODE_VAR_BY_SYSTEM_DEFAULT[system])
+    try:
+        code_zenith = float(given)
+    except (TypeError, ValueError):
+        code_zenith = float("nan")
+    if not (np.isfinite(code_zenith) and code_zenith > 0.0):
+        # assignment and set_param validate the setting; an in-place edit of the dict does not
+        raise ValueError(f"uncombined_iono_code_var_by_system[{system!r}] must be a finite variance > 0 m^2, "
+                         f"got {given!r}")
+    return code_zenith
+
+
+def _constrained_obs_variances(cfg, ev_deg: np.ndarray, system: str) -> tuple[np.ndarray, np.ndarray]:
+    """Code and phase variances [m^2] of the filters with ionospheric constraints (R7, R2) for ``system``.
+
+    Default (``uncombined_iono_legacy_weighting=False``): code
+    ``c_sys / sin(elevation)`` with ``c_sys`` from ``uncombined_iono_code_var_by_system``
+    (default G 0.3, E 0.3, C 1.0 m^2, ``PPPConfig.CODE_VAR_BY_SYSTEM_DEFAULT``), phase
+    ``uncombined_phase_var / sin(elevation)`` (1e-4 m^2).
+    ``uncombined_iono_legacy_weighting=True`` (the default before v1.0.0, kept to reproduce old results):
+    ``base + elev_coeff / sin(elevation)`` from the ``uncombined_iono_*_var_*`` settings, i.e. code
+    0.3 + 0.0025/sin(E) m^2, practically independent of the elevation (0.3025 m^2 at 90 deg, 0.3144 at
+    10 deg) and 3.3-18x stronger than the unconstrained routes' 1/sin(E). With the slant ionosphere pinned by
+    the GIM every code is direct geometry information, so low-elevation code errors and product code-datum
+    errors (COD C06 +4.9 m, a BeiDou satellite without DSB) entered the float ambiguities with zenith weight:
+    C/EC/GC/GEC COD static t_c10 157.5/130/65.5/48.5 min, G GRG kinematic t_c20 103.5 min (38.5/29/20/18
+    and 10.5 min with this weighting). One value cannot serve every system: 1.0 for all slows Galileo
+    (E GRG static 13 -> 44 min), 0.3 for all leaves BeiDou slow (C COD 58.5 min); 1.0 m^2 for BeiDou allows for
+    the elevation-dependent satellite-induced code variations of BDS-2 (Wanninger and Beer 2015).
+    """
+    if not bool(getattr(cfg, "uncombined_iono_legacy_weighting", False)):
+        scale = _elevation_variance_scale(ev_deg)
+        return (_code_zenith_var_by_system(cfg, system) * scale,
+                float(getattr(cfg, "uncombined_phase_var", 1e-4)) * scale)
+    inv_sin = _elevation_variance_scale(ev_deg)
+    code_var = (float(getattr(cfg, "uncombined_iono_code_var_base", 0.3))
+                + float(getattr(cfg, "uncombined_iono_code_var_elev_coeff", 0.0025)) * inv_sin)
+    phase_var = (float(getattr(cfg, "uncombined_iono_phase_var_base", 1e-4))
+                 + float(getattr(cfg, "uncombined_iono_phase_var_elev_coeff", 0.0003)) * inv_sin)
+    return code_var, phase_var
+
+
+def _sat_bias_ns(obs: pd.DataFrame, column: str) -> np.ndarray | None:
+    """Satellite bias column [ns] with missing values kept as NaN; None without the column or a value."""
+    if column not in obs.columns:
+        return None
+    values = obs[column].to_numpy(dtype=float)
+    return values if np.isfinite(values).any() else None
+
+
+def _sat_osb_pair_ns(obs: pd.DataFrame, code_1: str, code_2: str) -> np.ndarray | None:
+    """OSB(code_1) - OSB(code_2) [ns] when the product gives both satellite OSBs (``has_satellite_osb``), else None."""
+    if not has_satellite_osb(obs, (code_1, code_2)):
+        return None
+    return obs[f"OSB_{code_1}"].to_numpy(dtype=float) - obs[f"OSB_{code_2}"].to_numpy(dtype=float)
+
+
+def _sat_dsb_pair_ns(obs: pd.DataFrame, code_1: str, code_2: str) -> np.ndarray | None:
+    """Satellite DSB code_1 - code_2 [ns] of a DSB/DCB product (``BIAS_`` columns, direct or reversed), else None."""
+    direct = _sat_bias_ns(obs, f"BIAS_{code_1}_{code_2}")
+    reverse = _sat_bias_ns(obs, f"BIAS_{code_2}_{code_1}")
+    if direct is None:
+        return None if reverse is None else -reverse
+    if reverse is not None:
+        direct = np.where(np.isfinite(direct), direct, -reverse)
+    return direct
+
+
+def _same_signals(system: str, pair_a, pair_b) -> bool:
+    try:
+        return tuple(_code_signal(system, c) for c in pair_a) == tuple(_code_signal(system, c) for c in pair_b)
+    except ValueError:
+        return False
+
+
+def _gim_dcb_pair(cfg, system: str):
+    """Code pair the satellite DCBs of the configured IONEX file refer to (stated, else the IONEX default)."""
+    path = getattr(cfg, "gim_path", None)
+    try:
+        if path and _Path(path).is_file():
+            return _GIMReader.read_dcb_reference(path).codes(system)
+    except (OSError, ValueError):
+        pass
+    return _IONEX_DEFAULT_DCB_REFERENCE.get(system)
+
+
+#: Smallest satellite DSB difference [ns] between the bias product and the DSB the ionosphere model is consistent with
+#: that ``_align_iono_model_to_code_biases`` corrects. Two DSB estimates of the same satellite agree to about
+#: 0.3-0.5 ns (BRUX 2024-035: GRG OSB against the COD IONEX DCBs, Galileo 0.41 ns rms, max 0.85 ns): a smaller
+#: difference is the noise of the two estimates, and correcting it trades the product's DSB error for the
+#: reference's (Galileo GRG kinematic UCi RMS 0.096 -> 0.161 m with every satellite corrected, the per-satellite
+#: GIM-minus-state offsets uncorrelated with the corrections, r = -0.09). The systematic differences are larger:
+#: GPS III C1W-C2W 2.1-2.9 ns, BeiDou-2 IGSO and BeiDou-3 MEO C2I-C6I 1.6-2.7 ns (against CAS), and they explain the
+#: offsets (r = -0.89 GPS, -0.94 BeiDou; rms 0.59 -> 0.27 m, 0.93 -> 0.31 m on L1 / B1I).
+_IONO_DSB_ALIGN_MIN_NS = 1.0
+
+
+def _align_iono_model_to_code_biases(obs: pd.DataFrame, mode: str, system: str, cfg) -> tuple[pd.DataFrame, dict]:
+    """Refer the model ionosphere ``ion`` of a constrained uncombined route to the satellite code-bias datum of
+    the filter.
+
+    With per-signal code biases from a product (OSB, or a DSB applied to both codes) the slant ionosphere state of
+    a satellite on the first signal ``f1`` of the pair is ``I + beta * (D_used - D_true)``, ``beta = f2^2 / (f1^2 -
+    f2^2)``, ``D = b(code_1) - b(code_2)`` the satellite DSB: the bias product's DSB ``D_used`` differs from the
+    satellite's true DSB and the state takes the difference. A GIM gives ``I`` in the datum of the satellite DCBs
+    estimated with it. The constraint ``ion`` must be in the datum of the state, else the per-satellite
+    difference (BRUX 2024-035, GRG OSB: against the COD GIM DCBs GPS 0.68 m rms, up to 1.2 m on L1 for the GPS III
+    satellites, Galileo 0.19 m rms; BeiDou C2I-C6I against the CAS DSB 0.93 m rms, up to 1.6 m on B1I) is a
+    constant error of the pseudo-observation of that satellite, which the filter, treating it as white noise every
+    epoch, takes into the ionosphere states and, in kinematic mode, into the position. So ``ion`` gets
+    ``beta * ((D_used - D_ref) - median)`` per satellite, ``D_ref`` the DSB the model is consistent with:
+
+    1. ``ionosphere_model='gim'``: the satellite DCBs of the IONEX file (column ``bias`` [ns]) when they refer to
+       the two signals of the pair (``Reference observables`` of the file, else the IONEX default per system;
+       Galileo E5a and E5b are not taken for each other); with OSB code biases ``D_used`` is taken on the IONEX
+       codes (e.g. GPS C1W-C2W, Galileo C1X-C5X) when the product gives their OSBs, so the product's
+       inter-tracking biases carry over;
+    2. else, with OSB code biases, a DSB/DCB product of the pair in ``dcb_path`` (``BIAS_`` columns, e.g. CAS
+       DCB), for any constraint model.
+
+    ``median`` (over the satellites of the system with both values) is the datum difference of the two DSB sets, a
+    common term the receiver code-bias states take. Only a difference of at least ``_IONO_DSB_ALIGN_MIN_NS`` (1 ns)
+    from it is corrected: smaller ones are within the agreement of two DSB estimates (their noise, not a datum
+    difference); such a satellite, and one without a value, keeps ``ion`` (shift 0, i.e. the median). Without
+    code biases from a product or without a reference DSB the frame is returned unchanged; a dual-frequency
+    GIM-constrained route with product code biases and no reference warns once per run and system (add a DSB
+    product of the pair to ``dcb_path``). A single-frequency mode takes
+    :func:`_align_sf_iono_model_to_code_biases`. Returns the frame (a copy when changed) and a summary: ``source``
+    ('ionex', 'dsb' or None), ``pair``, ``reference_pair``, ``n_satellites`` corrected, ``unaligned`` (satellites
+    without a reference value), ``within_agreement`` (difference below the threshold), ``shift_m`` per corrected
+    satellite.
+    """
+    info = {"system": system, "source": None, "pair": None, "reference_pair": None, "n_satellites": 0,
+            "unaligned": (), "within_agreement": (), "shift_m": {}}
+    signals = MODE_SIGNALS.get(mode, ())
+    if obs is None or obs.empty or "ion" not in obs.columns or len(signals) not in (1, 2):
+        return obs, info
+    if len(signals) == 1:
+        return _align_sf_iono_model_to_code_biases(obs, signals[0], system, cfg, info)
+    try:
+        code_1, code_2 = (_first_prefixed_column(obs, SIGNAL_COLUMNS[s][0]) for s in signals)
+    except (IndexError, KeyError):
+        return obs, info
+    info["pair"] = (code_1, code_2)
+    used = _sat_osb_pair_ns(obs, code_1, code_2)
+    kind = "osb" if used is not None else None
+    if used is None:
+        used = _sat_dsb_pair_ns(obs, code_1, code_2)
+        kind = "dsb" if used is not None else None
+    if used is None:
+        return obs, info
+    model = getattr(cfg, "ionosphere_model", None)
+    diff = None
+    if model == "gim" and _sat_bias_ns(obs, "bias") is not None:
+        ref_pair = _gim_dcb_pair(cfg, system)
+        if ref_pair is not None and _same_signals(system, ref_pair, (code_1, code_2)):
+            ref_used = _sat_osb_pair_ns(obs, *ref_pair) if kind == "osb" else None
+            diff = (used if ref_used is None else ref_used) - obs["bias"].to_numpy(dtype=float)
+            info.update(source="ionex", reference_pair=tuple(ref_pair))
+    if diff is None and kind == "osb":
+        dsb = _sat_dsb_pair_ns(obs, code_1, code_2)
+        if dsb is not None:
+            diff = used - dsb
+            info.update(source="dsb", reference_pair=(code_1, code_2))
+    if diff is None:
+        if model == "gim" and kind == "osb":
+            # (code biases from a DSB product: the state is in that product's datum, estimated with a GIM or of
+            # its own; nothing to align it with)
+            _notes.warn_once(
+                cfg, ("ppp_iono_constraint_dsb", system, code_1, code_2),
+                f"GIM ionospheric constraint of {system} ({code_1}-{code_2}) is not referred to the satellite "
+                f"code-bias datum of the bias product: neither the IONEX DCBs nor a DSB product in dcb_path give "
+                f"the satellite DSB {code_1}-{code_2}, so the difference between the product's DSB and the DSB "
+                f"the GIM is consistent with (up to ~2 m of slant ionosphere per satellite) stays in the "
+                f"constraint; add a DSB product of the pair (e.g. CAS DCB) to dcb_path", UserWarning, stacklevel=3)
+        return obs, info
+    f1, f2 = (frequency_hz(s) for s in signals)
+    return _shift_iono_model(obs, diff, f2 ** 2 / (f1 ** 2 - f2 ** 2), info)
+
+
+def _shift_iono_model(obs: pd.DataFrame, diff: np.ndarray, factor: float, info: dict) -> tuple[pd.DataFrame, dict]:
+    """``ion`` + ``factor * ((diff - median) [ns] -> m)`` per satellite whose ``diff - median`` is at least
+    ``_IONO_DSB_ALIGN_MIN_NS``; ``diff`` = used minus reference satellite DSB [ns] per row; ``info`` updated."""
+    if "sv" in obs.index.names:
+        sv = obs.index.get_level_values("sv").astype(str)
+    elif "sv" in obs.columns:
+        sv = obs["sv"].astype(str)
+    else:
+        sv = pd.Index(["?"] * len(obs))
+    # per satellite, not per arc ('G04_0_1' -> 'G04'): the bias is the satellite's, the mean over satellites
+    prn = np.asarray(pd.Index(sv).str.split("_").str[0])
+    per_sat = pd.Series(diff, index=prn).groupby(level=0).mean()
+    have = per_sat.dropna()
+    if have.empty:
+        return obs, info
+    dev = have - float(have.median())
+    aligned = dev[dev.abs() >= _IONO_DSB_ALIGN_MIN_NS]
+    info.update(unaligned=tuple(sorted(set(per_sat.index) - set(have.index))),
+                within_agreement=tuple(sorted(set(have.index) - set(aligned.index))))
+    if aligned.empty:
+        return obs, info
+    shift = pd.Series(prn).map(aligned * (factor * _NS_TO_M)).to_numpy(dtype=float)
+    obs = obs.copy()
+    obs["ion"] = obs["ion"].to_numpy(dtype=float) + np.where(np.isfinite(shift), shift, 0.0)
+    info.update(n_satellites=int(aligned.size),
+                shift_m={k: float(factor * v * _NS_TO_M) for k, v in aligned.items()})
+    return obs, info
+
+
+def _align_sf_iono_model_to_code_biases(obs: pd.DataFrame, signal: str, system: str, cfg,
+                                        info: dict | None = None) -> tuple[pd.DataFrame, dict]:
+    """The GIM ionosphere ``ion`` of a single-frequency code observable in the satellite code-bias datum of the
+    product (the rule of :func:`_align_iono_model_to_code_biases`
+    for one signal). Used by SPP and by the single-frequency constrained PPP routes.
+
+    A GIM and its satellite DCBs ``D_GIM`` (IONEX ``PRN / BIAS / RMS``, column ``bias`` [ns]) are one consistent
+    pair: the map gives ``I + beta (D_GIM - D_true)`` on the first signal of the DCB pair, ``beta = f2^2 / (f1^2 -
+    f2^2)``. A code corrected with the product's bias (``OSB = -beta D_used`` on the first signal of an
+    IF-consistent product, ``-alpha D_used`` on the second, ``alpha = f1^2 / (f1^2 - f2^2)``) and with that map
+    keeps ``(f1 / f_s)^2 beta (D_used - D_GIM)`` on signal ``s``, whatever ``D_true``: so ``ion`` gets that term
+    per satellite (``D_used`` the product's OSB pair on the IONEX codes, else its DSB of those codes), with the
+    median and the 1-ns threshold of the dual-frequency rule. RTKLIB 2.4.2 takes the IONEX DCBs for
+    single-frequency positioning (``pntpos.c`` ``prange``: ``P1_P2`` from the IONEX file, the broadcast TGD only
+    where it gives none). BRUX 2024-035, GRG OSB and the COD GIM: the six GPS III satellites differ by 2.7-3.5 ns
+    (1.25-1.60 m on L1), every other GPS satellite by at most 0.51 ns; GPS L1 SPP rms 3D 1.444 -> 0.955 m.
+
+    Only with ``ionosphere_model='gim'``, IONEX DCBs of the system and a signal on one of the two frequencies of
+    the IONEX code pair (GPS C1W-C2W: L1, L2; Galileo C1C/C1X-C5Q/C5X: E1, E5a); otherwise (e.g. BeiDou with the
+    CODE / IGS GIMs, which carry no BeiDou DCBs; GPS L5; Galileo E5b) the frame is returned unchanged. Not warned:
+    without a reference the product's DSB is applied as given (the behaviour before v1.0.0).
+    """
+    if info is None:
+        info = {"system": system, "source": None, "pair": None, "reference_pair": None, "n_satellites": 0,
+                "unaligned": (), "within_agreement": (), "shift_m": {}}
+    if (obs is None or obs.empty or "ion" not in obs.columns or getattr(cfg, "ionosphere_model", None) != "gim"
+            or _sat_bias_ns(obs, "bias") is None):
+        return obs, info
+    ref_pair = _gim_dcb_pair(cfg, system)
+    if ref_pair is None:
+        return obs, info
+    try:
+        pair_signals = tuple(_code_signal(system, c) for c in ref_pair)
+    except ValueError:
+        return obs, info
+    if signal not in pair_signals:
+        return obs, info
+    code_1, code_2 = ref_pair
+    used = _sat_osb_pair_ns(obs, code_1, code_2)
+    if used is None:
+        used = _sat_dsb_pair_ns(obs, code_1, code_2)
+    if used is None:
+        return obs, info
+    info.update(pair=(code_1, code_2), source="ionex", reference_pair=(code_1, code_2))
+    f1, f2 = (frequency_hz(s) for s in pair_signals)
+    factor = f2 ** 2 / (f1 ** 2 - f2 ** 2) * (f1 / frequency_hz(signal)) ** 2
+    return _shift_iono_model(obs, used - obs["bias"].to_numpy(dtype=float), factor, info)
 
 
 class PPPUducSFSingleGNSS:
@@ -1065,7 +567,12 @@ class PPPUducSFSingleGNSS:
         Uses code and phase observables plus one ionosphere pseudo-observation
         per satellite. The ionosphere constraint comes from the preprocessed
         ``ion`` column and can be weighted with ``ion_rms`` through
-        ``_iono_constraint_sigma``.
+        ``_iono_constraint_sigma``. Code variance ``c_sys / sin(elevation)``
+        with ``c_sys`` from ``uncombined_iono_code_var_by_system`` (default
+        G 0.3, E 0.3, C 1.0 m^2), the setting of the dual-frequency
+        constrained routes (before, 1.0 m^2 for
+        every system, which ``{"G": 1.0, "E": 1.0, "C": 1.0}`` still gives);
+        phase variance ``0.001 / sin(elevation)`` m^2.
 
     State vector:
         ``[x, y, z, dtr, ztd?, (I, N)_s1, ..., (I, N)_sn]`` where each
@@ -1088,8 +595,15 @@ class PPPUducSFSingleGNSS:
 
     Limitations:
         The model depends strongly on the quality and datum of the external
-        ionospheric constraint. Do not compare it directly with unconstrained
-        single-frequency PPP as if they were the same observable model.
+        ionospheric constraint. With one frequency the GIM error cannot be
+        separated from the position, so by default
+        (``SF_SIGMA_IONO_END_DEFAULT``) the GIM acts as a prior on the slant
+        ionosphere of the satellites in view at the start and is practically
+        free after the first epochs; the solution then rests on the
+        ionosphere-free code/phase information, as the unconstrained route
+        (``PPPSingleFreqSingleGNSS``, GRAPHIC) does. On the validation data this
+        is better than GRAPHIC in the first 15 min in some cases (Galileo
+        especially) but not on the median, and worse after 15-60 min.
     """
 
     def __init__(
@@ -1103,12 +617,18 @@ class PPPUducSFSingleGNSS:
         interval=0.5,
         use_iono_rms=True,
         sigma_iono_0=1.1,
-        sigma_iono_end=2.3,
+        sigma_iono_end=None,
         t_end=30,
     ):
         self.cfg = config
-        self.obs = obs
         self.mode = mode
+        # the GIM prior in the satellite code-bias datum of the product (bug-fix stage 13d integration review,
+        # NQ-SPP-34; dual-frequency routes since D6): the state absorbs the product's DSB, the prior must carry it
+        self.iono_dsb_alignment = {}
+        if isinstance(obs, pd.DataFrame) and "ion" in obs.columns and len(_mode_signals(mode)) == 1:
+            system = SIGNALS[_mode_signals(mode)[0]].system
+            obs, self.iono_dsb_alignment[system] = _align_iono_model_to_code_biases(obs, mode, system, config)
+        self.obs = obs
         self.tro = tro
         self.ekf = ekf
         self.FREQ_DICT = dict(FREQ_DICT_ALL)
@@ -1118,8 +638,44 @@ class PPPUducSFSingleGNSS:
         self.interval = interval
         self.use_iono_rms = use_iono_rms
         self.sigma_iono_0 = sigma_iono_0
-        self.sigma_iono_end = sigma_iono_end
+        # None (the PPPConfig default) takes the default of this route: a GIM prior at the start, practically
+        # free after the first epochs (bug-fix stage 8b, NQ-PPP-23; see SF_SIGMA_IONO_END_DEFAULT)
+        self.sigma_iono_end = self.SF_SIGMA_IONO_END_DEFAULT if sigma_iono_end is None else sigma_iono_end
         self.t_end = t_end
+
+    #: route default of ``sigma_iono_end`` (a variance [m^2], like the whole ramp). The ramp is linear in the
+    #: variance over ``t_end`` minutes, so with 1e4 (30 s data, t_end 30 min) it is 1.1 m^2 at the first epoch,
+    #: about 170 m^2 at the second and 1000 m^2 after 3 min: in practice the GIM is a prior on the slant
+    #: ionosphere of the satellites in view at the start; satellites that rise later and new arcs get
+    #: practically no GIM information, and the solution rests on the ionosphere-free code/phase information
+    #: of the arcs (as GRAPHIC). With one frequency nothing separates the GIM error (1-3 TECU,
+    #: time-correlated and elevation-dependent, so it does not average out) from the position: with the
+    #: generic 3.0 the GIM error stayed in the solution (12 validation cases, 6 h static: median 0.17-0.27 m
+    #: final, 0.76-1.07 m after 1 h; kinematic RMS 0.56-1.05 m) against 0.08-0.11 m, 0.25-0.42 m and
+    #: 0.27-0.40 m with 1e4; 10, 30 and 100 converged later than 1e4 (BRUX L1, t_c10 184-261 against 87 min).
+    #: Against GRAPHIC: better in the first 15 min in 3-5 of the 12 cases per signal (BRUX 2024-035 E1 RMS
+    #: 0.38 against 1.23 m), worse on the median (L1/E1/B1I 1.87/1.84/1.60 against 1.33/0.92/1.36 m) and
+    #: after 1 h (0.25/0.42/0.42 against 0.19/0.15/0.17 m).
+    SF_SIGMA_IONO_END_DEFAULT = 1e4
+    #: GIM prior for every new arc (OFF by default). True: an arc that
+    #: starts after the first epoch (a rising satellite, a new arc after a slip or a gap) gets its slant
+    #: ionosphere state from the GIM ``ion`` value and the constraint ramp from its own start (``sigma_iono_0`` at
+    #: its first epoch, then the same ramp to ``sigma_iono_end`` over ``t_end``), as the arcs of the first epoch.
+    #: False (default): one ramp from the first epoch of the run, a new state starts at 0 m with ``p_iono``.
+    #: Not neutral on the validation data (SP3grg, 6 h, float; off -> on, median of 12 static cases BRUX/NKLG/NYA2
+    #: x 2024-035/132 x 00/12 h, L1 / E1 / B1I): RMS 0-15 min 1.52 -> 1.32 / 1.84 -> 1.84 / 1.60 -> 1.48 m, after
+    #: 1 h 0.248 -> 0.269 / 0.422 -> 0.341 / 0.414 -> 0.420 m, final 0.090 -> 0.083 / 0.105 -> 0.100 / 0.071 ->
+    #: 0.068 m, but the worst final 0.266 -> 0.203 / 0.129 -> 0.182 / 0.201 -> 0.254 m: final better in 17 of the
+    #: 24 BRUX/NKLG cases, worse in all 12 NYA2 cases (polar GIM; e.g. 2024-035 00 h L1 0.154 -> 0.195 m);
+    #: kinematic 2024-035 RMS from 60 min, median of 3 stations 0.270 -> 0.364 / 0.329 -> 0.384 / 0.395 ->
+    #: 0.264 m. Kept off (on only if it helps or is neutral).
+    SF_GIM_PRIOR_NEW_ARCS = False
+    #: columns the filter adds to the observation rows in its residual frame (before v1.0.0
+    #: the route returned its input observations instead of residuals)
+    RESIDUAL_COLUMNS = (
+        "system", "dtr", "ztd", "prefit_code_res", "prefit_phase_res", "prefit_iono_res", "postfit_code_res",
+        "postfit_phase_res", "postfit_iono_res", "code_used", "I_state", "N_state",
+    )
 
     def _obs_mode_columns(self):
         signals = _mode_signals(self.mode)
@@ -1215,8 +771,9 @@ class PPPUducSFSingleGNSS:
             idx_i = base + 2 * j
             idx_n = idx_i + 1
             P_new[idx_i, idx_i] = self.cfg.p_iono
-            Q_new[idx_i, idx_i] = self.cfg.q_iono * (self.interval * 60) / 3600
+            Q_new[idx_i, idx_i] = random_walk_variance(self.cfg.q_iono, self.interval)
             P_new[idx_n, idx_n] = self.cfg.p_amb
+            Q_new[idx_n, idx_n] = random_walk_variance(self.cfg.q_amb, self.interval)  # PPP-064
         return x_new, P_new, Q_new
 
     def _init_filter_common(self, epoch, clk0=0.0, zwd0=0.0):
@@ -1238,7 +795,8 @@ class PPPUducSFSingleGNSS:
         self.ekf.Q[3, 3] = self.cfg.q_dt
         if self.tro:
             self.ekf.P[4, 4] = self.cfg.p_tro
-            self.ekf.Q[4, 4] = self.cfg.q_tro
+            self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_tro, self.interval)
+        _init_coordinate_states(self.ekf, self.cfg)
         self.ekf.F = np.eye(dim_x)
         self.ekf.F[3, 3] = 0.0
         if 'ion' in self.obs.columns:
@@ -1252,8 +810,9 @@ class PPPUducSFSingleGNSS:
             idx_n = idx_i + 1
             self.ekf.x[idx_i] = ion_init[k]
             self.ekf.P[idx_i, idx_i] = self.cfg.p_iono
-            self.ekf.Q[idx_i, idx_i] = self.cfg.q_iono * (self.interval * 60) / 3600
+            self.ekf.Q[idx_i, idx_i] = random_walk_variance(self.cfg.q_iono, self.interval)
             self.ekf.P[idx_n, idx_n] = self.cfg.p_amb
+            self.ekf.Q[idx_n, idx_n] = random_walk_variance(self.cfg.q_amb, self.interval)  # PPP-064
         return sats
 
     def init_filter(self, clk0=0.0, zwd0=0.0):
@@ -1294,6 +853,9 @@ class PPPUducSFSingleGNSS:
         c_col, l_col, pco_col = self._prepare_obs()
         result_rows = []
         result_times = []
+        residual_rows = []
+        system = SIGNALS[_mode_signals(self.mode)[0]].system
+        code_zenith = _code_zenith_var_by_system(self.cfg, system)       # NQ-PPP-47 [m^2 at zenith]
         self.obs = self.obs.sort_values(by='sv')
         obs_epochs = {t: df for t, df in self.obs.groupby(level=1, sort=False)}
         osb_c_col = f'OSB_{c_col}'
@@ -1302,9 +864,13 @@ class PPPUducSFSingleGNSS:
         has_osb_l = osb_l_col in self.obs.columns
         r_cache = {}
         xyz = None
+        conv_xyz = None  # previous float position (convergence check)
         conv_time = None
         T0 = all_epochs[0]
-        arc_age = {sv: 0 for sv in old_sats}
+        arc_age: dict = {}  # PPP-069: the first advance_arc_age gives 0
+        # GIM prior for every new arc (SF_GIM_PRIOR_NEW_ARCS): epoch number at which each ionosphere state started
+        gim_new_arcs = bool(self.SF_GIM_PRIOR_NEW_ARCS)
+        arc_start = {sv: 0 for sv in old_sats}
         ar_cfg = PPPARSettings(
             enabled=bool(getattr(self.cfg, "pppar_enabled", False)),
             warmup_epochs=int(getattr(self.cfg, "pppar_warmup_epochs", 60)),
@@ -1315,22 +881,34 @@ class PPPUducSFSingleGNSS:
             min_lock_epochs=getattr(self.cfg, "pppar_min_lock_epochs", None),
             min_candidate_elevation_deg=getattr(self.cfg, "pppar_min_candidate_elevation_deg", None),
             use_float_ratio_covariance=bool(getattr(self.cfg, "pppar_use_float_ratio_covariance", True)),
-            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", False)),
+            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", True)),
             partial_min_ambiguities=getattr(self.cfg, "pppar_partial_min_ambiguities", None),
             wide_lane_max_frac_cycles=getattr(self.cfg, "pppar_wide_lane_max_frac_cycles", 0.25),
+            hold=bool(getattr(self.cfg, "pppar_fix_and_hold", False)),
         )
+        ar_float_state = None
         for num, t in enumerate(all_epochs):
+            # the previous epoch was reported fixed; without fix-and-hold the filter continues float
+            restore_float_state(self.ekf, ar_float_state)
+            ar_float_state = None
             reset_epoch = False
             if reset_every != 0:
                 if ((num * self.interval) % reset_every == 0) and (num != 0):
                     old_sats = self.reset_filter(epoch=t, clk0=clk0, zwd0=zwd0)
-                    arc_age = {sv: 0 for sv in old_sats}
+                    arc_age = {}  # PPP-069: every arc restarts at age 0
+                    # the reset re-initialises every ionosphere state from the GIM: each ramp starts again
+                    arc_start = {sv: num for sv in old_sats}
                     reset_epoch = True
                     T0 = t
             epoch = obs_epochs.get(t)
             if epoch is None:
                 continue
             curr_sats = epoch.index.get_level_values('sv').tolist()
+            fresh = []
+            if gim_new_arcs and curr_sats != old_sats:
+                prev = set(old_sats)
+                fresh = [j for j, sv in enumerate(curr_sats) if sv not in prev]
+                arc_start = {sv: (arc_start.get(sv, num) if sv in prev else num) for sv in curr_sats}
             if curr_sats != old_sats:
                 self.ekf.x, self.ekf.P, self.ekf.Q = self.rebuild_state(
                     self.ekf.x.copy(),
@@ -1374,6 +952,11 @@ class PPPUducSFSingleGNSS:
                 I_obs = epoch['P4'].to_numpy(copy=False)
             else:
                 I_obs = np.zeros(len(epoch), dtype=float)
+            if fresh:
+                # new arcs start from the GIM slant ionosphere, as the arcs of the first epoch (_init_filter_common)
+                j = np.asarray(fresh, dtype=int)
+                ok = np.isfinite(I_obs[j])
+                self.ekf.x[self.base_dim + 2 * j[ok]] = I_obs[j[ok]]
             Z = np.empty(3 * len(C1))
             Z[0::3] = C1
             Z[1::3] = L1
@@ -1391,20 +974,25 @@ class PPPUducSFSingleGNSS:
             )
             inv_sin = 1.0 / np.sin(ev)
             r_diag = np.empty(3 * len(C1))
-            r_diag[0::3] = np.where(code_mask, inv_sin, 1e12)
+            # NQ-SPP-33 (author decision 2026-10-15): BDS-3 codes not moved to the clock datum are down-weighted
+            extra = unmoved_code_variance_m2(self.cfg, system, epoch, uncombined=True)
+            # NQ-PPP-47 (bug-fix stage 13d): code c_sys / sin(E) of uncombined_iono_code_var_by_system, as on the
+            # dual-frequency constrained routes; the down-weighting term of NQ-SPP-33 comes on top
+            r_diag[0::3] = np.where(code_mask, code_zenith * inv_sin + extra, 1e12)
             r_diag[1::3] = 0.001 * inv_sin
-            if self.use_iono_rms and ('ion_rms' in epoch.columns):
-                ion_sigma = epoch['ion_rms'].to_numpy(copy=False)
-                ion_sigma = np.where(np.isfinite(ion_sigma), ion_sigma, self.sigma_iono_end)
-                ion_sigma = np.clip(ion_sigma, 1e-6, 1e6)
-            else:
-                frac = min(num, self.t_end) / max(self.t_end, 1)
-                ion_sigma = np.full(
-                    len(C1),
-                    self.sigma_iono_0 + (self.sigma_iono_end - self.sigma_iono_0) * frac,
-                    dtype=float,
-                )
-            r_diag[2::3] = ion_sigma
+            # constraint ramp over t_end minutes, scaled by ion_rms when used: as the dual-frequency filters;
+            # with SF_GIM_PRIOR_NEW_ARCS one ramp per arc from its own start
+            ramp_num = (np.fromiter((num - arc_start[sv] for sv in curr_sats), dtype=float, count=len(curr_sats))
+                        if gim_new_arcs else num)
+            r_diag[2::3] = _iono_constraint_sigma(
+                epoch,
+                ramp_num,
+                self.interval,
+                self.use_iono_rms,
+                self.sigma_iono_0,
+                self.sigma_iono_end,
+                self.t_end,
+            )
             r_diag = np.nan_to_num(r_diag, nan=1e12, posinf=1e12, neginf=1e12)
             m = r_diag.size
             R = r_cache.get(m)
@@ -1415,17 +1003,31 @@ class PPPUducSFSingleGNSS:
                 R.fill(0.0)
             R.flat[::m + 1] = r_diag
             self.ekf.R = R
-            self.ekf.predict_update(
-                z=Z,
-                HJacobian=self.Hjacobian,
-                args=(satellites,),
-                Hx=self.Hx,
-                hx_args=(satellites,),
-            )
+            # prefit residuals against the previous epoch's state (before the prediction and the clock prior, so the
+            # code rows carry the previous epoch's receiver clock), the convention of the other uncombined routes
+            # (generic R1/R2, R7); the IF, GRAPHIC and R4c routes report the innovation ekf.y instead
+            prefit = Z - self.Hx(self.ekf.x, satellites)
+            # receiver clock prior from the code rows (RTKLIB udclk_ppp; bug-fix stage 13b, A1(b))
+            self.ekf.state_priors = clock_priors(self.cfg.clock_prior_sigma_m, np.arange(0, m, 3))
+            with epoch_process_noise(self.ekf, t, self.interval):
+                self.ekf.predict_update(
+                    z=Z,
+                    HJacobian=self.Hjacobian,
+                    args=(satellites,),
+                    Hx=self.Hx,
+                    hx_args=(satellites,),
+                )
+            postfit = Z - self.Hx(self.ekf.x, satellites)
             arc_age = advance_arc_age(arc_age, curr_sats)
             ar_age = arc_age_array(arc_age, curr_sats)
             ar_diag = None
             if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
+                n_sv = len(curr_sats)
+                # float phase residuals and weights (rows 3i+1 carry N of satellite i; contract C3, NQ-PPP-20)
+                ar_inputs = ar_phase_kwargs(postfit, np.diag(self.ekf.R),
+                                            3 * np.arange(n_sv) + 1, self.base_dim + 2 * np.arange(n_sv) + 1,
+                                            ekf=self.ekf)
+                ar_float_state = keep_float_state(self.ekf, ar_cfg)
                 self.ekf.x, self.ekf.P, ar_diag = apply_indexed_uncombined_pppar(
                     x=self.ekf.x,
                     P=self.ekf.P,
@@ -1437,18 +1039,21 @@ class PPPUducSFSingleGNSS:
                             if 'ev' in epoch.columns
                             else np.full(len(curr_sats), 45.0, dtype=float),
                             "age": ar_age,
+                            "eligible": ar_eligible_mask(epoch),
                         }
                     ],
                     settings=ar_cfg,
+                    **ar_inputs,
                 )
             if not reset_epoch or reset_every == 0:
                 if xyz is not None:
-                    position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
+                    position_diff = np.linalg.norm(float_position(self.ekf, ar_float_state) - conv_xyz)
                     if conv_time is None and position_diff < 0.005:
                         conv_time = t - T0
                     elif position_diff > 0.005:
                         conv_time = None
             xyz = self.ekf.x[:3].copy()
+            conv_xyz = float_position(self.ekf, ar_float_state)
             dtr = self.ekf.x[3]
             ztd = self.ekf.x[4] if self.tro else 0.0
             if ref is not None and flh is not None:
@@ -1472,6 +1077,19 @@ class PPPUducSFSingleGNSS:
             })
             result_rows[-1].update(pppar_diagnostic_columns(ar_diag))
             result_times.append(t)
+            epoch_out = epoch.copy()
+            epoch_out['system'] = system
+            epoch_out['dtr'] = dtr
+            epoch_out['ztd'] = ztd
+            for name, values in (('prefit', prefit), ('postfit', postfit)):
+                epoch_out[f'{name}_code_res'] = values[0::3]
+                epoch_out[f'{name}_phase_res'] = values[1::3]
+                epoch_out[f'{name}_iono_res'] = values[2::3]
+            epoch_out['code_used'] = np.asarray(code_mask, dtype=bool)
+            state_block = self.ekf.x[self.base_dim:self.base_dim + 2 * len(curr_sats)].reshape(-1, 2)
+            epoch_out['I_state'] = state_block[:, 0]
+            epoch_out['N_state'] = state_block[:, 1]
+            residual_rows.append(epoch_out)
             if trace_filter:
                 ppp_trace_epoch(
                     trace_filter,
@@ -1480,22 +1098,21 @@ class PPPUducSFSingleGNSS:
                     time=t,
                     row=result_rows[-1],
                 )
-        if conv_time is not None:
-            if trace_filter:
-                ppp_trace(
-                    trace_filter,
-                    self.__class__.__name__,
-                    "convergence",
-                    threshold_m=0.005,
-                    minutes=conv_time.total_seconds() / 60,
-                    hours=conv_time.total_seconds() / 3600,
-                )
-            ct = conv_time.total_seconds() / 3600
-        else:
-            ct = None
-        result = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time'))
-        result['ct_min'] = ct
-        return result, self.obs, None, ct
+        if conv_time is not None and trace_filter:
+            ppp_trace(
+                trace_filter,
+                self.__class__.__name__,
+                "convergence",
+                threshold_m=0.005,
+                minutes=conv_time.total_seconds() / 60,
+                hours=conv_time.total_seconds() / 3600,
+            )
+        # contracts C1 / C2 (bug-fix stage 13b): {system: residual frame} (the route returned its input
+        # observations), ct_min [min]
+        result = finish_solution(pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time')),
+                                 conv_time)
+        residuals = residual_frames({system: residual_rows}, {system: self.obs}, self.RESIDUAL_COLUMNS)
+        return result, residuals, None, convergence_hours(conv_time)
 
 
 class PPPUdGenericMixedGNSS:
@@ -1549,6 +1166,14 @@ class PPPUdGenericMixedGNSS:
     SYSTEM_ORDER = ("G", "E", "C")
     BDS_CODE_VAR_SCALE_MIXED_NOCONSTR = 12.0
     BDS_PHASE_VAR_SCALE_MIXED_NOCONSTR = 144.0
+    #: columns of a residual frame without rows; a dual-frequency system's frames also carry the
+    #: per-band columns of _system_residual_output for bands 1 and 2
+    RESIDUAL_COLUMNS = (
+        "system", "reference_system", "system_isb", "dtr", "ztd",
+        "prefit_code_res_1", "prefit_phase_res_1", "postfit_code_res_1", "postfit_phase_res_1", "code_used_1",
+        "phase_used_1", "code_dcb_corr_1", "signal_bias_1", "phase_used", "strict_phase_code_gate", "dcb_total_m",
+        "I_state", "N1_state",
+    )
 
     def __init__(
         self,
@@ -1594,7 +1219,8 @@ class PPPUdGenericMixedGNSS:
         # one residual code-datum state per system/frequency pair in mixed float
         # PPP to absorb remaining inter-system observable datum mismatches.
         self.estimate_signal_bias = (not self.use_iono_constr) if estimate_signal_bias is None else bool(estimate_signal_bias)
-        self.signal_bias_q = 0.0 if self.estimate_signal_bias else float(getattr(self.cfg, "q_dcb", 0.0))
+        self.signal_bias_q = 0.0 if self.estimate_signal_bias else random_walk_variance(
+            getattr(self.cfg, "q_dcb", 0.0), interval)
         self.signal_bias_start_band = int(signal_bias_start_band)
         self.anchor_first_signal_bias = False
         self.bias_state_cols: dict[str, dict[int, int]] = {}
@@ -1626,11 +1252,18 @@ class PPPUdGenericMixedGNSS:
             and ("C" in self.systems)
             and (len(self.systems) > 1)
         )
-        self.enable_phase_jump_resets = False
+        # phase-jump screening of the no-constraint settings (off by default, as R7 without constraints)
+        self.enable_phase_jump_resets = bool(getattr(self.cfg, "uncombined_phase_screen", False))
+        self.phase_jump_warmup_epochs = int(getattr(self.cfg, "uncombined_phase_screen_warmup_epochs", 60))
         if self.use_iono_constr:
+            self.iono_dsb_alignment = {}
             for system, obs in self.obs_by_system.items():
                 if "ion" not in obs.columns:
                     raise ValueError("use_iono_constr requires an 'ion' column in all mixed observations.")
+                # the GIM in the satellite code-bias datum (bug-fix stage 13d), before the rows without a model value
+                # go: the satellite set of the DSB datum (median) is that of the observations
+                obs, self.iono_dsb_alignment[system] = _align_iono_model_to_code_biases(
+                    obs, self.mode_by_system[system], system, self.cfg)
                 self.obs_by_system[system] = obs.dropna(subset=["ion"])
                 if self.use_iono_rms and "ion_rms" in obs.columns:
                     self.obs_by_system[system] = self.obs_by_system[system].dropna(subset=["ion_rms"])
@@ -1940,10 +1573,10 @@ class PPPUdGenericMixedGNSS:
         for band_idx in range(len(layout)):
             phase_mask_matrix[:, band_idx] = phase_mask_matrix[:, band_idx] & ~both_code_rejected
 
-        inv_sin = _elevation_variance_scale(ev_deg)
+        code_var, phase_var = _uncombined_obs_variances(self.cfg, ev_deg)
         for band_idx in range(len(layout)):
-            r_diag[:, 2 * band_idx] = np.where(code_mask_matrix[:, band_idx], inv_sin, 1e12)
-            r_diag[:, 2 * band_idx + 1] = np.where(phase_mask_matrix[:, band_idx], 0.001 * inv_sin, 1e12)
+            r_diag[:, 2 * band_idx] = np.where(code_mask_matrix[:, band_idx], code_var, 1e12)
+            r_diag[:, 2 * band_idx + 1] = np.where(phase_mask_matrix[:, band_idx], phase_var, 1e12)
 
         if self.use_iono_constr:
             block[:, -1] = epoch["ion"].to_numpy(copy=False)
@@ -1960,6 +1593,11 @@ class PPPUdGenericMixedGNSS:
         if self.conservative_bds_weighting and system == "C":
             r_diag[:, 0::2] *= self.BDS_CODE_VAR_SCALE_MIXED_NOCONSTR
             r_diag[:, 1::2] *= self.BDS_PHASE_VAR_SCALE_MIXED_NOCONSTR
+        # NQ-SPP-33 (author decision 2026-10-15): BDS-3 codes not moved to the clock datum are down-weighted by the
+        # size of the missing term, added after the BeiDou noise scale (it is an error size, not a noise level)
+        extra = unmoved_code_variance_m2(self.cfg, system, epoch, uncombined=True)
+        for band_idx in range(len(layout)):
+            r_diag[:, 2 * band_idx] += np.where(code_mask_matrix[:, band_idx], extra, 0.0)
 
         return block.reshape(-1), r_diag.reshape(-1), {
             "code_masks": code_mask_matrix,
@@ -2053,16 +1691,16 @@ class PPPUdGenericMixedGNSS:
         self.ekf._I = np.eye(dim_x)
         self.ekf.x = x0.copy()
         self.ekf.P = np.eye(dim_x) * 1e2
-        self.ekf.P[:3, :3] = np.eye(3) * self.cfg.p_crd
         self.ekf.P[3, 3] = self.cfg.p_dt
         self.ekf.Q = np.zeros_like(self.ekf.P)
         self.ekf.Q[3, 3] = self.cfg.q_dt
+        _init_coordinate_states(self.ekf, self.cfg)
         for system, col in self.isb_cols.items():
             self.ekf.P[col, col] = self.cfg.p_isb
-            self.ekf.Q[col, col] = self.cfg.q_isb
+            self.ekf.Q[col, col] = random_walk_variance(self.cfg.q_isb, self.interval)
         if self.tro:
             self.ekf.P[self.col_ztd, self.col_ztd] = self.cfg.p_tro
-            self.ekf.Q[self.col_ztd, self.col_ztd] = self.cfg.q_tro
+            self.ekf.Q[self.col_ztd, self.col_ztd] = random_walk_variance(self.cfg.q_tro, self.interval)
         for band_cols in self.bias_state_cols.values():
             for band_idx, col in band_cols.items():
                 if self.anchor_first_signal_bias and band_idx == 0:
@@ -2093,10 +1731,11 @@ class PPPUdGenericMixedGNSS:
             idx_i = start + state_dim * i
             self.ekf.x[idx_i] = ion_values[i]
             self.ekf.P[idx_i, idx_i] = self.cfg.p_iono
-            self.ekf.Q[idx_i, idx_i] = self.cfg.q_iono * (self.interval * 60) / 3600
+            self.ekf.Q[idx_i, idx_i] = random_walk_variance(self.cfg.q_iono, self.interval)
             for amb in range(1, state_dim):
                 self.ekf.P[idx_i + amb, idx_i + amb] = self.cfg.p_amb
-                self.ekf.Q[idx_i + amb, idx_i + amb] = getattr(self.cfg, "q_amb", 0.0)
+                self.ekf.Q[idx_i + amb, idx_i + amb] = random_walk_variance(getattr(self.cfg, "q_amb", 0.0),
+                                                                            self.interval)
 
     def init_filter(self, clk0=0.0, zwd0=0.0):
         self.layouts = self._prepare_obs()
@@ -2122,35 +1761,31 @@ class PPPUdGenericMixedGNSS:
         x_new = np.zeros(new_dim)
         P_new = np.zeros((new_dim, new_dim))
         Q_new = np.zeros((new_dim, new_dim))
-        x_new[:self.base_dim] = x_old[:self.base_dim]
-        P_new[:self.base_dim, :self.base_dim] = P_old[:self.base_dim, :self.base_dim]
-        Q_new[:self.base_dim, :self.base_dim] = Q_old[:self.base_dim, :self.base_dim]
 
+        # Receiver states (incl. signal-bias states) plus every retained satellite,
+        # carried over together so the satellite-satellite covariances survive.
+        keep_old = [np.arange(self.base_dim)]
+        keep_new = [np.arange(self.base_dim)]
         for tag, (new_start, new_dim_state) in new_specs.items():
             if tag in old_specs:
                 old_start, old_dim_state = old_specs[tag]
                 common_dim = min(old_dim_state, new_dim_state)
-                old_idx = np.arange(old_start, old_start + common_dim)
-                new_idx = np.arange(new_start, new_start + common_dim)
-                x_new[new_idx] = x_old[old_idx]
-                P_new[np.ix_(new_idx, new_idx)] = P_old[np.ix_(old_idx, old_idx)]
-                Q_new[np.ix_(new_idx, new_idx)] = Q_old[np.ix_(old_idx, old_idx)]
-                base_idx = np.arange(self.base_dim)
-                P_new[np.ix_(new_idx, base_idx)] = P_old[np.ix_(old_idx, base_idx)]
-                P_new[np.ix_(base_idx, new_idx)] = P_old[np.ix_(base_idx, old_idx)]
-                Q_new[np.ix_(new_idx, base_idx)] = Q_old[np.ix_(old_idx, base_idx)]
-                Q_new[np.ix_(base_idx, new_idx)] = Q_old[np.ix_(base_idx, old_idx)]
+                keep_old.append(np.arange(old_start, old_start + common_dim))
+                keep_new.append(np.arange(new_start, new_start + common_dim))
                 continue
 
             system, sv = tag.split(":", 1)
             sat_idx = curr_sats[system].index(sv)
             x_new[new_start] = ion_by_system[system][sat_idx]
             P_new[new_start, new_start] = self.cfg.p_iono
-            Q_new[new_start, new_start] = self.cfg.q_iono * (self.interval * 60) / 3600
+            Q_new[new_start, new_start] = random_walk_variance(self.cfg.q_iono, self.interval)
             for amb in range(1, new_dim_state):
                 P_new[new_start + amb, new_start + amb] = self.cfg.p_amb
-                Q_new[new_start + amb, new_start + amb] = getattr(self.cfg, "q_amb", 0.0)
+                Q_new[new_start + amb, new_start + amb] = random_walk_variance(getattr(self.cfg, "q_amb", 0.0),
+                                                                               self.interval)
 
+        _carry_over_states(x_old, P_old, Q_old, x_new, P_new, Q_new,
+                           np.concatenate(keep_old), np.concatenate(keep_new))
         return x_new, P_new, Q_new
 
     def code_screening(self, x, satellites, code_obs, thr=1):
@@ -2165,6 +1800,41 @@ class PPPUdGenericMixedGNSS:
         if n_bad > n_sat / 2:
             mask = np.ones(n_sat, dtype=bool)
         return mask
+
+    def _phase_rows(self, sats_by_system):
+        """Phase rows of the epoch and the ambiguity state each carries (the AR phase residuals)."""
+        rows, amb = [], []
+        for system in self.systems:
+            n_sats = len(sats_by_system.get(system, []))
+            if not n_sats:
+                continue
+            n_bands = len(_mode_signals(self.mode_by_system[system]))
+            sat = np.arange(n_sats)[:, None]
+            band = np.arange(n_bands)[None, :]
+            rows.append((self._system_obs_start(sats_by_system, system) + self._obs_dim(system) * sat
+                         + 2 * band + 1).ravel())
+            amb.append((self._system_state_start(sats_by_system, system) + self._state_dim(system) * sat
+                        + 1 + band).ravel())
+        if not rows:
+            return np.zeros(0, dtype=int), np.zeros(0, dtype=int)
+        return np.concatenate(rows), np.concatenate(amb)
+
+    def _clock_prior_rows(self, sats_by_system):
+        """Code rows of the epoch (every system and band) and {ISB state index: code rows of its system}."""
+        code_rows, isb_rows = [], {}
+        for system in self.systems:
+            n_sats = len(sats_by_system.get(system, []))
+            if not n_sats:
+                continue
+            obs_dim = self._obs_dim(system)
+            start = self._system_obs_start(sats_by_system, system)
+            n_bands = len(_mode_signals(self.mode_by_system[system]))
+            rows = (start + obs_dim * np.arange(n_sats)[:, None] + 2 * np.arange(n_bands)[None, :]).ravel()
+            code_rows.append(rows)
+            if system in self.isb_cols:
+                isb_rows[self.isb_cols[system]] = rows
+        rows = np.concatenate(code_rows) if code_rows else np.zeros(0, dtype=int)
+        return rows, isb_rows
 
     def _system_state_values(self, system, sats_by_system):
         n_sats = len(sats_by_system[system])
@@ -2186,9 +1856,11 @@ class PPPUdGenericMixedGNSS:
             n1_idx = state_start + state_dim * sat_idx + 1
             n2_idx = state_start + state_dim * sat_idx + 2 if state_dim > 2 else None
             group = {
+                "system": system,
                 "n1_idx": n1_idx,
                 "n2_idx": n2_idx,
                 "ev": epoch_by_system[system]["ev"].to_numpy(copy=False),
+                "eligible": ar_eligible_mask(epoch_by_system[system]),
             }
             if age_by_system is not None:
                 group["age"] = arc_age_array(age_by_system.get(system, {}), sats_by_system[system])
@@ -2244,10 +1916,11 @@ class PPPUdGenericMixedGNSS:
         residuals = {system: [] for system in self.systems}
         r_cache = {}
         xyz = None
+        conv_xyz = None  # previous float position (convergence check)
         conv_time = None
         T0 = all_times[0]
         age_by_system = {
-            system: {sv: 0 for sv in old_sats_by_system[system]}
+            system: {}
             for system in self.systems
         }
         phase_traces = {
@@ -2264,17 +1937,22 @@ class PPPUdGenericMixedGNSS:
             min_lock_epochs=getattr(self.cfg, "pppar_min_lock_epochs", None),
             min_candidate_elevation_deg=getattr(self.cfg, "pppar_min_candidate_elevation_deg", None),
             use_float_ratio_covariance=bool(getattr(self.cfg, "pppar_use_float_ratio_covariance", True)),
-            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", False)),
+            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", True)),
             partial_min_ambiguities=getattr(self.cfg, "pppar_partial_min_ambiguities", None),
             wide_lane_max_frac_cycles=getattr(self.cfg, "pppar_wide_lane_max_frac_cycles", 0.25),
+            hold=bool(getattr(self.cfg, "pppar_fix_and_hold", False)),
         )
 
+        ar_float_state = None
         for num, t in enumerate(all_times):
+            # the previous epoch was reported fixed; without fix-and-hold the filter continues float
+            restore_float_state(self.ekf, ar_float_state)
+            ar_float_state = None
             reset_epoch = False
             if reset_every != 0 and ((num * self.interval) % reset_every == 0) and (num != 0):
                 old_sats_by_system = self.reset_filter(epoch=t, clk0=clk0, zwd0=zwd0)
                 age_by_system = {
-                    system: {sv: 0 for sv in old_sats_by_system[system]}
+                    system: {}
                     for system in self.systems
                 }
                 reset_epoch = True
@@ -2383,7 +2061,7 @@ class PPPUdGenericMixedGNSS:
                                 residual_source,
                             )
                         }
-                        if num < 60:
+                        if num < self.phase_jump_warmup_epochs:
                             continue
                         for idx in phase_residuals_outliers(
                             curr_sats_by_system[system],
@@ -2413,19 +2091,24 @@ class PPPUdGenericMixedGNSS:
 
             m = set_measurement_noise(r_diag)
             updated = False
-            for k in range(5):
-                try:
-                    self.ekf.predict_update(
-                        z=Z,
-                        HJacobian=self.Hjacobian,
-                        args=tuple(satellite_blocks),
-                        Hx=self.Hx,
-                        hx_args=tuple(satellite_blocks),
-                    )
-                    updated = True
-                    break
-                except np.linalg.LinAlgError:
-                    self.ekf.R.flat[::m + 1] += 1e-6 * (10.0 ** k)
+            prior_rows, isb_rows = self._clock_prior_rows(curr_sats_by_system)
+            with epoch_process_noise(self.ekf, t, self.interval):
+                for k in range(5):
+                    try:
+                        # receiver clock and ISB priors (RTKLIB udclk_ppp; bug-fix stage 13b, A1(b)), set again for
+                        # every attempt (the call consumes them)
+                        self.ekf.state_priors = clock_priors(self.cfg.clock_prior_sigma_m, prior_rows, isb_rows)
+                        self.ekf.predict_update(
+                            z=Z,
+                            HJacobian=self.Hjacobian,
+                            args=tuple(satellite_blocks),
+                            Hx=self.Hx,
+                            hx_args=tuple(satellite_blocks),
+                        )
+                        updated = True
+                        break
+                    except np.linalg.LinAlgError:
+                        self.ekf.R.flat[::m + 1] += 1e-6 * (10.0 ** k)
             if not updated:
                 if trace_filter:
                     ppp_trace(
@@ -2437,7 +2120,7 @@ class PPPUdGenericMixedGNSS:
                     )
                 old_sats_by_system = self.reset_filter(epoch=t, clk0=clk0, zwd0=zwd0)
                 age_by_system = {
-                    system: {sv: 0 for sv in old_sats_by_system[system]}
+                    system: {}
                     for system in self.systems
                 }
                 continue
@@ -2451,23 +2134,28 @@ class PPPUdGenericMixedGNSS:
 
             ar_diag = None
             if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
+                ar_inputs = ar_phase_kwargs(Z - self.Hx(self.ekf.x, *satellite_blocks),
+                                            np.diag(self.ekf.R), *self._phase_rows(curr_sats_by_system), ekf=self.ekf)
+                ar_float_state = keep_float_state(self.ekf, ar_cfg)
                 self.ekf.x, self.ekf.P, ar_diag = apply_indexed_uncombined_pppar(
                     x=self.ekf.x,
                     P=self.ekf.P,
                     ambiguity_groups=self._ambiguity_groups(curr_sats_by_system, epoch_by_system, age_by_system),
                     settings=ar_cfg,
+                    **ar_inputs,
                 )
 
             postfit = Z - self.Hx(self.ekf.x, *satellite_blocks)
             if not reset_epoch or reset_every == 0:
                 if xyz is not None:
-                    position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
+                    position_diff = np.linalg.norm(float_position(self.ekf, ar_float_state) - conv_xyz)
                     if conv_time is None and position_diff < 0.005:
                         conv_time = t - T0
                     elif position_diff > 0.005:
                         conv_time = None
 
             xyz = self.ekf.x[:3].copy()
+            conv_xyz = float_position(self.ekf, ar_float_state)
             dtr = self.ekf.x[3]
             ztd = self.ekf.x[self.col_ztd] if self.tro else 0.0
             if ref is not None and flh is not None:
@@ -2565,14 +2253,11 @@ class PPPUdGenericMixedGNSS:
                     row=result_row,
                 )
 
-        ct = conv_time.total_seconds() / 3600 if conv_time is not None else None
-        result = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name="time"))
-        result["ct_min"] = ct
-        residual_map = {
-            system: (pd.concat(frames) if frames else self.obs_by_system[system].iloc[0:0].copy())
-            for system, frames in residuals.items()
-        }
-        return result, residual_map, None, ct
+        # contracts C1 / C2 (bug-fix stage 13b): ct_min [min]; an empty residual frame keeps the residual columns
+        result = finish_solution(pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name="time")),
+                                 conv_time)
+        residual_map = residual_frames(residuals, self.obs_by_system, self.RESIDUAL_COLUMNS)
+        return result, residual_map, None, convergence_hours(conv_time)
 
 
 class PPPFilterMultiGNSSIonConstGEC(PPPUdGenericMixedGNSS):
@@ -2634,10 +2319,14 @@ class PPPFilterMultiGNSSIonConstGEC(PPPUdGenericMixedGNSS):
         )
         if not self.use_iono_constr:
             raise ValueError("PPPFilterMultiGNSSIonConstGEC requires ionospheric constraints.")
-        self.code_prefit_threshold = 10.0
-        self.enable_phase_jump_resets = True
-        self.legacy_phase_jump_resets = True
-        self.phase_jump_reset_threshold = 1.0
+        # code gate and phase-jump screening of the constrained settings (defaults 10 m, on, legacy
+        # source, 1 m, 60 epochs), as R7 with constraints
+        cfg = self.cfg
+        self.code_prefit_threshold = float(getattr(cfg, "uncombined_iono_code_prefit_threshold", 10.0))
+        self.enable_phase_jump_resets = bool(getattr(cfg, "uncombined_iono_phase_screen", True))
+        self.legacy_phase_jump_resets = bool(getattr(cfg, "uncombined_iono_phase_screen_legacy_source", True))
+        self.phase_jump_reset_threshold = float(getattr(cfg, "uncombined_iono_phase_screen_threshold", 1.0))
+        self.phase_jump_warmup_epochs = int(getattr(cfg, "uncombined_iono_phase_screen_warmup_epochs", 60))
 
     def _state_specs(self, sats_by_system: dict[str, list[str]]) -> tuple[dict[str, tuple[int, int]], int]:
         specs: dict[str, tuple[int, int]] = {}
@@ -2665,7 +2354,7 @@ class PPPFilterMultiGNSSIonConstGEC(PPPUdGenericMixedGNSS):
             self.ekf.P[idx_c1, idx_c1] = 1e-12
             self.ekf.Q[idx_c1, idx_c1] = 0.0
             self.ekf.P[idx_c2, idx_c2] = self.cfg.p_dcb
-            self.ekf.Q[idx_c2, idx_c2] = self.cfg.q_dcb
+            self.ekf.Q[idx_c2, idx_c2] = random_walk_variance(self.cfg.q_dcb, self.interval)
 
     def _init_filter_common(self, epoch, clk0=0.0, zwd0=0.0):
         sats_by_system = super()._init_filter_common(epoch, clk0=clk0, zwd0=zwd0)
@@ -2679,9 +2368,6 @@ class PPPFilterMultiGNSSIonConstGEC(PPPUdGenericMixedGNSS):
         Q_new = np.zeros((new_dim, new_dim))
 
         base = self.base_dim
-        x_new[:base] = x_old[:base]
-        P_new[:base, :base] = P_old[:base, :base]
-        Q_new[:base, :base] = Q_old[:base, :base]
 
         prev_all = [
             f"{system}:{sv}"
@@ -2697,20 +2383,16 @@ class PPPFilterMultiGNSSIonConstGEC(PPPUdGenericMixedGNSS):
         curr_map = {tag: idx for idx, tag in enumerate(curr_all)}
         common = [tag for tag in curr_all if tag in prev_map]
 
+        # Receiver states, retained satellites and receiver DCB states are carried
+        # over together, so no correlation between them is lost.
+        keep_old = [np.arange(base)]
+        keep_new = [np.arange(base)]
         if common:
             old_idx = np.array([prev_map[tag] for tag in common], dtype=int)
             new_idx = np.array([curr_map[tag] for tag in common], dtype=int)
             offs = np.array([0, 1, 2], dtype=int)
-            old_state = (base + 3 * old_idx[:, None] + offs[None, :]).ravel()
-            new_state = (base + 3 * new_idx[:, None] + offs[None, :]).ravel()
-            x_new[new_state] = x_old[old_state]
-            P_new[np.ix_(new_state, new_state)] = P_old[np.ix_(old_state, old_state)]
-            Q_new[np.ix_(new_state, new_state)] = Q_old[np.ix_(old_state, old_state)]
-            base_idx = np.arange(base)
-            P_new[np.ix_(new_state, base_idx)] = P_old[np.ix_(old_state, base_idx)]
-            P_new[np.ix_(base_idx, new_state)] = P_old[np.ix_(base_idx, old_state)]
-            Q_new[np.ix_(new_state, base_idx)] = Q_old[np.ix_(old_state, base_idx)]
-            Q_new[np.ix_(base_idx, new_state)] = Q_old[np.ix_(base_idx, old_state)]
+            keep_old.append((base + 3 * old_idx[:, None] + offs[None, :]).ravel())
+            keep_new.append((base + 3 * new_idx[:, None] + offs[None, :]).ravel())
 
         for tag in curr_all:
             if tag in prev_map:
@@ -2721,26 +2403,30 @@ class PPPFilterMultiGNSSIonConstGEC(PPPUdGenericMixedGNSS):
             idx_n2 = idx_i + 2
             x_new[idx_i] = 0.0
             P_new[idx_i, idx_i] = self.cfg.p_iono
-            Q_new[idx_i, idx_i] = self.cfg.q_iono * (self.interval * 60) / 3600
+            Q_new[idx_i, idx_i] = random_walk_variance(self.cfg.q_iono, self.interval)
             P_new[idx_n1, idx_n1] = self.cfg.p_amb
             P_new[idx_n2, idx_n2] = self.cfg.p_amb
+            # PPP-064 (bug-fix stage 13b): q_amb on the ambiguities of a rising satellite too (Q = 0 before)
+            Q_new[idx_n1, idx_n1] = random_walk_variance(self.cfg.q_amb, self.interval)
+            Q_new[idx_n2, idx_n2] = random_walk_variance(self.cfg.q_amb, self.interval)
 
         old_dcb = self._dcb_cols(prev_sats)
         new_dcb = self._dcb_cols(curr_sats)
         for system in self.systems:
             if system in old_dcb and system in new_dcb:
-                old_idx = np.array(old_dcb[system], dtype=int)
-                new_idx = np.array(new_dcb[system], dtype=int)
-                x_new[new_idx] = x_old[old_idx]
-                P_new[np.ix_(new_idx, new_idx)] = P_old[np.ix_(old_idx, old_idx)]
-                Q_new[np.ix_(new_idx, new_idx)] = Q_old[np.ix_(old_idx, old_idx)]
+                keep_old.append(np.array(old_dcb[system], dtype=int))
+                keep_new.append(np.array(new_dcb[system], dtype=int))
+        _carry_over_states(x_old, P_old, Q_old, x_new, P_new, Q_new,
+                           np.concatenate(keep_old), np.concatenate(keep_new))
         for _system, (idx_c1, idx_c2) in new_dcb.items():
+            # The first code bias of each system is the datum: fixed to zero
+            # with no correlation to the other states.
             x_new[idx_c1] = 0.0
-            P_new[idx_c1, idx_c1] = 1e-12
-            Q_new[idx_c1, idx_c1] = 0.0
+            _reset_covariance_states(P_new, [idx_c1], 1e-12)
+            _reset_covariance_states(Q_new, [idx_c1], 0.0)
             if P_new[idx_c2, idx_c2] == 0.0:
                 P_new[idx_c2, idx_c2] = self.cfg.p_dcb
-                Q_new[idx_c2, idx_c2] = self.cfg.q_dcb
+                Q_new[idx_c2, idx_c2] = random_walk_variance(self.cfg.q_dcb, self.interval)
         return x_new, P_new, Q_new
 
     def _fill_h_system(self, H, x, satellites, system, row_start, state_start):
@@ -2806,6 +2492,8 @@ class PPPFilterMultiGNSSIonConstGEC(PPPUdGenericMixedGNSS):
 
     def _configure_transition_matrix(self):
         self.ekf.F = np.eye(self.ekf.dim_x)
+        if not bool(getattr(self.cfg, "uncombined_iono_clock_identity", True)):
+            self.ekf.F[3, 3] = 0.0  # receiver clock re-estimated every epoch, as R7
 
     def _system_measurements(self, system, epoch, satellites, layout, num, strict_phase_code_gate=False):
         block, r_diag, diag = super()._system_measurements(
@@ -2823,18 +2511,19 @@ class PPPFilterMultiGNSSIonConstGEC(PPPUdGenericMixedGNSS):
 
         r_matrix = r_diag.reshape(n, obs_dim)
         ev_deg = self._col_np(epoch, "ev", np.full(n, 30.0))
-        inv_sin = _elevation_variance_scale(ev_deg)
-        legacy_code_var = 0.3 + 0.0025 * inv_sin
-        legacy_phase_var = 1e-4 + 0.0003 * inv_sin
+        # constrained weighting of the system (PPP-074, bug-fix stage 13b), as R7 and R4c
+        code_var, phase_var = _constrained_obs_variances(self.cfg, ev_deg, system)
+        # NQ-SPP-33 (author decision 2026-10-15): BDS-3 codes not moved to the clock datum are down-weighted
+        code_var = code_var + unmoved_code_variance_m2(self.cfg, system, epoch, uncombined=True)
         for band_idx in range(len(layout)):
             r_matrix[:, 2 * band_idx] = np.where(
                 diag["code_masks"][:, band_idx],
-                legacy_code_var,
+                code_var,
                 1e12,
             )
             r_matrix[:, 2 * band_idx + 1] = np.where(
                 diag["phase_masks"][:, band_idx],
-                legacy_phase_var,
+                phase_var,
                 1e12,
             )
         return block, r_matrix.reshape(-1), diag
@@ -2880,6 +2569,9 @@ class PPPUdMixedGNSS:
         for new no-constraint G/E/C work.
     """
 
+    #: columns the filter adds to the observation rows in its residual frames
+    RESIDUAL_COLUMNS = ("stec", "n1", "n2")
+
     def __init__(self, config: PPPConfig, gps_obs, gps_mode, gal_obs, gal_mode, ekf, pos0, tro=True, interval=0.5):
         self.cfg = config
         self.gps_obs = gps_obs
@@ -2901,6 +2593,12 @@ class PPPUdMixedGNSS:
         if self.use_iono_constr:
             if 'ion' not in self.gps_obs.columns or 'ion' not in self.gal_obs.columns:
                 raise ValueError("use_iono_constr requires an 'ion' column in GPS and Galileo observations.")
+            # the GIM in the satellite code-bias datum (bug-fix stage 13d), before the rows without a model value go
+            self.iono_dsb_alignment = {}
+            self.gps_obs, self.iono_dsb_alignment["G"] = _align_iono_model_to_code_biases(
+                self.gps_obs, self.gps_mode, "G", self.cfg)
+            self.gal_obs, self.iono_dsb_alignment["E"] = _align_iono_model_to_code_biases(
+                self.gal_obs, self.gal_mode, "E", self.cfg)
             self.gps_obs = self.gps_obs.dropna(subset=['ion'])
             self.gal_obs = self.gal_obs.dropna(subset=['ion'])
             if self.use_iono_rms and 'ion_rms' in self.gps_obs.columns:
@@ -3195,9 +2893,10 @@ class PPPUdMixedGNSS:
             self.ekf.P[5, 5] = self.cfg.p_tro
         self.ekf.Q = np.zeros_like(self.ekf.P)
         self.ekf.Q[3, 3] = self.cfg.q_dt
-        self.ekf.Q[4, 4] = self.cfg.q_isb
+        self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_isb, self.interval)
         if self.tro:
-            self.ekf.Q[5, 5] = self.cfg.q_tro
+            self.ekf.Q[5, 5] = random_walk_variance(self.cfg.q_tro, self.interval)
+        _init_coordinate_states(self.ekf, self.cfg)
         self.ekf.F = np.eye(dim_x)
         self.ekf.F[3, 3] = 0.0
 
@@ -3222,10 +2921,10 @@ class PPPUdMixedGNSS:
             idx_i = state_start + state_dim * i
             self.ekf.x[idx_i] = ion_values[i]
             self.ekf.P[idx_i, idx_i] = self.cfg.p_iono
-            self.ekf.Q[idx_i, idx_i] = self.cfg.q_iono * (self.interval * 60) / 3600
+            self.ekf.Q[idx_i, idx_i] = random_walk_variance(self.cfg.q_iono, self.interval)
             for amb in range(1, state_dim):
                 self.ekf.P[idx_i + amb, idx_i + amb] = self.cfg.p_amb
-                self.ekf.Q[idx_i + amb, idx_i + amb] = self.cfg.q_amb
+                self.ekf.Q[idx_i + amb, idx_i + amb] = random_walk_variance(self.cfg.q_amb, self.interval)
 
     def init_filter(self, clk0=0.0, zwd0=0.0):
         epochs = sorted(set(self.gps_obs.index.get_level_values('time').unique()) &
@@ -3243,24 +2942,17 @@ class PPPUdMixedGNSS:
         x_new = np.zeros(new_dim)
         P_new = np.zeros((new_dim, new_dim))
         Q_new = np.zeros((new_dim, new_dim))
-        x_new[:self.base_dim] = x_old[:self.base_dim]
-        P_new[:self.base_dim, :self.base_dim] = P_old[:self.base_dim, :self.base_dim]
-        Q_new[:self.base_dim, :self.base_dim] = Q_old[:self.base_dim, :self.base_dim]
 
+        # Receiver states plus every retained satellite, carried over together so
+        # the satellite-satellite covariances survive.
+        keep_old = [np.arange(self.base_dim)]
+        keep_new = [np.arange(self.base_dim)]
         for tag, (new_start, new_dim_state) in new_specs.items():
             if tag in old_specs:
                 old_start, old_dim_state = old_specs[tag]
                 common_dim = min(old_dim_state, new_dim_state)
-                old_idx = np.arange(old_start, old_start + common_dim)
-                new_idx = np.arange(new_start, new_start + common_dim)
-                x_new[new_idx] = x_old[old_idx]
-                P_new[np.ix_(new_idx, new_idx)] = P_old[np.ix_(old_idx, old_idx)]
-                Q_new[np.ix_(new_idx, new_idx)] = Q_old[np.ix_(old_idx, old_idx)]
-                base_idx = np.arange(self.base_dim)
-                P_new[np.ix_(new_idx, base_idx)] = P_old[np.ix_(old_idx, base_idx)]
-                P_new[np.ix_(base_idx, new_idx)] = P_old[np.ix_(base_idx, old_idx)]
-                Q_new[np.ix_(new_idx, base_idx)] = Q_old[np.ix_(old_idx, base_idx)]
-                Q_new[np.ix_(base_idx, new_idx)] = Q_old[np.ix_(base_idx, old_idx)]
+                keep_old.append(np.arange(old_start, old_start + common_dim))
+                keep_new.append(np.arange(new_start, new_start + common_dim))
             else:
                 sys_tag, sv = tag.split(":", 1)
                 sat_list = curr_gps if sys_tag == "G" else curr_gal
@@ -3268,11 +2960,13 @@ class PPPUdMixedGNSS:
                 sat_idx = sat_list.index(sv)
                 x_new[new_start] = ion_values[sat_idx]
                 P_new[new_start, new_start] = self.cfg.p_iono
-                Q_new[new_start, new_start] = self.cfg.q_iono * (self.interval * 60) / 3600
+                Q_new[new_start, new_start] = random_walk_variance(self.cfg.q_iono, self.interval)
                 for amb in range(1, new_dim_state):
                     P_new[new_start + amb, new_start + amb] = self.cfg.p_amb
-                    Q_new[new_start + amb, new_start + amb] = self.cfg.q_amb
+                    Q_new[new_start + amb, new_start + amb] = random_walk_variance(self.cfg.q_amb, self.interval)
 
+        _carry_over_states(x_old, P_old, Q_old, x_new, P_new, Q_new,
+                           np.concatenate(keep_old), np.concatenate(keep_new))
         return x_new, P_new, Q_new
 
     def code_screening(self, x, satellites, code_obs, thr=1):
@@ -3296,11 +2990,12 @@ class PPPUdMixedGNSS:
             return np.empty((0, state_dim))
         return self.ekf.x[start:start + state_dim * n_sats].reshape(n_sats, state_dim)
 
-    def _ar_ambiguity_groups(self, n_gps, n_gal, gps_ev, gal_ev, gps_age=None, gal_age=None):
+    def _ar_ambiguity_groups(self, n_gps, n_gal, gps_ev, gal_ev, gps_age=None, gal_age=None,
+                             gps_eligible=None, gal_eligible=None):
         groups = []
-        for system, n_sats, mode, ev, age in (
-            ("G", n_gps, self.gps_mode, gps_ev, gps_age),
-            ("E", n_gal, self.gal_mode, gal_ev, gal_age),
+        for system, n_sats, mode, ev, age, eligible in (
+            ("G", n_gps, self.gps_mode, gps_ev, gps_age, gps_eligible),
+            ("E", n_gal, self.gal_mode, gal_ev, gal_age, gal_eligible),
         ):
             if n_sats == 0:
                 continue
@@ -3310,9 +3005,11 @@ class PPPUdMixedGNSS:
             n1_idx = state_start + state_dim * sat_idx + 1
             n2_idx = state_start + state_dim * sat_idx + 2 if state_dim > 2 else None
             group = {
+                "system": system,
                 "n1_idx": n1_idx,
                 "n2_idx": n2_idx,
                 "ev": ev,
+                "eligible": eligible,
             }
             if age is not None:
                 group["age"] = age
@@ -3332,10 +3029,11 @@ class PPPUdMixedGNSS:
         gal_results = []
         r_cache = {}
         xyz = None
+        conv_xyz = None  # previous float position (convergence check)
         conv_time = None
         T0 = all_times[0]
-        gps_arc_age = {sv: 0 for sv in old_gps_sats}
-        gal_arc_age = {sv: 0 for sv in old_gal_sats}
+        gps_arc_age = {}
+        gal_arc_age = {}
         ar_cfg = PPPARSettings(
             enabled=bool(getattr(self.cfg, "pppar_enabled", False)),
             warmup_epochs=int(getattr(self.cfg, "pppar_warmup_epochs", 60)),
@@ -3346,17 +3044,22 @@ class PPPUdMixedGNSS:
             min_lock_epochs=getattr(self.cfg, "pppar_min_lock_epochs", None),
             min_candidate_elevation_deg=getattr(self.cfg, "pppar_min_candidate_elevation_deg", None),
             use_float_ratio_covariance=bool(getattr(self.cfg, "pppar_use_float_ratio_covariance", True)),
-            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", False)),
+            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", True)),
             partial_min_ambiguities=getattr(self.cfg, "pppar_partial_min_ambiguities", None),
             wide_lane_max_frac_cycles=getattr(self.cfg, "pppar_wide_lane_max_frac_cycles", 0.25),
+            hold=bool(getattr(self.cfg, "pppar_fix_and_hold", False)),
         )
 
+        ar_float_state = None
         for num, t in enumerate(all_times):
+            # the previous epoch was reported fixed; without fix-and-hold the filter continues float
+            restore_float_state(self.ekf, ar_float_state)
+            ar_float_state = None
             reset_epoch = False
             if reset_every != 0 and ((num * self.interval) % reset_every == 0) and (num != 0):
                 old_gps_sats, old_gal_sats = self.reset_filter(epoch=t, clk0=clk0, zwd0=zwd0)
-                gps_arc_age = {sv: 0 for sv in old_gps_sats}
-                gal_arc_age = {sv: 0 for sv in old_gal_sats}
+                gps_arc_age = {}
+                gal_arc_age = {}
                 reset_epoch = True
                 T0 = t
 
@@ -3419,20 +3122,30 @@ class PPPUdMixedGNSS:
             R.flat[::m + 1] = r_diag
             self.ekf.R = R
 
+            # receiver clock (every code row) and Galileo ISB (state 4, its code rows) priors, RTKLIB udclk_ppp
+            # (bug-fix stage 13b, A1(b))
+            gps_code = (self._obs_dim(self.gps_mode) * np.arange(len(curr_gps_sats))[:, None]
+                        + 2 * np.arange(len(gps_layout))[None, :]).ravel()
+            gal_code = (len(z_gps) + self._obs_dim(self.gal_mode) * np.arange(len(curr_gal_sats))[:, None]
+                        + 2 * np.arange(len(gal_layout))[None, :]).ravel()
+            prior_rows = np.concatenate((gps_code, gal_code)).astype(int)
             updated = False
-            for k in range(5):
-                try:
-                    self.ekf.predict_update(
-                        z=Z,
-                        HJacobian=self.Hjacobian,
-                        args=(gps_satellites, gal_satellites),
-                        Hx=self.Hx,
-                        hx_args=(gps_satellites, gal_satellites),
-                    )
-                    updated = True
-                    break
-                except np.linalg.LinAlgError:
-                    self.ekf.R.flat[::m + 1] += 1e-6 * (10.0 ** k)
+            with epoch_process_noise(self.ekf, t, self.interval):
+                for k in range(5):
+                    try:
+                        self.ekf.state_priors = clock_priors(self.cfg.clock_prior_sigma_m, prior_rows,
+                                                             {4: gal_code.astype(int)})
+                        self.ekf.predict_update(
+                            z=Z,
+                            HJacobian=self.Hjacobian,
+                            args=(gps_satellites, gal_satellites),
+                            Hx=self.Hx,
+                            hx_args=(gps_satellites, gal_satellites),
+                        )
+                        updated = True
+                        break
+                    except np.linalg.LinAlgError:
+                        self.ekf.R.flat[::m + 1] += 1e-6 * (10.0 ** k)
             if not updated:
                 if trace_filter:
                     ppp_trace(
@@ -3443,8 +3156,8 @@ class PPPUdMixedGNSS:
                         time=t,
                     )
                 old_gps_sats, old_gal_sats = self.reset_filter(epoch=t, clk0=clk0, zwd0=zwd0)
-                gps_arc_age = {sv: 0 for sv in old_gps_sats}
-                gal_arc_age = {sv: 0 for sv in old_gal_sats}
+                gps_arc_age = {}
+                gal_arc_age = {}
                 continue
             gps_arc_age = advance_arc_age(gps_arc_age, curr_gps_sats)
             gal_arc_age = advance_arc_age(gal_arc_age, curr_gal_sats)
@@ -3452,6 +3165,20 @@ class PPPUdMixedGNSS:
             gal_ar_age = arc_age_array(gal_arc_age, curr_gal_sats)
             ar_diag = None
             if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
+                # float phase residuals and weights (contract C3, NQ-PPP-20)
+                phase_rows, amb_idx = [], []
+                for system, mode, n_sv in (("G", self.gps_mode, len(curr_gps_sats)),
+                                           ("E", self.gal_mode, len(curr_gal_sats))):
+                    sat = np.arange(n_sv)[:, None]
+                    band = np.arange(len(_mode_signals(mode)))[None, :]
+                    phase_rows.append((self._system_obs_start(len(curr_gps_sats), system)
+                                       + self._obs_dim(mode) * sat + 2 * band + 1).ravel())
+                    amb_idx.append((self._system_state_start(len(curr_gps_sats), system)
+                                    + self._state_dim(mode) * sat + 1 + band).ravel())
+                ar_inputs = ar_phase_kwargs(Z - self.Hx(self.ekf.x, gps_satellites, gal_satellites),
+                                            np.diag(self.ekf.R), np.concatenate(phase_rows), np.concatenate(amb_idx),
+                                            ekf=self.ekf)
+                ar_float_state = keep_float_state(self.ekf, ar_cfg)
                 self.ekf.x, self.ekf.P, ar_diag = apply_indexed_uncombined_pppar(
                     x=self.ekf.x,
                     P=self.ekf.P,
@@ -3462,19 +3189,23 @@ class PPPUdMixedGNSS:
                         gal_ev=gal_epoch['ev'].to_numpy(copy=False),
                         gps_age=gps_ar_age,
                         gal_age=gal_ar_age,
+                        gps_eligible=ar_eligible_mask(gps_epoch),
+                        gal_eligible=ar_eligible_mask(gal_epoch),
                     ),
                     settings=ar_cfg,
+                    **ar_inputs,
                 )
 
             if not reset_epoch or reset_every == 0:
                 if xyz is not None:
-                    position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
+                    position_diff = np.linalg.norm(float_position(self.ekf, ar_float_state) - conv_xyz)
                     if conv_time is None and position_diff < 0.005:
                         conv_time = t - T0
                     elif position_diff > 0.005:
                         conv_time = None
 
             xyz = self.ekf.x[:3].copy()
+            conv_xyz = float_position(self.ekf, ar_float_state)
             dtr = self.ekf.x[3]
             isb = self.ekf.x[4]
             ztd = self.ekf.x[5] if self.tro else 0.0
@@ -3527,936 +3258,12 @@ class PPPUdMixedGNSS:
                     row=result_rows[-1],
                 )
 
-        ct = conv_time.total_seconds() / 3600 if conv_time is not None else None
-        result = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time'))
-        result['ct_min'] = ct
-        gps_result = pd.concat(gps_results) if gps_results else self.gps_obs.iloc[0:0].copy()
-        gal_result = pd.concat(gal_results) if gal_results else self.gal_obs.iloc[0:0].copy()
-        return result, gps_result, gal_result, ct
-
-
-class PPPUdMultiGNSS:
-    """Legacy GPS/Galileo dual-frequency uncombined PPP filter.
-
-    Purpose:
-        Historical G/E uncombined dual-frequency branch without external
-        ionospheric constraints. It remains reachable when GPS and Galileo
-        dual-frequency observations are active and ``use_iono_constr`` is
-        false.
-
-    Status:
-        Legacy/reachable GPS+Galileo path. It remains routed for G/E dual-
-        frequency no-constraint compatibility, but new mixed no-constraint work
-        should prefer ``PPPUdGenericMixedGNSS``.
-
-    Model:
-        Estimates receiver position, GPS receiver clock, Galileo ISB, optional
-        ZTD, and per-satellite ``[I, N1, N2]`` blocks from uncombined code and
-        phase observables.
-
-    State vector:
-        ``[x, y, z, dtr_G, isb_E, ztd?, (I, N1, N2)_G..., (I, N1, N2)_E...]``.
-
-    Supported systems:
-        GPS and Galileo only.
-
-    PPP-AR support:
-        Uncombined AR hooks are present in related branches; this class should
-        be validated carefully before enabling or changing AR behavior.
-
-    Limitations:
-        Legacy G/E-specific path. New mixed no-constraint work should prefer
-        ``PPPUdGenericMixedGNSS``.
-    """
-
-    def __init__(self, config:PPPConfig, gps_obs, gps_mode, gal_obs, gal_mode, ekf, pos0, tro=True, interval=0.5):
-        self.cfg=config
-        self.gps_obs = gps_obs
-        self.gps_mode = gps_mode
-        self.gal_obs = gal_obs
-        self.gal_mode = gal_mode
-        self.tro = tro
-        self.ekf = ekf
-        self.FREQ_DICT = dict(FREQ_DICT_ALL)
-        self.LAMBDA_DICT = {}
-        self.CLIGHT = 299792458
-        self.base_dim = 6 if self.tro else 5
-        self.pos0 = pos0
-        self.interval=interval
-        self.use_iono_constr = bool(getattr(self.cfg, "use_iono_constr", False))
-        self.use_iono_rms = bool(getattr(self.cfg, "use_iono_rms", True))
-        self.sigma_iono_0 = getattr(self.cfg, "sigma_iono_0", 1.1)
-        self.sigma_iono_end = getattr(self.cfg, "sigma_iono_end", 3.0)
-        self.t_end = getattr(self.cfg, "t_end", 30)
-        if self.use_iono_constr and self.gps_obs is not None and self.gal_obs is not None:
-            if 'ion' not in self.gps_obs.columns or 'ion' not in self.gal_obs.columns:
-                raise ValueError("use_iono_constr requires an 'ion' column in GPS and Galileo observations.")
-            self.gps_obs = self.gps_obs.dropna(subset=['ion'])
-            self.gal_obs = self.gal_obs.dropna(subset=['ion'])
-            if self.use_iono_rms and 'ion_rms' in self.gps_obs.columns:
-                self.gps_obs = self.gps_obs.dropna(subset=['ion_rms'])
-            if self.use_iono_rms and 'ion_rms' in self.gal_obs.columns:
-                self.gal_obs = self.gal_obs.dropna(subset=['ion_rms'])
-        elif self.gps_obs is None or self.gal_obs is None:
-            self.use_iono_constr = False
-        self.obs_per_sat = 5 if self.use_iono_constr else 4
-
-    def Hjacobian(self, x, gps_satellites, gal_satellites):
-        C = self.CLIGHT
-        # Częstotliwości GPS
-        gps_f1, gps_f2 = _dual_mode_signals(self.gps_mode)
-        F1_GPS = self.FREQ_DICT[gps_f1]
-        F2_GPS = self.FREQ_DICT[gps_f2]
-        L1 = C / F1_GPS
-        L2 = C / F2_GPS
-        MU1 = 1.0
-        MU2 = (F1_GPS / F2_GPS) ** 2
-
-        # Częstotliwości Galileo
-        gal_f1, gal_f2 = _dual_mode_signals(self.gal_mode)
-        F1_GAL = self.FREQ_DICT[gal_f1]
-        F2_GAL = self.FREQ_DICT[gal_f2]
-        E1 = C / F1_GAL
-        E5a = C / F2_GAL
-        MU1_GAL = 1.0
-        MU2_GAL = (F1_GAL / F2_GAL) ** 2
-
-        n_gps = gps_satellites.shape[0]
-        n_gal = gal_satellites.shape[0]
-        rec_xyz = x[:3].copy()
-
-        e_gps, _ = _unit_vectors_and_ranges(gps_satellites[:, :3], rec_xyz)
-        e_gal, _ = _unit_vectors_and_ranges(gal_satellites[:, :3], rec_xyz)
-        m_wet_gps = gps_satellites[:, 3]
-        m_wet_gal = gal_satellites[:, 3]
-
-        # Parametry wspólne: XYZ, clk_gps, ISB_galileo, ZTD
-        COL_X, COL_Y, COL_Z = 0, 1, 2
-        COL_CLK = 3
-        COL_ISB = 4
-        COL_ZTD = 5
-
-        base_dim = 6  # wspólne parametry (XYZ + clk_gps + isb + ztd)
-        rows_per_sat = self.obs_per_sat
-
-        # 4 obserwacje GNSS plus opcjonalny constraint jonosferyczny.
-        H = np.zeros((rows_per_sat * (n_gps + n_gal), base_dim + 3 * (n_gps + n_gal)))
-
-        # ---------------- GPS ----------------
-        if n_gps:
-            idx = np.arange(n_gps)
-            gps_rows = (rows_per_sat * idx[:, None] + np.arange(4)).ravel()
-            H[np.ix_(gps_rows, [COL_X, COL_Y, COL_Z])] = np.repeat(e_gps, 4, axis=0)
-            H[gps_rows, COL_CLK] = 1.0
-            H[gps_rows, COL_ZTD] = np.repeat(m_wet_gps, 4)
-
-            row0 = rows_per_sat * idx
-            row1 = row0 + 1
-            row2 = row0 + 2
-            row3 = row0 + 3
-            col_iono = base_dim + 3 * idx
-            H[row0, col_iono] = MU1
-            H[row1, col_iono] = -MU1
-            H[row2, col_iono] = MU2
-            H[row3, col_iono] = -MU2
-            H[row1, col_iono + 1] = L1
-            H[row3, col_iono + 2] = L2
-            if self.use_iono_constr:
-                H[row0 + 4, col_iono] = 1.0
-
-        # ---------------- Galileo ----------------
-        if n_gal:
-            idx = np.arange(n_gal)
-            gal_rows = (rows_per_sat * (n_gps + idx)[:, None] + np.arange(4)).ravel()
-            H[np.ix_(gal_rows, [COL_X, COL_Y, COL_Z])] = np.repeat(e_gal, 4, axis=0)
-            H[gal_rows, COL_CLK] = 1.0
-            H[gal_rows, COL_ISB] = 1.0
-            H[gal_rows, COL_ZTD] = np.repeat(m_wet_gal, 4)
-
-            row0 = rows_per_sat * (n_gps + idx)
-            row1 = row0 + 1
-            row2 = row0 + 2
-            row3 = row0 + 3
-            col_iono = base_dim + 3 * (n_gps + idx)
-            H[row0, col_iono] = MU1_GAL
-            H[row1, col_iono] = -MU1_GAL
-            H[row2, col_iono] = MU2_GAL
-            H[row3, col_iono] = -MU2_GAL
-            H[row1, col_iono + 1] = E1
-            H[row3, col_iono + 2] = E5a
-            if self.use_iono_constr:
-                H[row0 + 4, col_iono] = 1.0
-
-        return H
-
-    def Hx(self, x: np.ndarray, gps_satellites: np.ndarray, gal_satellites: np.ndarray) -> np.ndarray:
-        x_state = x.copy()
-        C = self.CLIGHT
-
-        # GPS
-        gps_f1, gps_f2 = _dual_mode_signals(self.gps_mode)
-        F1_GPS = self.FREQ_DICT[gps_f1]
-        F2_GPS = self.FREQ_DICT[gps_f2]
-        L1 = C / F1_GPS
-        L2 = C / F2_GPS
-        MU1 = 1.0
-        MU2 = (F1_GPS / F2_GPS) ** 2
-
-        # Galileo
-        gal_f1, gal_f2 = _dual_mode_signals(self.gal_mode)
-        F1_GAL = self.FREQ_DICT[gal_f1]
-        F2_GAL = self.FREQ_DICT[gal_f2]
-        E1 = C / F1_GAL
-        E5a = C / F2_GAL
-        MU1_GAL = 1.0
-        MU2_GAL = (F1_GAL / F2_GAL) ** 2
-
-        clk = x_state[3]
-        isb = x_state[4]  # inter-sys bias (dla Galileo)
-        zwd = x_state[5]
-
-        base_dim = self.base_dim
-        n_gps = gps_satellites.shape[0]
-        n_gal = gal_satellites.shape[0]
-        rows_per_sat = self.obs_per_sat
-
-        z_hat = np.empty(rows_per_sat * (n_gps + n_gal))
-
-        if n_gps:
-            gps_state = x_state[base_dim:base_dim + 3 * n_gps].reshape(n_gps, 3)
-            I_gps = gps_state[:, 0]
-            N1_gps = gps_state[:, 1]
-            N2_gps = gps_state[:, 2]
-            _, rho_gps = _unit_vectors_and_ranges(gps_satellites[:, :3], x_state[:3])
-            mw_gps = gps_satellites[:, 3]
-            geom = rho_gps
-            gps_block = np.column_stack((
-                geom + clk + mw_gps * zwd + MU1 * I_gps,
-                geom + clk + mw_gps * zwd - MU1 * I_gps + L1 * N1_gps,
-                geom + clk + mw_gps * zwd + MU2 * I_gps,
-                geom + clk + mw_gps * zwd - MU2 * I_gps + L2 * N2_gps,
-            ))
-            if self.use_iono_constr:
-                gps_block = np.column_stack((gps_block, I_gps))
-            z_hat[:rows_per_sat * n_gps] = gps_block.reshape(-1)
-
-        if n_gal:
-            gal_state = x_state[base_dim + 3 * n_gps:base_dim + 3 * (n_gps + n_gal)].reshape(n_gal, 3)
-            I_gal = gal_state[:, 0]
-            N1_gal = gal_state[:, 1]
-            N2_gal = gal_state[:, 2]
-            _, rho_gal = _unit_vectors_and_ranges(gal_satellites[:, :3], x_state[:3])
-            mw_gal = gal_satellites[:, 3]
-            geom = rho_gal
-            gal_block = np.column_stack((
-                geom + clk + isb + mw_gal * zwd + MU1_GAL * I_gal,
-                geom + clk + isb + mw_gal * zwd - MU1_GAL * I_gal + E1 * N1_gal,
-                geom + clk + isb + mw_gal * zwd + MU2_GAL * I_gal,
-                geom + clk + isb + mw_gal * zwd - MU2_GAL * I_gal + E5a * N2_gal,
-            ))
-            if self.use_iono_constr:
-                gal_block = np.column_stack((gal_block, I_gal))
-            start = rows_per_sat * n_gps
-            z_hat[start:start + rows_per_sat * n_gal] = gal_block.reshape(-1)
-
-        return z_hat
-
-    def rebuild_state(self, x_old, P_old, Q_old,
-                      prev_gps, prev_gal, curr_gps, curr_gal,
-                      P4_gps_dict: dict, P4_gal_dict: dict):
-        """
-        Aktualizuje stan filtra Kalman w sytuacji, gdy zmienia się widoczność satelitów GPS i Galileo.
-        Dla nowych satelitów inicjalizuje I_s na podstawie obserwacji P4.
-
-        Parametry:
-        - prev_gps / prev_gal: listy satelitów poprzedniej epoki
-        - curr_gps / curr_gal: listy satelitów bieżącej epoki
-        - P4_gps_dict: słownik {sv: P4} dla GPS
-        - P4_gal_dict: słownik {sv: P4} dla Galileo
-
-        Zakładamy:
-        - self.base_dim = 6 (X, Y, Z, clk_GPS, ISB_GAL, ZTD)
-        """
-
-        base_dim = self.base_dim
-        n_prev = len(prev_gps) + len(prev_gal)
-        n_curr = len(curr_gps) + len(curr_gal)
-
-        old_dim = base_dim + 3 * n_prev
-        new_dim = base_dim + 3 * n_curr
-
-        x_new = np.zeros(new_dim)
-        x_new[:base_dim] = x_old[:base_dim]
-
-        P_new = np.zeros((new_dim, new_dim))
-        P_new[:base_dim, :base_dim] = P_old[:base_dim, :base_dim]
-
-        Q_new = np.zeros((new_dim, new_dim))
-        Q_new[:base_dim, :base_dim] = Q_old[:base_dim, :base_dim]
-
-        # Oznaczenia systemowe, np. G:G01, E:E11
-        def tag(system: str, sv: str) -> str:
-            return f"{system}:{sv}"
-
-        prev_all = [tag("G", sv) for sv in prev_gps] + [tag("E", sv) for sv in prev_gal]
-        curr_all = [tag("G", sv) for sv in curr_gps] + [tag("E", sv) for sv in curr_gal]
-
-        prev_map = {prn: i for i, prn in enumerate(prev_all)}
-        curr_map = {prn: i for i, prn in enumerate(curr_all)}
-        common = [prn for prn in curr_all if prn in prev_map]
-
-        if common:
-            prev_idx = np.fromiter((prev_map[prn] for prn in common), dtype=int)
-            curr_idx = np.fromiter((curr_map[prn] for prn in common), dtype=int)
-            offsets = np.arange(3)
-            old_state_idx = (base_dim + 3 * prev_idx[:, None] + offsets[None, :]).ravel()
-            new_state_idx = (base_dim + 3 * curr_idx[:, None] + offsets[None, :]).ravel()
-
-            x_new[new_state_idx] = x_old[old_state_idx]
-            base_idx = np.arange(base_dim)
-            P_new[np.ix_(new_state_idx, base_idx)] = P_old[np.ix_(old_state_idx, base_idx)]
-            P_new[np.ix_(base_idx, new_state_idx)] = P_old[np.ix_(base_idx, old_state_idx)]
-            Q_new[np.ix_(new_state_idx, base_idx)] = Q_old[np.ix_(old_state_idx, base_idx)]
-            Q_new[np.ix_(base_idx, new_state_idx)] = Q_old[np.ix_(base_idx, old_state_idx)]
-            P_new[np.ix_(new_state_idx, new_state_idx)] = P_old[np.ix_(old_state_idx, old_state_idx)]
-            Q_new[np.ix_(new_state_idx, new_state_idx)] = Q_old[np.ix_(old_state_idx, old_state_idx)]
-
-        # --- nowe satelity: zainicjalizuj I_s z P4 ---
-        new_only = set(curr_all) - set(prev_all)
-        for prn in new_only:
-            j = curr_map[prn]
-            idx_I = base_dim + 3 * j
-            idx_N1 = idx_I + 1
-            idx_N2 = idx_I + 2
-
-            # Domyślny init
-            x_new[idx_I] = 0.0
-
-            # Próba inicjalizacji z P4
-            if prn.startswith("G:"):
-                sv = prn[2:]
-                if sv in P4_gps_dict:
-                    x_new[idx_I] = P4_gps_dict[sv]
-            elif prn.startswith("E:"):
-                sv = prn[2:]
-                if sv in P4_gal_dict:
-                    x_new[idx_I] = P4_gal_dict[sv]
-
-            # Ustaw P, Q
-            P_new[idx_I, idx_I] = self.cfg.p_iono
-            Q_new[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
-            P_new[idx_N1, idx_N1] = self.cfg.p_amb
-            P_new[idx_N2, idx_N2] = self.cfg.p_amb
-
-        return x_new, P_new, Q_new
-    def reset_filter(self, epoch, clk0: float = 0.0, zwd0: float = 0.0):
-        # Lista satelitów GPS i Galileo w pierwszej epoce
-        gps_sats = self.gps_obs.loc[(slice(None), epoch), :].index.get_level_values('sv').tolist()
-        gal_sats = self.gal_obs.loc[(slice(None), epoch), :].index.get_level_values('sv').tolist()
-
-        n_gps = len(gps_sats)
-        n_gal = len(gal_sats)
-
-        # Wymiary wektora stanu i obserwacji
-        base_dim = self.base_dim  # X, Y, Z, clk_gps, isb_galileo, ztd
-        dim_x = base_dim + 3 * (n_gps + n_gal)
-        dim_z = self.obs_per_sat * (n_gps + n_gal)
-
-        # Wektor stanu
-        x0 = np.zeros(dim_x)
-        x0[0:3] = self.pos0  # XYZ
-        x0[3] = clk0  # clk_gps
-        x0[4] = 0.0  # ISB dla Galileo
-        x0[5] = zwd0  # ZTD
-
-        # Inicjalizacja EKF
-        self.ekf = ExtendedKalmanFilter(dim_x=dim_x, dim_z=dim_z)
-        self.ekf._I = np.eye(dim_x)
-        self.ekf.x = x0.copy()
-        self.ekf.P = np.eye(dim_x) * 1e2
-        self.ekf.P[3, 3] = self.cfg.p_dt # clk
-        self.ekf.P[4, 4] = self.cfg.p_dt  # isb galileo
-        self.ekf.P[5, 5] = self.cfg.p_tro  # zwd
-
-        self.ekf.Q = np.zeros_like(self.ekf.P)
-        self.ekf.Q[3, 3] = self.cfg.q_dt
-        self.ekf.Q[4, 4] = self.cfg.q_dt
-        self.ekf.Q[5, 5] = self.cfg.q_tro
-
-        self.ekf.F = np.eye(dim_x)
-        self.ekf.F[3, 3] = 0.0  # model zegara: zresetuj co epokę (opcjonalnie)
-
-        # Inicjalizacja GPS: I_s, N1, N2
-        P4_gps = self.gps_obs.loc[(slice(None), epoch), 'P4'].to_numpy()
-        for i, sv in enumerate(gps_sats):
-            idx_I = base_dim + 3 * i
-            idx_N1 = idx_I + 1
-            idx_N2 = idx_I + 2
-
-            I_init = P4_gps[i]  # zakładamy P4 ≈ I_s * (MU2 - 1)
-
-            self.ekf.x[idx_I] = I_init
-            self.ekf.P[idx_I, idx_I] = self.cfg.p_iono
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
-
-            self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
-            self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb
-
-        # Inicjalizacja Galileo: I_s, N1, N2
-        P4_gal = self.gal_obs.loc[(slice(None), epoch), 'P4'].to_numpy()
-        for j, sv in enumerate(gal_sats):
-            k = n_gps + j  # Galileo są po GPS
-            idx_I = base_dim + 3 * k
-            idx_N1 = idx_I + 1
-            idx_N2 = idx_I + 2
-
-            I_init = P4_gal[j]  # analogicznie jak dla GPS
-
-            self.ekf.x[idx_I] = I_init
-            self.ekf.P[idx_I, idx_I] = self.cfg.p_iono
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
-
-            self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
-            self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb
-
-        return gps_sats, gal_sats
-
-    def init_filter(self, clk0: float = 0.0, zwd0: float = 0.0):
-        # Częstotliwości do przeliczenia P4 → I
-
-
-        # Wspólna pierwsza epoka
-        all_times = sorted(set(self.gps_obs.index.get_level_values('time').unique()) &
-                           set(self.gal_obs.index.get_level_values('time').unique()))
-        first_ep = all_times[0]
-
-        # Lista satelitów GPS i Galileo w pierwszej epoce
-        gps_sats = self.gps_obs.loc[(slice(None), first_ep), :].index.get_level_values('sv').tolist()
-        gal_sats = self.gal_obs.loc[(slice(None), first_ep), :].index.get_level_values('sv').tolist()
-
-        n_gps = len(gps_sats)
-        n_gal = len(gal_sats)
-
-        # Wymiary wektora stanu i obserwacji
-        base_dim = self.base_dim  # X, Y, Z, clk_gps, isb_galileo, ztd
-        dim_x = base_dim + 3 * (n_gps + n_gal)
-        dim_z = self.obs_per_sat * (n_gps + n_gal)
-
-        # Wektor stanu
-        x0 = np.zeros(dim_x)
-        x0[0:3] = self.pos0  # XYZ
-        x0[3] = clk0  # clk_gps
-        x0[4] = 0.0  # ISB dla Galileo
-        x0[5] = zwd0  # ZTD
-
-        # Inicjalizacja EKF
-        self.ekf = ExtendedKalmanFilter(dim_x=dim_x, dim_z=dim_z)
-        self.ekf._I = np.eye(dim_x)
-        self.ekf.x = x0.copy()
-        self.ekf.P = np.eye(dim_x) * 1e2
-        self.ekf.P[3, 3] = self.cfg.p_dt  # clk
-        self.ekf.P[4, 4] = self.cfg.p_dt  # isb galileo
-        self.ekf.P[5, 5] = self.cfg.p_tro  # zwd
-
-        self.ekf.Q = np.zeros_like(self.ekf.P)
-        self.ekf.Q[3, 3] = self.cfg.q_dt
-        self.ekf.Q[4, 4] = self.cfg.q_dt
-        self.ekf.Q[5, 5] = self.cfg.q_tro
-
-        self.ekf.F = np.eye(dim_x)
-        self.ekf.F[3, 3] = 0.0  # model zegara: zresetuj co epokę (opcjonalnie)
-
-        # Inicjalizacja GPS: I_s, N1, N2
-        P4_gps = self.gps_obs.loc[(slice(None), first_ep), 'P4'].to_numpy()
-        for i, sv in enumerate(gps_sats):
-            idx_I = base_dim + 3 * i
-            idx_N1 = idx_I + 1
-            idx_N2 = idx_I + 2
-
-            I_init = P4_gps[i]  # zakładamy P4 ≈ I_s * (MU2 - 1)
-
-            self.ekf.x[idx_I] = I_init
-            self.ekf.P[idx_I, idx_I] = self.cfg.p_iono
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
-
-            self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
-            self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb
-
-        # Inicjalizacja Galileo: I_s, N1, N2
-        P4_gal = self.gal_obs.loc[(slice(None), first_ep), 'P4'].to_numpy()
-        for j, sv in enumerate(gal_sats):
-            k = n_gps + j  # Galileo są po GPS
-            idx_I = base_dim + 3 * k
-            idx_N1 = idx_I + 1
-            idx_N2 = idx_I + 2
-
-            I_init = P4_gal[j]  # analogicznie jak dla GPS
-
-            self.ekf.x[idx_I] = I_init
-            self.ekf.P[idx_I, idx_I] = self.cfg.p_amb
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
-
-            self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
-            self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb
-
-        return gps_sats, gal_sats, all_times
-
-
-    def _prepare_obs(self):
-        gps_data = _dual_mode_columns(self.gps_obs, self.gps_mode)
-        gal_data = _dual_mode_columns(self.gal_obs, self.gal_mode)
-        self.gps_obs = self.gps_obs.copy()
-        self.gal_obs = self.gal_obs.copy()
-
-        for col in _dual_rec_pco_columns(self.gps_mode):
-            if col not in self.gps_obs.columns.tolist():
-                self.gps_obs.loc[:, col] = 0.0
-        for col in _dual_rec_pco_columns(self.gal_mode):
-            if col not in self.gal_obs.columns.tolist():
-                self.gal_obs.loc[:, col] = 0.0
-
-        return gps_data, gal_data
-
-    def extract_ambiguities(self, x, P, n_sats, base_dim=5):
-        """
-        Wyciąga wektor ambiguł N1, N2 oraz ich macierz kowariancji z pełnego stanu i macierzy P.
-
-        Parameters:
-            x        -- wektor stanu EKF (1D array)
-            P        -- macierz kowariancji (2D array)
-            n_sats   -- liczba satelitów (czyli bloków [I_s, N1_s, N2_s])
-            base_dim -- liczba parametrów globalnych (default=5)
-
-        Returns:
-            N_vec    -- wektor [N1_1, N2_1, N1_2, N2_2, ..., N1_n, N2_n]
-            P_N      -- macierz kowariancji odpowiadająca N_vec
-        """
-        offsets = np.array([1, 2])
-        idxs_N = (base_dim + 3 * np.arange(n_sats)[:, None] + offsets[None, :]).ravel()
-        N_vec = x[idxs_N]
-        P_N = P[np.ix_(idxs_N, idxs_N)]
-
-        return N_vec, P_N
-
-    def code_screening(self, x, satellites, code_obs, thr=1):
-        sat_xyz = np.asarray(satellites, dtype=float)
-        ref_xyz = np.asarray(x, dtype=float)
-        dist = np.linalg.norm(sat_xyz - ref_xyz, axis=1)
-        prefit = code_obs-dist
-        median_prefit = np.median(prefit)
-        mask = (prefit >= (median_prefit - thr)) & (prefit <= (median_prefit + thr))
-        n_sat = len(prefit)
-        n_bad = np.count_nonzero(~mask)
-        if n_bad >n_sat/2:
-            mask = np.ones(n_sat,dtype=bool)
-        return mask
-
-    def run_filter(self, clk0=0.0, ref=None, flh=None, zwd0=0.0, trace_filter=False, reset_every=0):
-        old_gps_sats, old_gal_sats, all_times = self.init_filter(clk0=clk0, zwd0=zwd0)
-        gps_data, gal_data = self._prepare_obs()
-        agps, bgps, gps_c1, gps_c2, gps_l1, gps_l2 = gps_data
-        agal, bgal, gal_c1, gal_c2, gal_l1, gal_l2 = gal_data
-        result_rows = []
-        result_times = []
-        e, g = [], []
-        self.gps_obs = self.gps_obs.sort_values(by='sv')
-        self.gal_obs = self.gal_obs.sort_values(by='sv')
-        gps_epochs = {
-            t: df for t, df in self.gps_obs.groupby(level=1, sort=False)
-        }
-        gal_epochs = {
-            t: df for t, df in self.gal_obs.groupby(level=1, sort=False)
-        }
-        gps_osb_c1_col = f'OSB_{gps_c1}'
-        gps_osb_c2_col = f'OSB_{gps_c2}'
-        gps_osb_l1_col = f'OSB_{gps_l1}'
-        gps_osb_l2_col = f'OSB_{gps_l2}'
-        gal_osb_c1_col = f'OSB_{gal_c1}'
-        gal_osb_c2_col = f'OSB_{gal_c2}'
-        gal_osb_l1_col = f'OSB_{gal_l1}'
-        gal_osb_l2_col = f'OSB_{gal_l2}'
-        gps_has_osb_c1 = gps_osb_c1_col in self.gps_obs.columns
-        gps_has_osb_c2 = gps_osb_c2_col in self.gps_obs.columns
-        gps_has_osb_l1 = gps_osb_l1_col in self.gps_obs.columns
-        gps_has_osb_l2 = gps_osb_l2_col in self.gps_obs.columns
-        gal_has_osb_c1 = gal_osb_c1_col in self.gal_obs.columns
-        gal_has_osb_c2 = gal_osb_c2_col in self.gal_obs.columns
-        gal_has_osb_l1 = gal_osb_l1_col in self.gal_obs.columns
-        gal_has_osb_l2 = gal_osb_l2_col in self.gal_obs.columns
-        gps_sig1, gps_sig2 = _dual_mode_signals(self.gps_mode)
-        gal_sig1, gal_sig2 = _dual_mode_signals(self.gal_mode)
-        gps_pco1_col, gps_pco2_col = _dual_rec_pco_columns(self.gps_mode)
-        gal_pco1_col, gal_pco2_col = _dual_rec_pco_columns(self.gal_mode)
-        r_cache = {}
-        ar_cfg = PPPARSettings(
-            enabled=bool(getattr(self.cfg, "pppar_enabled", False)),
-            warmup_epochs=int(getattr(self.cfg, "pppar_warmup_epochs", 60)),
-            min_ambiguities=int(getattr(self.cfg, "pppar_min_ambiguities", 4)),
-            ratio_threshold=float(getattr(self.cfg, "pppar_ratio_threshold", 2.0)),
-            constraint_sigma_cycles=float(getattr(self.cfg, "pppar_constraint_sigma_cycles", 1e-3)),
-            constraint_sigma_floor_cycles=getattr(self.cfg, "pppar_constraint_sigma_floor_cycles", 1e-3),
-            min_lock_epochs=getattr(self.cfg, "pppar_min_lock_epochs", None),
-            min_candidate_elevation_deg=getattr(self.cfg, "pppar_min_candidate_elevation_deg", None),
-            use_float_ratio_covariance=bool(getattr(self.cfg, "pppar_use_float_ratio_covariance", True)),
-            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", False)),
-            partial_min_ambiguities=getattr(self.cfg, "pppar_partial_min_ambiguities", None),
-            wide_lane_max_frac_cycles=getattr(self.cfg, "pppar_wide_lane_max_frac_cycles", 0.25),
-        )
-        xyz = None
-        conv_time = None
-        T0 = all_times[0]
-        gps_arc_age = {sv: 0 for sv in old_gps_sats}
-        gal_arc_age = {sv: 0 for sv in old_gal_sats}
-        for num, t in enumerate(all_times):
-            reset_epoch = False
-            if reset_every != 0:
-                if ((num * self.interval) % reset_every == 0) and (num != 0):
-                    old_gps_sats, old_gal_sats = self.reset_filter(epoch=t)
-                    gps_arc_age = {sv: 0 for sv in old_gps_sats}
-                    gal_arc_age = {sv: 0 for sv in old_gal_sats}
-                    reset_epoch = True
-                    T0 = t
-            gps_epoch = gps_epochs.get(t)
-            gal_epoch = gal_epochs.get(t)
-            if gps_epoch is None or gal_epoch is None:
-                continue
-
-            def safe_get(df, col, length=None):
-                """Zwraca kolumnę jako numpy, a jeśli brak – wektor zer o podanej długości."""
-                if col in df.columns:
-                    return df[col].to_numpy(copy=False)
-                elif length is not None:
-                    return np.zeros(length)
-                else:
-                    return np.zeros(len(df))
-
-            # --- GPS ---
-            gps_cols = [
-                'clk', 'tro', 'ah_los',
-                'dprel', gps_pco1_col, gps_pco2_col,
-                f'sat_pco_los_{gps_sig1}',
-                f'sat_pco_los_{gps_sig2}',
-                'phw', 'me_wet'
-            ]
-            gps_len = len(gps_epoch)
-            (gps_clk, gps_tro, gps_ah_los, gps_dprel, gps_pco1, gps_pco2,
-             sat_pco_L1, sat_pco_L2, phw, mwet) = [safe_get(gps_epoch, c, gps_len) for c in gps_cols]
-
-            # --- Galileo ---
-            gal_cols = [
-                'clk', 'tro', 'ah_los',
-                'dprel', gal_pco1_col, gal_pco2_col,
-                f'sat_pco_los_{gal_sig1}',
-                f'sat_pco_los_{gal_sig2}',
-                'phw'
-            ]
-            gal_len = len(gal_epoch)
-            (gal_clk, gal_tro, gal_ah_los, gal_dprel, gal_pco1, gal_pco2,
-             sat_pco_E1, sat_pco_E5a, gal_phw) = [safe_get(gal_epoch, c, gal_len) for c in gal_cols]
-
-            curr_gps_sats = gps_epoch.index.get_level_values('sv').tolist()
-            curr_gal_sats = gal_epoch.index.get_level_values('sv').tolist()
-            if (curr_gps_sats != old_gps_sats) or (curr_gal_sats != old_gal_sats):
-                # Tworzymy słowniki P4 dla nowej epoki
-                P4_gps_dict = gps_epoch['P4'].to_dict()
-                P4_gal_dict = gal_epoch['P4'].to_dict()
-
-                # Aktualizacja stanu filtra EKF
-                self.ekf.x, self.ekf.P, self.ekf.Q = self.rebuild_state(
-                    x_old=self.ekf.x,
-                    P_old=self.ekf.P,
-                    Q_old=self.ekf.Q,
-                    prev_gps=old_gps_sats,
-                    prev_gal=old_gal_sats,
-                    curr_gps=curr_gps_sats,
-                    curr_gal=curr_gal_sats,
-                    P4_gps_dict=P4_gps_dict,
-                    P4_gal_dict=P4_gal_dict
-                )
-
-                self.ekf.dim_x = len(self.ekf.x)
-                self.ekf.dim_z = self.obs_per_sat * (len(curr_gps_sats) + len(curr_gal_sats))
-                self.ekf._I = np.eye(self.ekf.dim_x)
-                self.ekf.F = np.eye(self.ekf.dim_x)
-
-            old_gps_sats = curr_gps_sats
-            old_gal_sats = curr_gal_sats
-            gps_arc_age = {sv: gps_arc_age.get(sv, 0) for sv in curr_gps_sats}
-            gal_arc_age = {sv: gal_arc_age.get(sv, 0) for sv in curr_gal_sats}
-
-            tides = gps_epoch['tides_los'].to_numpy(copy=False)
-            gps_satellites = gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
-
-            gps_p1_c1 = osb_m(gps_epoch, gps_c1, gps_len)
-            gps_p2_c2 = osb_m(gps_epoch, gps_c2, gps_len)
-            gps_pl1_l1 = osb_m(gps_epoch, gps_l1, gps_len)
-            gps_pl2_l2 = osb_m(gps_epoch, gps_l2, gps_len)
-            gps_code_corr_c1, gps_code_corr_c2, _gps_dcb_total = split_dual_code_dsb_corrections_m(
-                gps_epoch,
-                gps_c1,
-                gps_c2,
-                coeff_1=agps,
-                coeff_2=bgps,
-                n=gps_len,
-            )
-            C1 = gps_epoch[gps_c1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p1_c1 + gps_code_corr_c1 - tides
-            C2 = gps_epoch[gps_c2].to_numpy(copy=False) - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_p2_c2 + gps_code_corr_c2 - tides
-            L1 = gps_epoch[gps_l1].to_numpy(copy=False) - gps_pco1 + sat_pco_L1 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl1_l1 - tides - (
-                self.CLIGHT / self.FREQ_DICT[gps_sig1]) * phw
-            L2 = gps_epoch[gps_l2].to_numpy(copy=False) - gps_pco2 + sat_pco_L2 + gps_clk * self.CLIGHT - gps_tro - gps_ah_los - gps_dprel - gps_pl2_l2 - tides - (
-                self.CLIGHT / self.FREQ_DICT[gps_sig2]) * phw
-
-            gal_tides = gal_epoch['tides_los'].to_numpy(copy=False)
-            gal_satellites = gal_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
-
-            gal_p1_c1 = osb_m(gal_epoch, gal_c1, gal_len)
-            gal_p2_c2 = osb_m(gal_epoch, gal_c2, gal_len)
-            gal_pl1_l1 = osb_m(gal_epoch, gal_l1, gal_len)
-            gal_pl2_l2 = osb_m(gal_epoch, gal_l2, gal_len)
-            gal_code_corr_c1, gal_code_corr_c2, _gal_dcb_total = split_dual_code_dsb_corrections_m(
-                gal_epoch,
-                gal_c1,
-                gal_c2,
-                coeff_1=agal,
-                coeff_2=bgal,
-                n=gal_len,
-            )
-            EC1 = gal_epoch[gal_c1].to_numpy(copy=False) - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_p1_c1 + gal_code_corr_c1 - gal_tides
-            EC2 = gal_epoch[gal_c2].to_numpy(copy=False) - gal_pco2 + sat_pco_E5a + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_p2_c2 + gal_code_corr_c2 - gal_tides
-            EL1 = gal_epoch[gal_l1].to_numpy(copy=False) - gal_pco1 + sat_pco_E1 + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_pl1_l1 - gal_tides - (
-                self.CLIGHT / self.FREQ_DICT[gal_sig1]) * gal_phw
-            EL2 = gal_epoch[gal_l2].to_numpy(copy=False) - gal_pco2 + sat_pco_E5a + gal_clk * self.CLIGHT - gal_tro - gal_ah_los - gal_dprel - gal_pl2_l2 - gal_tides - (
-                self.CLIGHT / self.FREQ_DICT[gal_sig2]) * gal_phw
-
-            if self.use_iono_constr:
-                IONO = gps_epoch['ion'].to_numpy(copy=False)
-                EIONO = gal_epoch['ion'].to_numpy(copy=False)
-                ZGPS = np.empty(5 * len(C1))
-                ZGPS[0::5] = C1
-                ZGPS[1::5] = L1
-                ZGPS[2::5] = C2
-                ZGPS[3::5] = L2
-                ZGPS[4::5] = IONO
-                ZGAL = np.empty(5 * len(EC1))
-                ZGAL[0::5] = EC1
-                ZGAL[1::5] = EL1
-                ZGAL[2::5] = EC2
-                ZGAL[3::5] = EL2
-                ZGAL[4::5] = EIONO
-            else:
-                ZGPS = np.empty(4 * len(C1))
-                ZGPS[0::4] = C1
-                ZGPS[1::4] = L1
-                ZGPS[2::4] = C2
-                ZGPS[3::4] = L2
-                ZGAL = np.empty(4 * len(EC1))
-                ZGAL[0::4] = EC1
-                ZGAL[1::4] = EL1
-                ZGAL[2::4] = EC2
-                ZGAL[3::4] = EL2
-
-            Z = np.concatenate((ZGPS, ZGAL))
-            gps_c1_mask = self.code_screening(x=self.ekf.x[:3],code_obs=C1,thr=30,satellites=gps_satellites[:,:3])
-            gps_c2_mask = self.code_screening(x=self.ekf.x[:3], code_obs=C2, thr=30, satellites=gps_satellites[:,:3])
-            gal_c1_mask = self.code_screening(x=self.ekf.x[:3], code_obs=EC1, thr=30, satellites=gal_satellites[:,:3])
-            gal_c2_mask = self.code_screening(x=self.ekf.x[:3], code_obs=EC2, thr=30, satellites=gal_satellites[:,:3])
-
-            # WEIGHTS GPS
-            ev_gps = np.deg2rad(gps_epoch['ev'].to_numpy(copy=False))
-            inv_sin_gps = 1.0 / np.sin(ev_gps)
-
-            # WEIGHTS GAL
-            ev_gal = np.deg2rad(gal_epoch['ev'].to_numpy(copy=False))
-            inv_sin_gal = 1.0 / np.sin(ev_gal)
-            if self.use_iono_constr:
-                R = np.empty(5 * len(C1))
-                R[0::5] = np.where(gps_c1_mask, inv_sin_gps, 1e12)
-                R[1::5] = 0.001 * inv_sin_gps
-                R[2::5] = np.where(gps_c2_mask, inv_sin_gps, 1e12)
-                R[3::5] = 0.001 * inv_sin_gps
-                R[4::5] = _iono_constraint_sigma(
-                    gps_epoch,
-                    num,
-                    self.interval,
-                    self.use_iono_rms,
-                    self.sigma_iono_0,
-                    self.sigma_iono_end,
-                    self.t_end,
-                )
-
-                RG = np.empty(5 * len(EC1))
-                RG[0::5] = np.where(gal_c1_mask, inv_sin_gal, 1e12)
-                RG[1::5] = 0.001 * inv_sin_gal
-                RG[2::5] = np.where(gal_c2_mask, inv_sin_gal, 1e12)
-                RG[3::5] = 0.001 * inv_sin_gal
-                RG[4::5] = _iono_constraint_sigma(
-                    gal_epoch,
-                    num,
-                    self.interval,
-                    self.use_iono_rms,
-                    self.sigma_iono_0,
-                    self.sigma_iono_end,
-                    self.t_end,
-                )
-            else:
-                R = np.empty(4 * len(C1))
-                R[0::4] = np.where(gps_c1_mask, inv_sin_gps, 1e12)
-                R[1::4] = 0.001 * inv_sin_gps
-                R[2::4] = np.where(gps_c2_mask, inv_sin_gps, 1e12)
-                R[3::4] = 0.001 * inv_sin_gps
-
-                RG = np.empty(4 * len(EC1))
-                RG[0::4] = np.where(gal_c1_mask, inv_sin_gal, 1e12)
-                RG[1::4] = 0.001 * inv_sin_gal
-                RG[2::4] = np.where(gal_c2_mask, inv_sin_gal, 1e12)
-                RG[3::4] = 0.001 * inv_sin_gal
-
-            r_diag = np.concatenate((R, RG))
-            r_diag = np.nan_to_num(r_diag, nan=1e12, posinf=1e12, neginf=1e12)
-            m = r_diag.size
-            R = r_cache.get(m)
-            if R is None:
-                R = np.zeros((m, m), dtype=np.float64)
-                r_cache[m] = R
-            else:
-                R.fill(0.0)
-            R.flat[::m + 1] = r_diag
-            self.ekf.R = R
-            updated = False
-            for k in range(5):
-                try:
-                    self.ekf.predict_update(
-                        z=Z,
-                        HJacobian=self.Hjacobian,
-                        args=(gps_satellites, gal_satellites),
-                        Hx=self.Hx,
-                        hx_args=(gps_satellites, gal_satellites),
-                    )
-                    updated = True
-                    break
-                except np.linalg.LinAlgError:
-                    jitter = 1e-6 * (10.0 ** k)
-                    self.ekf.R.flat[::m + 1] += jitter
-            if not updated:
-                if trace_filter:
-                    ppp_trace(
-                        trace_filter,
-                        self.__class__.__name__,
-                        "singular-update-reset",
-                        epoch=num,
-                        time=t,
-                    )
-                old_gps_sats, old_gal_sats = self.reset_filter(epoch=t)
-                gps_arc_age = {sv: 0 for sv in old_gps_sats}
-                gal_arc_age = {sv: 0 for sv in old_gal_sats}
-                continue
-            gps_arc_age = advance_arc_age(gps_arc_age, curr_gps_sats)
-            gal_arc_age = advance_arc_age(gal_arc_age, curr_gal_sats)
-            gps_ar_age = arc_age_array(gps_arc_age, curr_gps_sats)
-            gal_ar_age = arc_age_array(gal_arc_age, curr_gal_sats)
-            ar_diag = None
-            if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
-                self.ekf.x, self.ekf.P, ar_diag = apply_uncombined_pppar(
-                    x=self.ekf.x,
-                    P=self.ekf.P,
-                    base_dim=self.base_dim,
-                    n_gps=len(curr_gps_sats),
-                    n_gal=len(curr_gal_sats),
-                    gps_ev=gps_epoch['ev'].to_numpy(copy=False),
-                    gal_ev=gal_epoch['ev'].to_numpy(copy=False),
-                    settings=ar_cfg,
-                    gps_age=gps_ar_age,
-                    gal_age=gal_ar_age,
-                )
-            if not reset_epoch or reset_every == 0:
-                if xyz is not None:
-                    position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
-
-                    # If convergence time is not set and position difference is small, set the convergence time
-                    if conv_time is None and position_diff < 0.005:
-                        conv_time = t - T0  # Set the convergence time
-                    elif position_diff > 0.005:  # Reset convergence time if position change exceeds threshold
-                        conv_time = None  # Reset the convergence time
-
-            xyz = self.ekf.x[:3].copy()
-            dtr = self.ekf.x[3]
-            isb = self.ekf.x[4]
-            ztd = self.ekf.x[5]
-            stec = self.ekf.x[self.base_dim:][::3]
-            n1 = self.ekf.x[self.base_dim:][1::3]
-            n2 = self.ekf.x[self.base_dim:][2::3]
-
-            gps_stec = stec[:len(curr_gps_sats)]
-            gal_stec = stec[len(curr_gps_sats):]
-            n1_gps = n1[:len(curr_gps_sats)]
-            n2_gps = n2[:len(curr_gps_sats)]
-
-            n1_gal = n1[len(curr_gps_sats):]
-            n2_gal = n2[len(curr_gps_sats):]
-
-            gps_epoch['stec'] = gps_stec
-            gps_epoch['n1'] = n1_gps
-            gps_epoch['n2'] = n2_gps
-
-
-            gal_epoch['stec'] = gal_stec
-            gal_epoch['n1'] = n1_gal
-            gal_epoch['n2'] = n2_gal
-            g.append(gps_epoch)
-            e.append(gal_epoch)
-            if ref is not None and flh is not None:
-                dx = ref - self.ekf.x[:3]
-                enu = np.array(ecef_to_enu(dXYZ=dx, flh=flh, degrees=True)).flatten()
-            else:
-                enu = np.zeros(3)
-            result_rows.append({
-                'de': enu[0],
-                'dn': enu[1],
-                'du': enu[2],
-                'dtr': dtr,
-                'ztd': ztd,
-                'x': xyz[0],
-                'y': xyz[1],
-                'z': xyz[2],
-                'isb': isb,
-                'ar_fixed': 0 if ar_diag is None else int(ar_diag.fixed_ambiguities),
-                'ar_ratio': np.nan if ar_diag is None or ar_diag.ratio_min is None else float(ar_diag.ratio_min),
-                'ar_ok': False if ar_diag is None else bool(ar_diag.accepted),
-                'ar_gps_min_age': int(np.min(gps_ar_age)) if gps_ar_age.size else np.nan,
-                'ar_gal_min_age': int(np.min(gal_ar_age)) if gal_ar_age.size else np.nan,
-            })
-            result_rows[-1].update(pppar_diagnostic_columns(ar_diag))
-            if ar_diag is not None:
-                result_rows[-1]['ar_fixed'] = int(ar_diag.fixed_ambiguities)
-                result_rows[-1]['ar_ratio'] = np.nan if ar_diag.ratio_min is None else float(ar_diag.ratio_min)
-                result_rows[-1]['ar_ok'] = bool(ar_diag.accepted)
-            result_times.append(t)
-            if trace_filter:
-                ppp_trace_epoch(
-                    trace_filter,
-                    self.__class__.__name__,
-                    epoch=num,
-                    time=t,
-                    row=result_rows[-1],
-                )
-        if conv_time is not None:
-            if trace_filter:
-                ppp_trace(
-                    trace_filter,
-                    self.__class__.__name__,
-                    "convergence",
-                    threshold_m=0.005,
-                    minutes=conv_time.total_seconds() / 60,
-                    hours=conv_time.total_seconds() / 3600,
-                )
-            ct = conv_time.total_seconds() / 3600
-        else:
-            ct = None
-        gps_result = pd.concat(g)
-        gal_result = pd.concat(e)
-        result = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time'))
-        result['ct_min']=ct
-        return result, gps_result, gal_result, ct
+        # contracts C1 / C2 (bug-fix stage 13b): {system: residual frame}, ct_min [min]
+        result = finish_solution(pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time')),
+                                 conv_time)
+        residuals = residual_frames({"G": gps_results, "E": gal_results}, {"G": self.gps_obs, "E": self.gal_obs},
+                                    self.RESIDUAL_COLUMNS)
+        return result, residuals, None, convergence_hours(conv_time)
 
 
 class PPPUdSingleGNSS:
@@ -4496,10 +3303,11 @@ class PPPUdSingleGNSS:
         ionosphere datum from absorbing all code-bias mismatch.
 
     PPP-AR support:
-        Uses indexed uncombined AR when enabled and when lock-age/candidate
-        gates pass.
-        BeiDou AR is disabled in current uncombined paths until BDS phase-bias
-        handling is validated.
+        Uses uncombined wide-lane/narrow-lane AR when enabled, for satellites
+        with product phase biases, once lock-age/candidate gates pass.
+        BeiDou AR runs only when the bias product gives BDS phase biases
+        (e.g. GRG L2I/L6I; COD MGEX has none) and is less validated than GPS
+        and Galileo AR.
 
     Limitations:
         This class is numerically sensitive to the ionosphere/bias datum. Any
@@ -4532,21 +3340,25 @@ class PPPUdSingleGNSS:
             # second-frequency receiver signal bias as rx_dcb_m.
             self.rx_dcb_col = self.base_dim + 1
             self.base_dim += 2
-        if self.use_iono_constr and self.obs is not None:
-            if 'ion' not in self.obs.columns:
-                raise ValueError("use_iono_constr requires an 'ion' column in observations.")
-            self.obs = self.obs.dropna(subset=['ion'])
-            if self.use_iono_rms and 'ion_rms' in self.obs.columns:
-                self.obs = self.obs.dropna(subset=['ion_rms'])
-        elif self.obs is None:
-            self.use_iono_constr = False
-        self.obs_per_sat = 5 if self.use_iono_constr else 4
         try:
             sig1, _ = _dual_mode_signals(self.mode)
             self.system = SIGNALS[sig1].system
         except Exception:
             # Fallback for unexpected single-frequency modes (should not happen for PPPUdSingleGNSS).
             self.system = "G"
+        self.iono_dsb_alignment = {}
+        if self.use_iono_constr and self.obs is not None:
+            if 'ion' not in self.obs.columns:
+                raise ValueError("use_iono_constr requires an 'ion' column in observations.")
+            # the GIM in the satellite code-bias datum (bug-fix stage 13d), before the rows without a model value go
+            self.obs, self.iono_dsb_alignment[self.system] = _align_iono_model_to_code_biases(
+                self.obs, self.mode, self.system, self.cfg)
+            self.obs = self.obs.dropna(subset=['ion'])
+            if self.use_iono_rms and 'ion_rms' in self.obs.columns:
+                self.obs = self.obs.dropna(subset=['ion_rms'])
+        elif self.obs is None:
+            self.use_iono_constr = False
+        self.obs_per_sat = 5 if self.use_iono_constr else 4
 
     def _rx_dcb_coefficients(self) -> tuple[float, float]:
         sig1, sig2 = _dual_mode_signals(self.mode)
@@ -4565,7 +3377,7 @@ class PPPUdSingleGNSS:
         self.ekf.P[idx_c1, idx_c1] = 1e-12
         self.ekf.Q[idx_c1, idx_c1] = 0.0
         self.ekf.P[idx_c2, idx_c2] = self.cfg.p_dcb
-        self.ekf.Q[idx_c2, idx_c2] = self.cfg.q_dcb
+        self.ekf.Q[idx_c2, idx_c2] = random_walk_variance(self.cfg.q_dcb, self.interval)
 
     def _anchor_rx_signal_bias_datum(self) -> None:
         if not self._has_rx_signal_bias_states():
@@ -4583,22 +3395,19 @@ class PPPUdSingleGNSS:
         ):
             self.ekf.F[3, 3] = 0.0
 
-    def _single_iono_obs_variances(self, ev_deg: np.ndarray, n_sats: int) -> tuple[np.ndarray, np.ndarray]:
-        if self.use_iono_constr and bool(getattr(self.cfg, "uncombined_iono_legacy_weighting", True)):
-            inv_sin = _elevation_variance_scale(ev_deg)
-            code_var = (
-                float(getattr(self.cfg, "uncombined_iono_code_var_base", 0.3))
-                + float(getattr(self.cfg, "uncombined_iono_code_var_elev_coeff", 0.0025)) * inv_sin
-            )
-            phase_var = (
-                float(getattr(self.cfg, "uncombined_iono_phase_var_base", 1e-4))
-                + float(getattr(self.cfg, "uncombined_iono_phase_var_elev_coeff", 0.0003)) * inv_sin
-            )
-            return code_var, phase_var
+    #: columns the filter adds to the observation rows in its residual frame
+    RESIDUAL_COLUMNS = (
+        "system", "dtr", "ztd", "prefit_code_res_1", "prefit_phase_res_1", "prefit_code_res_2", "prefit_phase_res_2",
+        "postfit_code_res_1", "postfit_phase_res_1", "postfit_code_res_2", "postfit_phase_res_2", "code_used_1",
+        "code_used_2", "code_dcb_corr_1", "code_dcb_corr_2", "dcb_total_m", "rx_dcb_m", "rx_code_bias_1_m",
+        "rx_code_bias_2_m", "I_state", "N1_state", "N2_state",
+    )
 
-        code_var = float(getattr(self.cfg, "uncombined_code_var", 1.0))
-        phase_var = float(getattr(self.cfg, "uncombined_phase_var", 1.0))
-        return np.full(n_sats, code_var, dtype=float), np.full(n_sats, phase_var, dtype=float)
+    def _single_iono_obs_variances(self, ev_deg: np.ndarray, n_sats: int) -> tuple[np.ndarray, np.ndarray]:
+        ev_deg = np.broadcast_to(np.asarray(ev_deg, dtype=float), (n_sats,))
+        if self.use_iono_constr:
+            return _constrained_obs_variances(self.cfg, ev_deg, self.system)
+        return _uncombined_obs_variances(self.cfg, ev_deg)
 
     def _code_bias_correction_m(self, epoch: pd.DataFrame, code_col: str, n: int) -> np.ndarray:
         """Return additive observable-specific code bias correction (meters)."""
@@ -4820,9 +3629,12 @@ class PPPUdSingleGNSS:
             idx_N1 = idx_I + 1
             idx_N2 = idx_I + 2
             P_new[idx_I, idx_I] = self.cfg.p_iono#100.0
-            Q_new[idx_I, idx_I] = self.cfg.q_iono * (self.interval * 60) / 3600
+            Q_new[idx_I, idx_I] = random_walk_variance(self.cfg.q_iono, self.interval)
             P_new[idx_N1, idx_N1] = self.cfg.p_amb#1e6
             P_new[idx_N2, idx_N2] = self.cfg.p_amb#1e6
+            # PPP-064 (bug-fix stage 13b): q_amb on every ambiguity (it was ignored by this filter)
+            Q_new[idx_N1, idx_N1] = random_walk_variance(self.cfg.q_amb, self.interval)
+            Q_new[idx_N2, idx_N2] = random_walk_variance(self.cfg.q_amb, self.interval)
 
         return x_new, P_new, Q_new
 
@@ -4850,8 +3662,9 @@ class PPPUdSingleGNSS:
         epoch0 = self.obs.loc[(slice(None), epoch), :]
         I_init = self._initial_iono_values(epoch0)
         self.ekf.Q = np.zeros_like(self.ekf.P)
-        self.ekf.Q[3, 3] = self.cfg.q_dt * (self.interval * 60) / 3600 #9e9
-        self.ekf.Q[4, 4] = self.cfg.q_tro#0.025
+        self.ekf.Q[3, 3] = self.cfg.q_dt  # per epoch, as init_filter (was scaled to hours here only)
+        self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_tro, self.interval)
+        _init_coordinate_states(self.ekf, self.cfg)
         self._init_rx_signal_bias_states()
         self._configure_transition_matrix()
 
@@ -4860,10 +3673,12 @@ class PPPUdSingleGNSS:
             idx_N1 = idx_I + 1
             idx_N2 = idx_I + 2
             self.ekf.P[idx_I, idx_I] =self.cfg.p_iono# 100
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono* (self.interval * 60) / 3600
+            self.ekf.Q[idx_I, idx_I] = random_walk_variance(self.cfg.q_iono, self.interval)
             self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb #1e6
 
             self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb #1e6
+            self.ekf.Q[idx_N1, idx_N1] = random_walk_variance(self.cfg.q_amb, self.interval)  # PPP-064
+            self.ekf.Q[idx_N2, idx_N2] = random_walk_variance(self.cfg.q_amb, self.interval)
             self.ekf.x[idx_I] = I_init[k]  # seed I_s from the selected ionosphere model constraint
 
         return sats0
@@ -4895,7 +3710,8 @@ class PPPUdSingleGNSS:
         I_init = self._initial_iono_values(first_epoch)
         self.ekf.Q = np.zeros_like(self.ekf.P)
         self.ekf.Q[3, 3] = self.cfg.q_dt #9e9
-        self.ekf.Q[4, 4] = self.cfg.q_tro #0.025
+        self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_tro, self.interval)
+        _init_coordinate_states(self.ekf, self.cfg)
         self._init_rx_signal_bias_states()
         self._configure_transition_matrix()
 
@@ -4904,10 +3720,12 @@ class PPPUdSingleGNSS:
             idx_N1 = idx_I + 1
             idx_N2 = idx_I + 2
             self.ekf.P[idx_I, idx_I] = self.cfg.p_iono #100
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono * (self.interval * 60) / 3600#25
+            self.ekf.Q[idx_I, idx_I] = random_walk_variance(self.cfg.q_iono, self.interval)
             self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb#1e6
 
             self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb #1e6
+            self.ekf.Q[idx_N1, idx_N1] = random_walk_variance(self.cfg.q_amb, self.interval)  # PPP-064
+            self.ekf.Q[idx_N2, idx_N2] = random_walk_variance(self.cfg.q_amb, self.interval)
             self.ekf.x[idx_I] = I_init[k]  # seed I_s from the selected ionosphere model constraint
 
         return sats0, gps_epochs
@@ -4925,17 +3743,17 @@ class PPPUdSingleGNSS:
 
     def extract_ambiguities(self, x, P, n_sats, base_dim=5):
         """
-        Wyciąga wektor ambiguł N1, N2 oraz ich macierz kowariancji z pełnego stanu i macierzy P.
+        Ambiguity vector N1, N2 and its covariance matrix from the full state and the matrix P.
 
         Parameters:
-            x        -- wektor stanu EKF (1D array)
-            P        -- macierz kowariancji (2D array)
-            n_sats   -- liczba satelitów (czyli bloków [I_s, N1_s, N2_s])
-            base_dim -- liczba parametrów globalnych (default=5)
+            x        -- EKF state vector (1D array)
+            P        -- covariance matrix (2D array)
+            n_sats   -- number of satellites (blocks [I_s, N1_s, N2_s])
+            base_dim -- number of global parameters (default=5)
 
         Returns:
-            N_vec    -- wektor [N1_1, N2_1, N1_2, N2_2, ..., N1_n, N2_n]
-            P_N      -- macierz kowariancji odpowiadająca N_vec
+            N_vec    -- vector [N1_1, N2_1, N1_2, N2_2, ..., N1_n, N2_n]
+            P_N      -- covariance matrix of N_vec
         """
         offsets = np.array([1, 2])
         idxs_N = (base_dim + 3 * np.arange(n_sats)[:, None] + offsets[None, :]).ravel()
@@ -4976,8 +3794,6 @@ class PPPUdSingleGNSS:
         gps_has_osb_c2 = gps_osb_c2_col in self.obs.columns
         gps_has_osb_l1 = gps_osb_l1_col in self.obs.columns
         gps_has_osb_l2 = gps_osb_l2_col in self.obs.columns
-        code_var = float(getattr(self.cfg, "uncombined_code_var", 1.0))
-        phase_var = float(getattr(self.cfg, "uncombined_phase_var", 1.0))
         code_prefit_threshold = float(getattr(self.cfg, "uncombined_code_prefit_threshold", 30.0))
         phase_screen_enabled = bool(getattr(self.cfg, "uncombined_phase_screen", False))
         phase_screen_threshold = float(getattr(self.cfg, "uncombined_phase_screen_threshold", 10.0))
@@ -5010,22 +3826,28 @@ class PPPUdSingleGNSS:
             min_lock_epochs=getattr(self.cfg, "pppar_min_lock_epochs", None),
             min_candidate_elevation_deg=getattr(self.cfg, "pppar_min_candidate_elevation_deg", None),
             use_float_ratio_covariance=bool(getattr(self.cfg, "pppar_use_float_ratio_covariance", True)),
-            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", False)),
+            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", True)),
             partial_min_ambiguities=getattr(self.cfg, "pppar_partial_min_ambiguities", None),
             wide_lane_max_frac_cycles=getattr(self.cfg, "pppar_wide_lane_max_frac_cycles", 0.25),
+            hold=bool(getattr(self.cfg, "pppar_fix_and_hold", False)),
         )
         xyz = None
+        conv_xyz = None  # previous float position (convergence check)
         conv_time = None
         T0 = all_epochs[0]
-        arc_age = {sv: 0 for sv in old_sats}
+        arc_age: dict = {}  # PPP-069: the first advance_arc_age gives 0
         phase_traces_1: dict[int, dict[str, float]] = {}
         phase_traces_2: dict[int, dict[str, float]] = {}
+        ar_float_state = None
         for num, t in enumerate(epochs):
+            # the previous epoch was reported fixed; without fix-and-hold the filter continues float
+            restore_float_state(self.ekf, ar_float_state)
+            ar_float_state = None
             reset_epoch = False
             if reset_every != 0:
                 if ((num * self.interval) % reset_every == 0) and (num != 0):
                     old_sats = self.reset_filter(epoch=t)
-                    arc_age = {sv: 0 for sv in old_sats}
+                    arc_age = {}  # PPP-069: every arc restarts at age 0
                     reset_epoch = True
                     T0 = t
             gps_epoch = obs_epochs.get(t)
@@ -5033,7 +3855,7 @@ class PPPUdSingleGNSS:
                 continue
 
             def safe_get(df, col, length=None):
-                """Zwraca kolumnę jako numpy, a jeśli brak – wektor zer o podanej długości."""
+                """The column as a NumPy array; a vector of zeros of the given length when it is missing."""
                 if col in df.columns:
                     return df[col].to_numpy(copy=False)
                 elif length is not None:
@@ -5071,7 +3893,6 @@ class PPPUdSingleGNSS:
                 self._seed_iono_states_from_epoch(curr_sats, gps_epoch, new_sats)
 
             old_sats = curr_sats
-            arc_age = {sv: arc_age.get(sv, 0) for sv in curr_sats}
 
             tides = gps_epoch['tides_los'].to_numpy(copy=False)
             gps_satellites = gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
@@ -5205,6 +4026,9 @@ class PPPUdSingleGNSS:
 
             if self.use_iono_constr:
                 code_var_epoch, phase_var_epoch = self._single_iono_obs_variances(gps_ev, n_sats)
+                # NQ-SPP-33 (author decision 2026-10-15): BDS-3 codes not moved to the clock datum are down-weighted
+                code_var_epoch = code_var_epoch + unmoved_code_variance_m2(self.cfg, self.system, gps_epoch,
+                                                                                   uncombined=True)
                 R_diag = np.ones(5 * n_sats, dtype=float)
                 R_diag[0::5] = np.where(gps_c1_mask, code_var_epoch, 1e12)
                 R_diag[2::5] = np.where(gps_c2_mask, code_var_epoch, 1e12)
@@ -5221,6 +4045,10 @@ class PPPUdSingleGNSS:
                     self.t_end,
                 )
             else:
+                code_var, phase_var = self._single_iono_obs_variances(gps_ev, n_sats)
+                # NQ-SPP-33 (author decision 2026-10-15): BDS-3 codes not moved to the clock datum are down-weighted
+                code_var = code_var + unmoved_code_variance_m2(self.cfg, self.system, gps_epoch,
+                                                                       uncombined=True)
                 R_diag = np.ones(4 * n_sats, dtype=float)
                 both_code_rejected = (~gps_c1_mask) & (~gps_c2_mask)
                 R_diag[0::4] = np.where(gps_c1_mask, code_var, 1e12)
@@ -5239,17 +4067,27 @@ class PPPUdSingleGNSS:
             R.flat[::m + 1] = R_diag
             self.ekf.R = R
 
-            self.ekf.predict_update(z=Z,
-                                    HJacobian=self.Hjacobian,
-                                    args=(gps_satellites,),
-                                    Hx=self.Hx,
-                                    hx_args=(gps_satellites,))
+            # receiver clock prior from the code rows of both bands (RTKLIB udclk_ppp; bug-fix stage 13b, A1(b))
+            code_rows = (rows_per_sat * np.arange(n_sats)[:, None] + np.array([0, 2])[None, :]).ravel()
+            self.ekf.state_priors = clock_priors(self.cfg.clock_prior_sigma_m, code_rows)
+            with epoch_process_noise(self.ekf, t, self.interval):
+                self.ekf.predict_update(z=Z,
+                                        HJacobian=self.Hjacobian,
+                                        args=(gps_satellites,),
+                                        Hx=self.Hx,
+                                        hx_args=(gps_satellites,))
             self._anchor_rx_signal_bias_datum()
             arc_age = advance_arc_age(arc_age, curr_sats, phase_reset_svs)
             ar_age = arc_age_array(arc_age, curr_sats)
             postfit = Z - self.Hx(self.ekf.x, gps_satellites)
             ar_diag = None
             if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
+                # float phase residuals and weights: rows 1 / 3 of each satellite carry N1 / N2 (C3, NQ-PPP-20)
+                sat = np.arange(n_sats)[:, None]
+                ar_inputs = ar_phase_kwargs(postfit, np.diag(self.ekf.R),
+                                            (rows_per_sat * sat + np.array([1, 3])).ravel(),
+                                            (self.base_dim + 3 * sat + np.array([1, 2])).ravel(), ekf=self.ekf)
+                ar_float_state = keep_float_state(self.ekf, ar_cfg)
                 self.ekf.x, self.ekf.P, ar_diag = apply_uncombined_pppar(
                     x=self.ekf.x,
                     P=self.ekf.P,
@@ -5260,11 +4098,13 @@ class PPPUdSingleGNSS:
                     gal_ev=np.empty(0, dtype=float),
                     settings=ar_cfg,
                     gps_age=ar_age,
+                    gps_eligible=ar_eligible_mask(gps_epoch),
+                    **ar_inputs,
                 )
 
             if not reset_epoch or reset_every == 0:
                 if xyz is not None:
-                    position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
+                    position_diff = np.linalg.norm(float_position(self.ekf, ar_float_state) - conv_xyz)
 
                     # If convergence time is not set and position difference is small, set the convergence time
                     if conv_time is None and position_diff < 0.005:
@@ -5272,6 +4112,7 @@ class PPPUdSingleGNSS:
                     elif position_diff > 0.005:  # Reset convergence time if position change exceeds threshold
                         conv_time = None  # Reset the convergence time
             xyz = self.ekf.x[:3].copy()
+            conv_xyz = float_position(self.ekf, ar_float_state)
             dtr = self.ekf.x[3].copy()
             ztd = self.ekf.x[4].copy()
             if ref is not None and flh is not None:
@@ -5379,23 +4220,21 @@ class PPPUdSingleGNSS:
                     time=t,
                     row=result_rows[-1],
                 )
-        if conv_time is not None:
-            if trace_filter:
-                ppp_trace(
-                    trace_filter,
-                    self.__class__.__name__,
-                    "convergence",
-                    threshold_m=0.005,
-                    minutes=conv_time.total_seconds() / 60,
-                    hours=conv_time.total_seconds() / 3600,
-                )
-            ct = conv_time.total_seconds() / 3600
-        else:
-            ct = None
-        output = pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time'))
-        output['ct_min'] = ct
-        residuals = pd.concat(obs_result) if obs_result else None
-        return output, residuals, residuals, ct
+        if conv_time is not None and trace_filter:
+            ppp_trace(
+                trace_filter,
+                self.__class__.__name__,
+                "convergence",
+                threshold_m=0.005,
+                minutes=conv_time.total_seconds() / 60,
+                hours=conv_time.total_seconds() / 3600,
+            )
+        # contracts C1 / C2 (bug-fix stage 13b, PPP-033): {system: residual frame} (the frame was returned twice, so
+        # a GPS run filled residuals_gal with a copy), ct_min [min]
+        output = finish_solution(pd.DataFrame(result_rows, index=pd.DatetimeIndex(result_times, name='time')),
+                                 conv_time)
+        residuals = residual_frames({self.system: obs_result}, {self.system: self.obs}, self.RESIDUAL_COLUMNS)
+        return output, residuals, None, convergence_hours(conv_time)
 
 
 class PPPFilterMultiGNSSIonConst:
@@ -5437,10 +4276,14 @@ class PPPFilterMultiGNSSIonConst:
         numerical model changes.
     """
 
+    #: columns of the per-satellite residual frames: slant ionosphere, ambiguities, corrected code and
+    #: phase [m] and their innovations
+    RESIDUAL_COLUMNS = ("Idelay", "n1", "n2", "C1", "L1", "C2", "L2", "vc1", "vl1", "vc2", "vl2")
+
     def __init__(self, config: PPPConfig, gps_obs, gps_mode, gal_obs, gal_mode, ekf, pos0, tro=True, est_dcb=False,
                  interval=0.5,
                  use_iono_rms=True, sigma_iono_0=1.1,
-                 sigma_iono_end=2.3, t_end=30):
+                 sigma_iono_end=3.0, t_end=30):
         """
 
         :param gps_obs: pd.DataFrame, gps observations
@@ -5455,7 +4298,8 @@ class PPPFilterMultiGNSSIonConst:
         :param use_iono_rms: bool, use Ionospheric constraints
         :param sigma_iono_0: [float, int] ionospheric contraint error at first epoch
         :param sigma_iono_end:  [float, int] ionospheric constraint error at last epoch
-        :param t_end: int, epoch number after which sigma_iono stops at sigma_iono_end
+        :param t_end: [float, int] length [min] of the constraint ramp from sigma_iono_0 to
+            sigma_iono_end (PPPConfig.t_end; the ramp counts from the first epoch)
         """
         self.cfg = config
         self.gps_obs = gps_obs
@@ -5468,9 +4312,20 @@ class PPPFilterMultiGNSSIonConst:
         self.CLIGHT = 299792458
         self.base_dim = 6 if tro else 5  # X,Y,Z,clk,ISB_gal,ZTD
         self.est_dcb = est_dcb
+        # receiver signal-bias states also in the phase rows (uncombined_iono_signal_bias_phase_jacobian),
+        # in Hjacobian and Hx alike; the Jacobian alone had them, so every epoch the phase residuals
+        # missed the L2/E5a code-bias state (metres) and the update pushed it into ZTD and height
+        # (PPP-061, 2-4 m height error in the first minutes, hidden by the loose q_tro before PPP-060)
+        self._phase_signal_bias = bool(getattr(config, "uncombined_iono_signal_bias_phase_jacobian", True))
         self.pos0 = pos0
         self.interval = interval
         # --------
+        # the GIM in the satellite code-bias datum (bug-fix stage 13d), before the rows without a model value go
+        self.iono_dsb_alignment = {}
+        self.gps_obs, self.iono_dsb_alignment["G"] = _align_iono_model_to_code_biases(
+            self.gps_obs, self.gps_mode, "G", self.cfg)
+        self.gal_obs, self.iono_dsb_alignment["E"] = _align_iono_model_to_code_biases(
+            self.gal_obs, self.gal_mode, "E", self.cfg)
         self.gps_obs = self.gps_obs.dropna(subset=['ion'])
         self.gal_obs = self.gal_obs.dropna(subset=['ion'])
         if 'ion_rms' in self.gps_obs.columns:
@@ -5478,9 +4333,19 @@ class PPPFilterMultiGNSSIonConst:
         if 'ion_rms' in self.gal_obs.columns:
             self.gal_obs = self.gal_obs.dropna(subset=['ion_rms'])
         self.use_iono_rms = use_iono_rms
-        self.sigma_iono_0 = sigma_iono_0
-        self.sigma_iono_end = sigma_iono_end
-        self.t_end = t_end
+        # None (allowed by PPPConfig, the default of sigma_iono_end) takes the defaults of this route:
+        # sigma_iono_end 3.0, as the other dual-frequency constrained filters (author decision NQ-PPP-22,
+        # revised in bug-fix stage 9: the former 2.3 compensated the PPP-061 model mismatch; after its fix
+        # 3.0 converges faster on every static and storm R4c row, e.g. NYA2 6 h t_c10 91 -> 82.5 min, finals
+        # within 0.06 cm; kinematic BRUX RMS -0.66 cm on the pre-stage-9 GIM, +0.26 cm with the stage-9 GIM)
+        self.sigma_iono_0 = 1.1 if sigma_iono_0 is None else sigma_iono_0
+        self.sigma_iono_end = 3.0 if sigma_iono_end is None else sigma_iono_end
+        self.t_end = 30 if t_end is None else t_end
+
+    def _configure_transition_matrix(self):
+        self.ekf.F = np.eye(self.ekf.dim_x)
+        if not bool(getattr(self.cfg, "uncombined_iono_clock_identity", True)):
+            self.ekf.F[3, 3] = 0.0  # receiver clock re-estimated every epoch, as R7
 
     def dcb_param_indices(self, n_gps, n_gal):
         """
@@ -5569,9 +4434,10 @@ class PPPFilterMultiGNSSIonConst:
             if self.est_dcb:
                 dcb_base = base_dim + 3 * (n_gps + n_gal)
                 H[row + 0, dcb_base + 0] = 1.0  # DCB_C1_GPS
-                H[row + 1, dcb_base + 0] = 1.0  # DCB_L1_GPS==C1
                 H[row + 2, dcb_base + 1] = 1.0  # DCB_C2_GPS
-                H[row + 3, dcb_base + 1] = 1.0  # DCB_L2_GPS==C2
+                if self._phase_signal_bias:  # same terms as Hx
+                    H[row + 1, dcb_base + 0] = 1.0  # DCB_L1_GPS==C1
+                    H[row + 3, dcb_base + 1] = 1.0  # DCB_L2_GPS==C2
 
                 # ROZW tez na L1 i L2 ?
             H[row + 4, col_iono] = 1.0  # constraint
@@ -5597,9 +4463,10 @@ class PPPFilterMultiGNSSIonConst:
             if self.est_dcb:
                 dcb_base = base_dim + 3 * (n_gps + n_gal)
                 H[row + 0, dcb_base + 2] = 1.0  # DCB_C1_GAL
-                H[row + 1, dcb_base + 2] = 1.0  # DCB_L1_GAL==C1
                 H[row + 2, dcb_base + 3] = 1.0  # DCB_C2_GAL
-                H[row + 3, dcb_base + 3] = 1.0  # DCB_C2_GAL==C2
+                if self._phase_signal_bias:  # same terms as Hx
+                    H[row + 1, dcb_base + 2] = 1.0  # DCB_L1_GAL==C1
+                    H[row + 3, dcb_base + 3] = 1.0  # DCB_C2_GAL==C2
             H[row + 4, col_iono] = 1.0
         return H
 
@@ -5631,6 +4498,8 @@ class PPPFilterMultiGNSSIonConst:
         isb = x[4]
         zwd = x[5]
         dcb = x[-4:] if self.est_dcb else np.zeros(8)
+        # receiver signal-bias terms of the phase rows, the same as in Hjacobian (PPP-061)
+        pdcb = dcb if self._phase_signal_bias else np.zeros(4)
         z_hat = np.empty(5 * (n_gps + n_gal))
         sat_xyz = gps_satellites[:, :3]
         m_wet = gps_satellites[:, 3]
@@ -5644,9 +4513,9 @@ class PPPFilterMultiGNSSIonConst:
             geom = rho[s]
             mw = m_wet[s]
             z_hat[5 * s + 0] = geom + clk + mw * zwd + MU1 * I_s + dcb[0]
-            z_hat[5 * s + 1] = geom + clk + mw * zwd - MU1 * I_s + L1 * N1_s
+            z_hat[5 * s + 1] = geom + clk + mw * zwd - MU1 * I_s + L1 * N1_s + pdcb[0]
             z_hat[5 * s + 2] = geom + clk + mw * zwd + MU2 * I_s + dcb[1]
-            z_hat[5 * s + 3] = geom + clk + mw * zwd - MU2 * I_s + L2 * N2_s
+            z_hat[5 * s + 3] = geom + clk + mw * zwd - MU2 * I_s + L2 * N2_s + pdcb[1]
             z_hat[5 * s + 4] = I_s
         sat_xyz = gal_satellites[:, :3]
         m_wet = gal_satellites[:, 3]
@@ -5661,9 +4530,9 @@ class PPPFilterMultiGNSSIonConst:
             mw = m_wet[s]
             row = 5 * (n_gps + s)
             z_hat[row + 0] = geom + clk + isb + mw * zwd + MU1_GAL * I_s + dcb[2]
-            z_hat[row + 1] = geom + clk + isb + mw * zwd - MU1_GAL * I_s + E1 * N1_s
+            z_hat[row + 1] = geom + clk + isb + mw * zwd - MU1_GAL * I_s + E1 * N1_s + pdcb[2]
             z_hat[row + 2] = geom + clk + isb + mw * zwd + MU2_GAL * I_s + dcb[3]
-            z_hat[row + 3] = geom + clk + isb + mw * zwd - MU2_GAL * I_s + E5a * N2_s
+            z_hat[row + 3] = geom + clk + isb + mw * zwd - MU2_GAL * I_s + E5a * N2_s + pdcb[3]
             z_hat[row + 4] = I_s
         return z_hat
 
@@ -5734,11 +4603,12 @@ class PPPFilterMultiGNSSIonConst:
         self.ekf.P[5, 5] = self.cfg.p_tro  # 2.0 # tro
         self.ekf.Q = np.zeros_like(self.ekf.P)
         self.ekf.Q[3, 3] = self.cfg.q_dt  # 1e9 # clk
-        self.ekf.Q[4, 4] = self.cfg.q_isb  # 1.0 # isb
-        self.ekf.Q[5, 5] = self.cfg.q_tro  # 0.025 # tro
-        self.ekf.F = np.eye(dim_x)
-        # self.ekf.F[3, 3] = 0.0
+        self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_isb, self.interval)  # isb
+        self.ekf.Q[5, 5] = random_walk_variance(self.cfg.q_tro, self.interval)  # tro
+        _init_coordinate_states(self.ekf, self.cfg)
+        self._configure_transition_matrix()
 
+        q_amb = random_walk_variance(self.cfg.q_amb, self.interval)
         P4_gps = self.gps_obs.loc[(slice(None), first_ep), 'ion'].to_numpy()
         P4_gal = self.gal_obs.loc[(slice(None), first_ep), 'ion'].to_numpy()
         for i, sv in enumerate(gps_sats):
@@ -5748,10 +4618,11 @@ class PPPFilterMultiGNSSIonConst:
             I_init = P4_gps[i]
             self.ekf.x[idx_I] = I_init
             self.ekf.P[idx_I, idx_I] = self.cfg.p_iono  # 1.5
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono * (
-                        self.interval * 60) / 3600  # 2.0 * (self.interval * 60) / 3600
+            self.ekf.Q[idx_I, idx_I] = random_walk_variance(self.cfg.q_iono, self.interval)
             self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb  # 1e6
             self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb  # 1e6
+            self.ekf.Q[idx_N1, idx_N1] = q_amb  # PPP-064 (bug-fix stage 13b)
+            self.ekf.Q[idx_N2, idx_N2] = q_amb
         for j, sv in enumerate(gal_sats):
             k = n_gps + j
             idx_I = base_dim + 3 * k
@@ -5760,14 +4631,16 @@ class PPPFilterMultiGNSSIonConst:
             I_init = P4_gal[j]
             self.ekf.x[idx_I] = I_init
             self.ekf.P[idx_I, idx_I] = self.cfg.p_iono  # 1.5
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono * (self.interval * 60) / 3600
+            self.ekf.Q[idx_I, idx_I] = random_walk_variance(self.cfg.q_iono, self.interval)
             self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
             self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb
+            self.ekf.Q[idx_N1, idx_N1] = q_amb  # PPP-064
+            self.ekf.Q[idx_N2, idx_N2] = q_amb
         if self.est_dcb:
             dcb_indices = self.dcb_param_indices(n_gps, n_gal)
             for idx in dcb_indices:
                 self.ekf.P[idx, idx] = self.cfg.p_dcb  # 1e2
-                self.ekf.Q[idx, idx] = self.cfg.q_dcb
+                self.ekf.Q[idx, idx] = random_walk_variance(self.cfg.q_dcb, self.interval)
         # zakładam: dcb_block=4 (zalecane; patrz pkt 2)
         base = self.base_dim + 3 * (n_gps + n_gal)
         idx_c1gps = base + 0  # DCB_C1_GPS
@@ -5808,11 +4681,12 @@ class PPPFilterMultiGNSSIonConst:
         self.ekf.P[5, 5] = self.cfg.p_tro  # 2.0 # tro
         self.ekf.Q = np.zeros_like(self.ekf.P)
         self.ekf.Q[3, 3] = self.cfg.q_dt  # 1e9 # clk
-        self.ekf.Q[4, 4] = self.cfg.q_isb  # 1.0 # isb
-        self.ekf.Q[5, 5] = self.cfg.q_tro  # 0.025 # tro
-        self.ekf.F = np.eye(dim_x)
-        # self.ekf.F[3, 3] = 0.0
+        self.ekf.Q[4, 4] = random_walk_variance(self.cfg.q_isb, self.interval)  # isb
+        self.ekf.Q[5, 5] = random_walk_variance(self.cfg.q_tro, self.interval)  # tro
+        _init_coordinate_states(self.ekf, self.cfg)
+        self._configure_transition_matrix()
 
+        q_amb = random_walk_variance(self.cfg.q_amb, self.interval)
         P4_gps = self.gps_obs.loc[(slice(None), epoch), 'ion'].to_numpy()
         P4_gal = self.gal_obs.loc[(slice(None), epoch), 'ion'].to_numpy()
         for i, sv in enumerate(gps_sats):
@@ -5822,10 +4696,11 @@ class PPPFilterMultiGNSSIonConst:
             I_init = P4_gps[i]
             self.ekf.x[idx_I] = I_init
             self.ekf.P[idx_I, idx_I] = self.cfg.p_iono  # 1.5
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono * (
-                    self.interval * 60) / 3600  # 2.0 * (self.interval * 60) / 3600
+            self.ekf.Q[idx_I, idx_I] = random_walk_variance(self.cfg.q_iono, self.interval)
             self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb  # 1e6
             self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb  # 1e6
+            self.ekf.Q[idx_N1, idx_N1] = q_amb  # PPP-064 (bug-fix stage 13b)
+            self.ekf.Q[idx_N2, idx_N2] = q_amb
         for j, sv in enumerate(gal_sats):
             k = n_gps + j
             idx_I = base_dim + 3 * k
@@ -5834,14 +4709,16 @@ class PPPFilterMultiGNSSIonConst:
             I_init = P4_gal[j]
             self.ekf.x[idx_I] = I_init
             self.ekf.P[idx_I, idx_I] = self.cfg.p_iono  # 1.5
-            self.ekf.Q[idx_I, idx_I] = self.cfg.q_iono * (self.interval * 60) / 3600
+            self.ekf.Q[idx_I, idx_I] = random_walk_variance(self.cfg.q_iono, self.interval)
             self.ekf.P[idx_N1, idx_N1] = self.cfg.p_amb
             self.ekf.P[idx_N2, idx_N2] = self.cfg.p_amb
+            self.ekf.Q[idx_N1, idx_N1] = q_amb  # PPP-064
+            self.ekf.Q[idx_N2, idx_N2] = q_amb
         if self.est_dcb:
             dcb_indices = self.dcb_param_indices(n_gps, n_gal)
             for idx in dcb_indices:
                 self.ekf.P[idx, idx] = self.cfg.p_dcb  # 1e2
-                self.ekf.Q[idx, idx] = self.cfg.q_dcb
+                self.ekf.Q[idx, idx] = random_walk_variance(self.cfg.q_dcb, self.interval)
         # zakładam: dcb_block=4 (zalecane; patrz pkt 2)
         base = self.base_dim + 3 * (n_gps + n_gal)
         idx_c1gps = base + 0  # DCB_C1_GPS
@@ -5870,10 +4747,10 @@ class PPPFilterMultiGNSSIonConst:
         P_new = np.zeros((new_dim, new_dim))
         Q_new = np.zeros((new_dim, new_dim))
 
-        # base block
-        x_new[:base] = x_old[:base]
-        P_new[:base, :base] = P_old[:base, :base]
-        Q_new[:base, :base] = Q_old[:base, :base]
+        # Receiver states, retained satellites and DCB states are carried over
+        # together (one joint covariance block), so no correlation is lost.
+        keep_old = [np.arange(base)]
+        keep_new = [np.arange(base)]
 
         def tagG(sv):
             return f"G:{sv}"
@@ -5894,22 +4771,8 @@ class PPPFilterMultiGNSSIonConst:
 
             # indeksy stanów (I,N1,N2) dla wszystkich common sat
             offs = np.array([0, 1, 2], dtype=int)
-            old_state = (base + 3 * old_idx[:, None] + offs[None, :]).ravel()
-            new_state = (base + 3 * new_idx[:, None] + offs[None, :]).ravel()
-
-            # x
-            x_new[new_state] = x_old[old_state]
-
-            # P/Q: sat-sat blok naraz
-            P_new[np.ix_(new_state, new_state)] = P_old[np.ix_(old_state, old_state)]
-            Q_new[np.ix_(new_state, new_state)] = Q_old[np.ix_(old_state, old_state)]
-
-            # cross z base
-            b = np.arange(base)
-            P_new[np.ix_(new_state, b)] = P_old[np.ix_(old_state, b)]
-            P_new[np.ix_(b, new_state)] = P_old[np.ix_(b, old_state)]
-            Q_new[np.ix_(new_state, b)] = Q_old[np.ix_(old_state, b)]
-            Q_new[np.ix_(b, new_state)] = Q_old[np.ix_(b, old_state)]
+            keep_old.append((base + 3 * old_idx[:, None] + offs[None, :]).ravel())
+            keep_new.append((base + 3 * new_idx[:, None] + offs[None, :]).ravel())
 
         # nowe satelity: tylko diagonalne init
         new_only = [prn for prn in curr_all if prn not in prev_map]
@@ -5919,23 +4782,26 @@ class PPPFilterMultiGNSSIonConst:
             idx_N1 = idx_I + 1
             idx_N2 = idx_I + 2
             P_new[idx_I, idx_I] = self.cfg.p_iono
-            Q_new[idx_I, idx_I] = self.cfg.q_iono * (self.interval * 60) / 3600
+            Q_new[idx_I, idx_I] = random_walk_variance(self.cfg.q_iono, self.interval)
             P_new[idx_N1, idx_N1] = self.cfg.p_amb
             P_new[idx_N2, idx_N2] = self.cfg.p_amb
+            Q_new[idx_N1, idx_N1] = random_walk_variance(self.cfg.q_amb, self.interval)  # PPP-064
+            Q_new[idx_N2, idx_N2] = random_walk_variance(self.cfg.q_amb, self.interval)
 
-        # DCB block transfer (jak miałeś)
+        # DCB states: part of the joint block above
         if self.est_dcb:
             dcb_new = self.dcb_param_indices(len(curr_gps), len(curr_gal))
             dcb_old = self.dcb_param_indices(len(prev_gps), len(prev_gal))
             for i, idx in enumerate(dcb_new):
                 if i < len(dcb_old):
-                    x_new[idx] = x_old[dcb_old[i]]
-                    P_new[idx, idx] = P_old[dcb_old[i], dcb_old[i]]
-                    Q_new[idx, idx] = Q_old[dcb_old[i], dcb_old[i]]
+                    keep_old.append(np.array([dcb_old[i]], dtype=int))
+                    keep_new.append(np.array([idx], dtype=int))
                 else:
                     P_new[idx, idx] = self.cfg.p_dcb
-                    Q_new[idx, idx] = self.cfg.q_dcb
+                    Q_new[idx, idx] = random_walk_variance(self.cfg.q_dcb, self.interval)
 
+        _carry_over_states(x_old, P_old, Q_old, x_new, P_new, Q_new,
+                           np.concatenate(keep_old), np.concatenate(keep_new))
         return x_new, P_new, Q_new
 
     def code_screening(self, x, satellites, code_obs, thr=1):
@@ -5974,7 +4840,7 @@ class PPPFilterMultiGNSSIonConst:
         curr = phase_residuals_dict.get(num, {})
         prev1 = phase_residuals_dict.get(num - 1, {})
 
-        # sprawdź komplet N poprzednich epok (identyczne kryterium jak u Ciebie)
+        # check that all N previous epochs are present
         for sv in sat_list:
             ok = True
             for offset in range(N):
@@ -6006,7 +4872,8 @@ class PPPFilterMultiGNSSIonConst:
                 ii = self.base_dim + nidx
                 self.ekf.x[ii] = 0.0
                 self.ekf.P[ii, ii] = 1e6
-                self.ekf.Q[ii, ii] = 0.0
+                # PPP-064 (bug-fix stage 13b): the restarted ambiguity keeps the q_amb random walk (Q was set to 0)
+                self.ekf.Q[ii, ii] = random_walk_variance(self.cfg.q_amb, self.interval)
                 reset_svs.append(sv)
         return reset_svs
 
@@ -6018,7 +4885,8 @@ class PPPFilterMultiGNSSIonConst:
         :param flh: np.ndarray, reference coordinates in BLH
         :param zwd0: [float, int], initial ZTD value
         :param trace_filter:bool, whether to trace filter
-        :param reset_every: int, number of epochs to reset filter
+        :param reset_every: int, reset period [min] (PPPConfig.reset_every: the filter is reset when
+            the epoch index x interval [min] is a multiple of it), 0 = never
         :return: tuple(pd.Dataframe, pd.Dataframe, pd.Dataframe, float), solution, gps&gal residuals, convergence time
         """
         gps_sats, gal_sats, epochs = self.init_filter(clk0=clk0, zwd0=zwd0)
@@ -6037,10 +4905,16 @@ class PPPFilterMultiGNSSIonConst:
         gal_rows = []
         gal_data = []
 
-        t_end = self.t_end / self.interval
+        t_end = max(self.t_end / self.interval, 1.0)
 
         sigma_iono_t = self.sigma_iono_0 + (self.sigma_iono_end - self.sigma_iono_0) / t_end * np.arange(t_end)
+        # code gate and phase-jump screening of the constrained uncombined settings (PPP-029)
+        code_prefit_threshold = float(getattr(self.cfg, "uncombined_iono_code_prefit_threshold", 10.0))
+        phase_screen_enabled = bool(getattr(self.cfg, "uncombined_iono_phase_screen", True))
+        phase_screen_threshold = float(getattr(self.cfg, "uncombined_iono_phase_screen_threshold", 1.0))
+        phase_screen_warmup_epochs = int(getattr(self.cfg, "uncombined_iono_phase_screen_warmup_epochs", 60))
         xyz = None
+        conv_xyz = None  # previous float position (convergence check)
         conv_time = None
         T0 = epochs[0]
         prt_gps_l1 = {}
@@ -6068,9 +4942,10 @@ class PPPFilterMultiGNSSIonConst:
             min_lock_epochs=getattr(self.cfg, "pppar_min_lock_epochs", None),
             min_candidate_elevation_deg=getattr(self.cfg, "pppar_min_candidate_elevation_deg", None),
             use_float_ratio_covariance=bool(getattr(self.cfg, "pppar_use_float_ratio_covariance", True)),
-            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", False)),
+            partial_fixing_enabled=bool(getattr(self.cfg, "pppar_partial_fixing_enabled", True)),
             partial_min_ambiguities=getattr(self.cfg, "pppar_partial_min_ambiguities", None),
             wide_lane_max_frac_cycles=getattr(self.cfg, "pppar_wide_lane_max_frac_cycles", 0.25),
+            hold=bool(getattr(self.cfg, "pppar_fix_and_hold", False)),
         )
 
         def _reset_ar_float_ambiguities(system: str, svs: set[str], curr_gps: list[str], curr_gal: list[str]) -> None:
@@ -6091,15 +4966,19 @@ class PPPFilterMultiGNSSIonConst:
                         indices.extend([base + 1, base + 2])
             _reset_covariance_states(ar_float_P, indices, float(self.cfg.p_amb))
 
+        ar_float_state = None
         for num, t in enumerate(epochs):
+            # the previous epoch was reported fixed; without fix-and-hold the filter continues float
+            restore_float_state(self.ekf, ar_float_state)
+            ar_float_state = None
             reset_epoch = False
             if reset_every != 0:
                 if ((num * self.interval) % reset_every == 0) and (num != 0):
                     ppp_trace(trace_filter, self.__class__.__name__, "reset", epoch=num, time=t)
                     gps_sats, gal_sats = self.reset_filter(epoch=t)
                     ar_float_P = self.ekf.P.copy()
-                    gps_arc_age = {sv: 0 for sv in gps_sats}
-                    gal_arc_age = {sv: 0 for sv in gal_sats}
+                    gps_arc_age = {}
+                    gal_arc_age = {}
                     reset_epoch = True
                     T0 = t
                     # n_i = 0
@@ -6127,7 +5006,7 @@ class PPPFilterMultiGNSSIonConst:
                 self.ekf.dim_x = len(self.ekf.x)
                 self.ekf.dim_z = 5 * (len(curr_gps_sats) + len(curr_gal_sats))
                 self.ekf._I = np.eye(self.ekf.dim_x)
-                self.ekf.F = np.eye(self.ekf.dim_x)
+                self._configure_transition_matrix()
 
                 n_gps = len(gps_epoch);
                 n_gal = len(gal_epoch)
@@ -6150,8 +5029,6 @@ class PPPFilterMultiGNSSIonConst:
                     ar_float_P[idx_c1gal, idx_c1gal] = 1e-12
             gps_sats = curr_gps_sats
             gal_sats = curr_gal_sats
-            gps_arc_age = {sv: gps_arc_age.get(sv, 0) for sv in curr_gps_sats}
-            gal_arc_age = {sv: gal_arc_age.get(sv, 0) for sv in curr_gal_sats}
             gps_satellites = gps_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
             gal_satellites = gal_epoch[['xe', 'ye', 'ze', 'me_wet']].to_numpy()
 
@@ -6162,7 +5039,7 @@ class PPPFilterMultiGNSSIonConst:
                     _mode = self.gps_mode
                     sat_pco1_col = f"sat_pco_los_{_mode[:2]}"
                     sat_pco2_col = f"sat_pco_los_{_mode[2:]}"
-                    pco2_col = "pco_los_l2"
+                    pco2_col = _dual_rec_pco_columns(_mode)[1]  # E1E5b/E5aE5b: pco_los_l5 (PPP-022)
                     f1 = self.FREQ_DICT[_mode[:2]]
                     f2 = self.FREQ_DICT[_mode[2:]]
                 else:
@@ -6177,7 +5054,7 @@ class PPPFilterMultiGNSSIonConst:
                         sat_pco2_col = f"sat_pco_los_{_mode[2:]}"
                         f1 = self.FREQ_DICT[_mode[:2]]
                         f2 = self.FREQ_DICT[_mode[2:]]
-                    pco2_col = "pco_los_l2"
+                    pco2_col = _dual_rec_pco_columns(_mode)[1]  # E1E5b/E5aE5b: pco_los_l5 (PPP-022)
 
                 # helper: fast column -> numpy (no copy if possible)
                 def col_np(name, default=0.0):
@@ -6201,20 +5078,17 @@ class PPPFilterMultiGNSSIonConst:
                 sat_pco1 = col_np(sat_pco1_col, 0.0)
                 sat_pco2 = col_np(sat_pco2_col, 0.0)
 
-                # OSB: KONIECZNIE jako numpy, nie Series
-                osb_c1 = col_np(f"OSB_{cols['C1']}", 0.0)
-                osb_c2 = col_np(f"OSB_{cols['C2']}", 0.0)
-                osb_l1 = col_np(f"OSB_{cols['L1']}", 0.0)
-                osb_l2 = col_np(f"OSB_{cols['L2']}", 0.0)
+                # satellite plus receiver OSB [m] (OSB_ and STA_OSB_ columns, as the other filters;
+                # PPPSession writes product DSBs in the clock datum as OSB_, PPP-038)
+                n_obs = len(epoch)
+                osb_c1 = osb_m(epoch, cols['C1'], n_obs)
+                osb_c2 = osb_m(epoch, cols['C2'], n_obs)
+                osb_l1 = osb_m(epoch, cols['L1'], n_obs)
+                osb_l2 = osb_m(epoch, cols['L2'], n_obs)
 
                 # stałe tylko raz
                 cl = self.CLIGHT
                 clk_cl = clk * cl
-
-                osb_c1 = osb_c1 * 1e-09 * cl
-                osb_c2 = osb_c2 * 1e-09 * cl
-                osb_l1 = osb_l1 * 1e-09 * cl
-                osb_l2 = osb_l2 * 1e-09 * cl
 
                 C1 = epoch[cols["C1"]].to_numpy(copy=False)
                 C2 = epoch[cols["C2"]].to_numpy(copy=False)
@@ -6248,15 +5122,17 @@ class PPPFilterMultiGNSSIonConst:
             prt_gps_l1[num] = {sv: r for sv, r in zip(curr_gps_sats, prefit_gps_l1)}
             prt_gps_l2[num] = {sv: r for sv, r in zip(curr_gps_sats, prefit_gps_l2)}
             gps_phase_reset_svs: set[str] = set()
-            if num >= 60:
+            if phase_screen_enabled and num >= phase_screen_warmup_epochs:
                 gps_phase_reset_svs.update(
                     self.phase_residuals_screening(
-                        sat_list=curr_gps_sats, phase_residuals_dict=prt_gps_l1, num=num, freq='n1'
+                        sat_list=curr_gps_sats, phase_residuals_dict=prt_gps_l1, num=num, freq='n1',
+                        thr=phase_screen_threshold,
                     )
                 )
                 gps_phase_reset_svs.update(
                     self.phase_residuals_screening(
-                        sat_list=curr_gps_sats, phase_residuals_dict=prt_gps_l2, num=num, freq='n2'
+                        sat_list=curr_gps_sats, phase_residuals_dict=prt_gps_l2, num=num, freq='n2',
+                        thr=phase_screen_threshold,
                     )
                 )
             for sv in gps_phase_reset_svs:
@@ -6268,17 +5144,17 @@ class PPPFilterMultiGNSSIonConst:
             prt_gal_l1[num] = {sv: r for sv, r in zip(curr_gal_sats, prefit_gal_l1)}
             prt_gal_l2[num] = {sv: r for sv, r in zip(curr_gal_sats, prefit_gal_l2)}
             gal_phase_reset_svs: set[str] = set()
-            if num >= 60:
+            if phase_screen_enabled and num >= phase_screen_warmup_epochs:
                 gal_phase_reset_svs.update(
                     self.phase_residuals_screening(
                         sat_list=curr_gal_sats, phase_residuals_dict=prt_gal_l1, num=num,
-                        sys='E', len_gps=len(curr_gps_sats), freq='n1'
+                        sys='E', len_gps=len(curr_gps_sats), freq='n1', thr=phase_screen_threshold,
                     )
                 )
                 gal_phase_reset_svs.update(
                     self.phase_residuals_screening(
                         sat_list=curr_gal_sats, phase_residuals_dict=prt_gal_l2, num=num,
-                        sys='E', len_gps=len(curr_gps_sats), freq='n2'
+                        sys='E', len_gps=len(curr_gps_sats), freq='n2', thr=phase_screen_threshold,
                     )
                 )
             for sv in gal_phase_reset_svs:
@@ -6291,31 +5167,30 @@ class PPPFilterMultiGNSSIonConst:
 
             ev_gps = gps_epoch['ev'].to_numpy(copy=False)
             ev_gal = gal_epoch['ev'].to_numpy(copy=False)
-            inv_sin_gps = 1.0 / np.sin(np.deg2rad(ev_gps))
-            inv_sin_gal = 1.0 / np.sin(np.deg2rad(ev_gal))
-            sigma_code_gps = 0.3 + 0.0025 * inv_sin_gps  # **2
-            sigma_phase_gps = 1e-4 + 0.0003 * inv_sin_gps  # **2
-            if self.use_iono_rms:
-                sigma_ion_gps = gps_epoch[
-                                    'ion_rms'].to_numpy(copy=False) * sigma_ion  # sigma_ion/np.sin(np.deg2rad(ev_gps)) #np.full_like(ev_gps, sigma_ion)
-                sigma_ion_gal = gal_epoch[
-                                    'ion_rms'].to_numpy(copy=False) * sigma_ion  # sigma_ion/np.sin(np.deg2rad(ev_gal)) #np.full_like(ev_gal, sigma_ion)
+            # variances [m^2] of the constrained weighting per system (PPP-074, bug-fix stage 13b; see
+            # _constrained_obs_variances)
+            sigma_code_gps, sigma_phase_gps = _constrained_obs_variances(self.cfg, ev_gps, "G")
+            sigma_code_gal, sigma_phase_gal = _constrained_obs_variances(self.cfg, ev_gal, "E")
+            if self.use_iono_rms and 'ion_rms' in gps_epoch.columns and 'ion_rms' in gal_epoch.columns:
+                # the GIM RMS [m] added to the ramp variance (PPP-074; it multiplied the ramp before, as
+                # _iono_constraint_sigma did)
+                sigma_ion_gps = _ramp_plus_ion_rms(sigma_ion, gps_epoch['ion_rms'].to_numpy(copy=False),
+                                                   self.sigma_iono_end)
+                sigma_ion_gal = _ramp_plus_ion_rms(sigma_ion, gal_epoch['ion_rms'].to_numpy(copy=False),
+                                                   self.sigma_iono_end)
             else:
                 sigma_ion_gps = np.full_like(ev_gps, sigma_ion)
                 sigma_ion_gal = np.full_like(ev_gal, sigma_ion)
 
-            sigma_code_gal = 0.3 + 0.0025 * inv_sin_gal  # **2
-            sigma_phase_gal = 1e-4 + 0.0003 * inv_sin_gal  # **2
-
             gps_c1_mask, prefit_c1 = self.code_screening(x=self.ekf.x[:3], satellites=gps_satellites[:, :3],
-                                                         code_obs=C1, thr=10)
+                                                         code_obs=C1, thr=code_prefit_threshold)
             gps_c2_mask, prefit_c2 = self.code_screening(x=self.ekf.x[:3], satellites=gps_satellites[:, :3],
-                                                         code_obs=C2, thr=10)
+                                                         code_obs=C2, thr=code_prefit_threshold)
 
             gal_c1_mask, prefit_e1 = self.code_screening(x=self.ekf.x[:3], satellites=gal_satellites[:, :3],
-                                                         code_obs=EC1, thr=10)
+                                                         code_obs=EC1, thr=code_prefit_threshold)
             gal_c2_mask, prefit_e2 = self.code_screening(x=self.ekf.x[:3], satellites=gal_satellites[:, :3],
-                                                         code_obs=EC2, thr=10)
+                                                         code_obs=EC2, thr=code_prefit_threshold)
 
             gps_sc1 = np.where(gps_c1_mask, sigma_code_gps, 1e12)
             gps_sc2 = np.where(gps_c2_mask, sigma_code_gps, 1e12)
@@ -6357,23 +5232,34 @@ class PPPFilterMultiGNSSIonConst:
                     )
                 continue
             updated = False
-            for k in range(5):
-                try:
-                    self.ekf.predict_update(
-                        z=Z,
-                        HJacobian=self.Hjacobian,
-                        args=(gps_satellites, gal_satellites),
-                        Hx=self.Hx,
-                        hx_args=(gps_satellites, gal_satellites),
-                    )
-                    updated = True
-                    break
-                except np.linalg.LinAlgError:
-                    jitter = 1e-6 * (10.0 ** k)
-                    self.ekf.R.flat[::m + 1] += jitter
+            # receiver clock (every code row) and Galileo ISB (state 4, its code rows) priors, RTKLIB udclk_ppp
+            # (bug-fix stage 13b, A1(b))
+            n_sat_all = len(curr_gps_sats) + len(curr_gal_sats)
+            code_rows = (5 * np.arange(n_sat_all)[:, None] + np.array([0, 2])[None, :]).ravel()
+            gal_code_rows = code_rows[2 * len(curr_gps_sats):]
+            with epoch_process_noise(self.ekf, t, self.interval) as process_noise:
+                for k in range(5):
+                    try:
+                        self.ekf.state_priors = clock_priors(self.cfg.clock_prior_sigma_m, code_rows,
+                                                             {4: gal_code_rows})
+                        self.ekf.predict_update(
+                            z=Z,
+                            HJacobian=self.Hjacobian,
+                            args=(gps_satellites, gal_satellites),
+                            Hx=self.Hx,
+                            hx_args=(gps_satellites, gal_satellites),
+                        )
+                        updated = True
+                        break
+                    except np.linalg.LinAlgError:
+                        jitter = 1e-6 * (10.0 ** k)
+                        self.ekf.R.flat[::m + 1] += jitter
             if updated and ar_cfg.use_float_ratio_covariance:
                 if ar_float_P.shape == self.ekf.P.shape:
-                    P_pred_ar = self.ekf.F @ ar_float_P @ self.ekf.F.T + self.ekf.Q
+                    P_pred_ar = (self.ekf.F @ ar_float_P @ self.ekf.F.T
+                                 + gap_scaled_process_noise(self.ekf.Q, process_noise.step))
+                    # the clock / ISB priors the filter applied to its own prediction (A1(b))
+                    reset_prior_states(P_pred_ar, self.ekf.priors_applied)
                     H_ar = self.Hjacobian(self.ekf.x, gps_satellites, gal_satellites)
                     ar_float_P = _covariance_measurement_update(P_pred_ar, H_ar, self.ekf.R)
                 else:
@@ -6391,20 +5277,25 @@ class PPPFilterMultiGNSSIonConst:
                     )
                 gps_sats, gal_sats = self.reset_filter(epoch=t)
                 ar_float_P = self.ekf.P.copy()
-                gps_arc_age = {sv: 0 for sv in gps_sats}
-                gal_arc_age = {sv: 0 for sv in gal_sats}
+                gps_arc_age = {}
+                gal_arc_age = {}
                 continue
 
-            for sv in curr_gps_sats:
-                gps_arc_age[sv] = gps_arc_age.get(sv, 0) + 1
-            for sv in curr_gal_sats:
-                gal_arc_age[sv] = gal_arc_age.get(sv, 0) + 1
-            gps_ar_age = np.array([gps_arc_age.get(sv, 0) for sv in curr_gps_sats], dtype=int)
-            gal_ar_age = np.array([gal_arc_age.get(sv, 0) for sv in curr_gal_sats], dtype=int)
+            # PPP-069: one arc-age convention for every route (0 at the first epoch of an arc)
+            gps_arc_age = advance_arc_age(gps_arc_age, curr_gps_sats, gps_phase_reset_svs)
+            gal_arc_age = advance_arc_age(gal_arc_age, curr_gal_sats, gal_phase_reset_svs)
+            gps_ar_age = arc_age_array(gps_arc_age, curr_gps_sats)
+            gal_ar_age = arc_age_array(gal_arc_age, curr_gal_sats)
 
             ar_diag = None
 
             if ar_cfg.enabled and num >= ar_cfg.warmup_epochs:
+                # float phase residuals and weights: rows 1 / 3 of each satellite carry N1 / N2 (C3, NQ-PPP-20)
+                sat = np.arange(len(curr_gps_sats) + len(curr_gal_sats))[:, None]
+                ar_inputs = ar_phase_kwargs(Z - self.Hx(self.ekf.x, gps_satellites, gal_satellites),
+                                            np.diag(self.ekf.R), (5 * sat + np.array([1, 3])).ravel(),
+                                            (self.base_dim + 3 * sat + np.array([1, 2])).ravel(), ekf=self.ekf)
+                ar_float_state = keep_float_state(self.ekf, ar_cfg)
                 self.ekf.x, self.ekf.P, ar_diag = apply_uncombined_pppar(
                     x=self.ekf.x,
                     P=self.ekf.P,
@@ -6417,9 +5308,10 @@ class PPPFilterMultiGNSSIonConst:
                     gps_age=gps_ar_age,
                     gal_age=gal_ar_age,
                     ratio_P=ar_float_P if ar_cfg.use_float_ratio_covariance else None,
+                    gps_eligible=ar_eligible_mask(gps_epoch),
+                    gal_eligible=ar_eligible_mask(gal_epoch),
+                    **ar_inputs,
                 )
-
-
 
             dtr = self.ekf.x[3]
             isb = self.ekf.x[4]
@@ -6428,7 +5320,7 @@ class PPPFilterMultiGNSSIonConst:
             # ---- convergence time measure
             if not reset_epoch or reset_every == 0:
                 if xyz is not None:
-                    position_diff = np.linalg.norm(self.ekf.x[:3] - xyz)
+                    position_diff = np.linalg.norm(float_position(self.ekf, ar_float_state) - conv_xyz)
 
                     # If convergence time is not set and position difference is small, set the convergence time
                     if conv_time is None and position_diff < 0.005:
@@ -6438,6 +5330,7 @@ class PPPFilterMultiGNSSIonConst:
 
             # --- data collecting
             xyz = self.ekf.x[:3].copy()
+            conv_xyz = float_position(self.ekf, ar_float_state)
             dcb = self.ekf.x[-4:]
             x_gps = self.ekf.x[self.base_dim:self.base_dim + 3 * len(gps_epoch)]
             x_gal = self.ekf.x[self.base_dim + 3 * len(gps_epoch):self.base_dim + 3 * (len(gps_epoch) + len(gal_epoch))]
@@ -6456,8 +5349,8 @@ class PPPFilterMultiGNSSIonConst:
                 enu = np.array([0.0, 0.0, 0.0])
             row = {'time': t, 'de': enu[0], 'dn': enu[1], 'du': enu[2],
                    'dtr': dtr, 'isb': isb, 'ztd': ztd, 'dcb_gps_c1': dcb[0], 'dcb_gps_c2': dcb[1],
-                   'dcb_gal_c1': dcb[2], 'dcb_gal_c2': dcb[3], 'xr': self.ekf.x[0], 'yr': self.ekf.x[1],
-                   'zr': self.ekf.x[2],
+                   'dcb_gal_c1': dcb[2], 'dcb_gal_c2': dcb[3], 'x': self.ekf.x[0], 'y': self.ekf.x[1],
+                   'z': self.ekf.x[2],
                    'ar_fixed': 0 if ar_diag is None else int(ar_diag.fixed_ambiguities),
                    'ar_ratio': np.nan if ar_diag is None or ar_diag.ratio_min is None else float(ar_diag.ratio_min),
                    'ar_ok': False if ar_diag is None else bool(ar_diag.accepted),
@@ -6521,55 +5414,28 @@ class PPPFilterMultiGNSSIonConst:
                 )
 
         df_result = pd.DataFrame(result)
-        df_result = df_result.set_index(['time'])
-        # sklej index
-        gps_index = gps_rows[0].append(gps_rows[1:])
+        df_result = df_result.set_index(['time']) if len(df_result) else None
 
-        # sklej dane
-        gps_array = np.vstack(gps_data)
+        def residual_frame(rows, data):
+            # per-satellite rows of the run; an empty frame with the same columns when the system has none
+            if not rows:
+                return pd.DataFrame(np.empty((0, len(self.RESIDUAL_COLUMNS))), columns=list(self.RESIDUAL_COLUMNS),
+                                    index=pd.MultiIndex.from_arrays([[], []], names=["sv", "time"]))
+            return pd.DataFrame(np.vstack(data), index=rows[0].append(rows[1:]), columns=list(self.RESIDUAL_COLUMNS))
 
-        cols = [
-            "Idelay", "n1", "n2",
-            "C1", "L1", "C2", "L2",
-            "vc1", "vl1", "vc2", "vl2",
-        ]
+        df_obs_gps = residual_frame(gps_rows, gps_data)
+        df_obs_gal = residual_frame(gal_rows, gal_data)
 
-        df_obs_gps = pd.DataFrame(
-            gps_array,
-            index=gps_index,
-            columns=cols,
-        )
-
-        # sklej index
-        gal_index = gal_rows[0].append(gal_rows[1:])
-
-        # sklej dane
-        gal_array = np.vstack(gal_data)
-
-        cols = [
-            "Idelay", "n1", "n2",
-            "C1", "L1", "C2", "L2",
-            "vc1", "vl1", "vc2", "vl2",
-        ]
-
-        df_obs_gal = pd.DataFrame(
-            gal_array,
-            index=gal_index,
-            columns=cols,
-        )
-
-        if conv_time is not None:
-            if trace_filter:
-                ppp_trace(
-                    trace_filter,
-                    self.__class__.__name__,
-                    "convergence",
-                    threshold_m=0.005,
-                    minutes=conv_time.total_seconds() / 60,
-                    hours=conv_time.total_seconds() / 3600,
-                )
-
-            ct = conv_time.total_seconds() / 3600
-        else:
-            ct = None
-        return df_result, df_obs_gps, df_obs_gal, ct
+        if conv_time is not None and trace_filter:
+            ppp_trace(
+                trace_filter,
+                self.__class__.__name__,
+                "convergence",
+                threshold_m=0.005,
+                minutes=conv_time.total_seconds() / 60,
+                hours=conv_time.total_seconds() / 3600,
+            )
+        # contracts C1 / C2 (bug-fix stage 13b, PPP-033 / PPP-034): {system: residual frame}; x, y, z (were xr, yr,
+        # zr) and ct_min [min] (missing before)
+        return (finish_solution(df_result, conv_time), {"G": df_obs_gps, "E": df_obs_gal}, None,
+                convergence_hours(conv_time))

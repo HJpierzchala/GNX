@@ -153,13 +153,18 @@ class IGRFDipole:
         m_hat = -[g11, h11, g10]/norm([g11, h11, g10])
 
     Params are base values at t0_year with secular rates (nT/year).
-    Defaults are IGRF-13 main field at 2020.0 and secular variation 2020–2025.
+    Defaults are IGRF-13 main field at 2020.0 and secular variation 2020–2025
+    (igrf13coeffs.txt: SV g10 5.7, g11 7.4, h11 -25.9 nT/yr). The Gauss
+    coefficients are spherical (geocentric): the 2020.0 pole is 80.5895N
+    72.680W geocentric (80.65N as a geodetic surface latitude).
+    With ``clamp_to_2025`` the axis is frozen at 2025.0, the end of the IGRF-13
+    secular-variation interval (IGRF-14 is not implemented).
     """
     g10_0: float = -29404.8
     g11_0: float = -1450.9
     h11_0: float =  4652.5
     g10_dot: float =  5.7
-    g11_dot: float =  7.0
+    g11_dot: float =  7.4
     h11_dot: float = -25.9
     t0_year: float = 2020.0
     clamp_to_2025: bool = True

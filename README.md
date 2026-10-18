@@ -21,6 +21,18 @@ The library currently focuses on:
 
 GNX-py supports **GPS**, **Galileo**, and **BeiDou/BDS**. It is actively developed as open-source research software, so the codebase intentionally exposes both mature workflows and newer validation branches. The README below describes that status explicitly.
 
+### New in GNX-py v1
+
+Version 1.0.0 is the first stable release. Besides many fixes (see [`CHANGELOG.md`](CHANGELOG.md)) it brings:
+
+- **BDGIM**, the BeiDou-3 global ionosphere model of the B-CNAV message (BDS-SIS-ICD-B2b-1.0 §7.7), as `ionosphere_model="bdgim"` next to Klobuchar, NTCM and GIM;
+- **ocean tide loading** from BLQ files (`ocean_loading_path`), the second step of the IERS solid Earth tide and the pole tide (`erp_path`);
+- **satellite attitude**: published yaw-steering laws per satellite block and ORBEX attitude files (`attitude_path`), one attitude frame for the satellite PCO, PCV and phase wind-up, and a PPP guard for satellite turns (`attitude_turn_guard`);
+- **own file readers** for RINEX 2/3/4 observations and navigation, SP3, RINEX clock and ANTEX files, validated on a corpus of real files (the library no longer needs gfzrnx or georinex);
+- **downloads** organised like the processing sessions, `DownloadConfig` -> `DownloadSession` -> `DownloadReport`, with BKG, NASA CDDIS, CODE and the EUREF archive at BKG;
+- **`SISSession`**, the signal-in-space session (formerly `SISController`);
+- a **validation** of every processing branch over a matrix of settings, products, stations and days, with the positioning accuracy limits referred to RTKLIB on the same data (see [Validation](#validation)).
+
 ---
 
 ## Current Capabilities
@@ -41,7 +53,8 @@ GNX-py includes Single Point Positioning through `gnx_py.spp`:
 - precise-orbit SPP when SP3 products are supplied;
 - GPS, Galileo, BeiDou, and mixed `G/E/C` system selections;
 - one receiver-clock state per active constellation in mixed runs;
-- configurable ionosphere models (`klobuchar`, `gim`, `ntcm`, or disabled) and troposphere models.
+- configurable ionosphere models (`klobuchar`, `gim`, `ntcm`, `bdgim`, or disabled) and troposphere models;
+- an optional GDOP gate per epoch (`spp_max_gdop`, default 30 as in RTKLIB).
 
 Start with:
 
@@ -60,7 +73,7 @@ The `gnx_py.ppp` package implements Precise Point Positioning workflows around `
 - precise SP3 orbit/clock workflows and broadcast-orbit validation paths;
 - optional ionospheric constraints for uncombined PPP;
 - OSB/DCB/DSB-style bias product ingestion;
-- configurable EKF presets, trace diagnostics, cycle-slip preprocessing, antenna corrections, tides, relativity, and troposphere handling.
+- configurable EKF presets, trace diagnostics, cycle-slip preprocessing, antenna corrections (PCO and PCV from ANTEX), satellite attitude, solid Earth, ocean-loading and pole tides, relativity, and troposphere handling.
 
 Recommended starting points are GPS/Galileo combined PPP and BDS-only `B1IB3I` PPP. Mixed uncombined modes are powerful but more sensitive to product and bias consistency.
 
@@ -89,7 +102,7 @@ The `gnx_py.ionosphere` package provides STEC and ionosphere tools around `TECCo
 - bias policy controlled by `TECConfig.stec_bias_sources`;
 - bias sources from products, GIM DCB blocks, manual configuration, or zero fallback;
 - OSB, DCB, and DSB-style bias handling;
-- Klobuchar, NTCM-style, and GIM-based model support;
+- Klobuchar, NTCM-style, BDGIM (BeiDou-3), and GIM-based model support;
 - IPP geometry, mapping functions, and TEC/VTEC utilities;
 - ionospheric activity indices such as SIDX, GIX-family diagnostics, ROT, and ROTI;
 - experimental VTEC kriging in geographic or solar-geomagnetic frames.
@@ -98,7 +111,7 @@ The `gnx_py.ionosphere` package provides STEC and ionosphere tools around `TECCo
 
 ### Orbits, SIS, and SISRE
 
-The `gnx_py.orbits` package provides signal-in-space analysis through `SISConfig` and `SISController`:
+The `gnx_py.orbits` package provides signal-in-space analysis through `SISConfig` and `SISSession` (formerly `SISController`, which still works as a deprecated alias and emits a `DeprecationWarning` when instantiated):
 
 - broadcast-vs-precise orbit and clock comparison;
 - SP3-vs-SP3 comparison on a common epoch grid;
@@ -110,6 +123,42 @@ The `gnx_py.orbits` package provides signal-in-space analysis through `SISConfig
 - GPS, Galileo, and BeiDou processing branches.
 
 For BeiDou SIS/SISRE work, `B1IB3I` is the validated/stable starting mode for MEO/IGSO broadcast-vs-SP3 comparisons. BDS clock interpretation depends strongly on the selected signal, broadcast TGD/ISC convention, precise clock datum, and external bias products. Inspect `clock_convention_status` and related metadata before interpreting BDS clock metrics. BeiDou GEO is not supported in the current SIS/SISRE path and is skipped or guarded.
+
+### GNSS data downloads
+
+The `gnx_py.downloaders` package downloads the inputs of a processing run through `DownloadConfig` and `DownloadSession`, and returns a `DownloadReport` with the paths per product type:
+
+```python
+from datetime import date
+from gnx_py.downloaders import DownloadConfig, DownloadSession
+from gnx_py.ppp import PPPConfig
+
+config = DownloadConfig(project_name="brux_2024_035", dates=date(2024, 2, 4),
+                        product_types=("obs", "nav", "sp3", "clk", "bia"),
+                        stations="BRUX00BEL", output_root="data")
+report = DownloadSession(config).run()      # DownloadReport
+print(report.summary())                     # one analysis centre for SP3/CLK/OSB
+ppp = PPPConfig(obs_path=report.files("obs")[0], nav_path=report.files("nav")[0],
+                sp3_path=report.files("sp3"), dcb_path=report.files("bia")[0], ...)
+```
+
+- sources: BKG (observations, navigation, products incl. the analysis-centre `IGSac` tree; no IONEX or ORBEX), NASA CDDIS (every type; needs an Earthdata token), CODE (CODE's own products, incl. GIM and ORBEX) and `"euref"`, the EUREF Permanent GNSS Network archive at BKG (observations only, not a default source: e.g. `sources=("bkg", "euref")`);
+- RINEX 3/4 long observation names are tried with the data-source letters of `rinex_data_source_preference` (default `("R", "S")`, receiver then stream);
+- CDDIS uses an Earthdata bearer token (`token=` or `EARTHDATA_TOKEN`); a username/password or credentials file is exchanged for a token once per run, only when CDDIS is a source, reusing a valid token of the account;
+- orbits, clocks, OSB and ORBEX come from one analysis-centre solution for the whole project, the SP3 boundary days included, so PPP-AR gets consistent products; mixing is a reported last resort;
+- `product_preferences={"nav": ("BRD400DLR", "BRDC00IGS")}` fetches the RINEX 4 navigation file with the BeiDou-3 BDGIM parameters (`ionosphere_model="bdgim"`), independently of the observation RINEX version;
+- files stay compressed as in the archive (`.gz`, `.Z`, `.crx.gz`); GNX reads them directly (see [Reading files](#reading-files)). Every file is checked (whole gzip stream, size, content header) before it is kept or reused;
+- `report.outcomes()` gives one line per requested item, including items no selected source provides (`"unavailable"`, with the reason).
+
+See `examples/run_project_download_example.py`, [`gnx_py/downloaders/README.md`](gnx_py/downloaders/README.md) and the section *Downloading data for your own project* of the introduction tutorial.
+
+### Reading files
+
+GNX-py reads its inputs with its own readers: RINEX 2/3/4 observations (`gnx_py.io.rinex_obs`), RINEX 2/3/4 navigation (`gnx_py.io.rinex_nav`), RINEX clock files (`gnx_py.io.rinex_clk`), SP3 (`gnx_py.io.sp3_reader`), ANTEX (`gnx_py.models.antex`), Bias-SINEX, SINEX, IONEX, BLQ and ORBEX. The readers were checked on a corpus of several hundred real files with very different headers.
+
+- Compressed files (gzip, Unix `.Z`, bzip2, zip) are decompressed in memory, without temporary files, so read-only directories and parallel reads of one file are safe.
+- Hatanaka-compressed observations (CRINEX 1 and 3, also inside gzip or `.Z`) are decompressed in memory by the RNXCMP `crx2rnx` program that the `hatanaka` package installs. GNX starts it through its internal helper `gnx_py.core._proc.run`, which uses `posix_spawn` instead of `fork` on macOS and glibc Linux, so reading is safe in processes that have loaded PROJ (cartopy, pyproj).
+- gfzrnx is not used, and georinex is not a runtime dependency.
 
 ---
 
@@ -145,41 +194,36 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-### Tutorial installation
+If PowerShell refuses to run `Activate.ps1` (the default execution policy blocks scripts), allow it for the current window with `Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned`, or use the Command Prompt steps of [`INSTALL_WINDOWS_PIP.md`](INSTALL_WINDOWS_PIP.md).
 
-The optional tutorial extra installs notebook-related dependencies:
+### Optional extras
 
-```bash
-python -m pip install -e ".[tutorial]"
-```
-
-For developer tools:
+`pyproject.toml` declares optional dependency groups:
 
 ```bash
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[tutorial]"   # Jupyter notebooks of tutorial/ and the manual build
+python -m pip install -e ".[dask]"       # dask, for chunked NetCDF output (save_grids_to_netcdf(..., chunks=...))
+python -m pip install -e ".[dev]"        # developer tools (pytest, coverage, linters)
 ```
 
-### Requirements and constraints files
+### Requirements files
 
-The canonical dependency declaration is in `pyproject.toml`. The requirements files are kept for users who prefer requirements-file workflows:
+The canonical dependency declaration is `pyproject.toml` (runtime dependencies and the `tutorial`, `dask`, `test`, and `dev` extras). The requirements files mirror it for users who prefer requirements-file workflows:
 
-- `requirements-runtime.txt`: runtime dependencies matching the package metadata.
-- `requirements-tutorial.txt`: notebook/tutorial dependencies; equivalent in spirit to `.[tutorial]`.
-- `requirements-dev.txt`: runtime, tutorial, and development/test tools.
-- `constraints-macos.txt`: captured macOS dependency pins for reproducing a known setup.
-- `constraints-win.txt`: Windows-oriented dependency pins for Python 3.12.
-
-Use constraints as reproducibility aids, not as the primary source of package metadata.
+- `requirements-runtime.txt`: the runtime dependencies of the package metadata.
+- `requirements-tutorial.txt`: the `tutorial` extra.
 
 ### Verify the import
 
 With the intended environment active:
 
 ```bash
-python -c "import sys, gnx_py; print(sys.executable); print(gnx_py.__file__)"
+python -c "import sys, gnx_py; print(sys.executable); print(gnx_py.__file__, gnx_py.__version__)"
 ```
 
 For an editable install, `gnx_py.__file__` should point to this repository.
+
+Switching an environment from a regular install (`pip install .`) to the editable install: run `python -m pip uninstall gnx_py` first and delete a `gnx_py` folder that may be left in `site-packages`. Numba writes its cache files next to the installed package, and such a leftover folder hides the editable install (`import gnx_py` then finds a namespace package without `__version__`).
 
 ---
 
@@ -192,11 +236,12 @@ python examples/run_spp_example.py
 python examples/run_ppp_example.py
 python examples/run_sise_example.py
 python examples/run_stec_example.py
+python examples/run_project_download_example.py
 ```
 
 The scripts are intentionally small and editable. Each has a `USER SETTINGS` block near the top where you can change the station, constellation set, signal mode, product paths, time window, and output options.
 
-By default, examples use `sample_data/`, run short smoke windows when configured to do so, and write generated files under `examples/output/`. Some workflows require matching observation, navigation, SP3, ANTEX, GIM, SINEX, and bias files; check the path block in each script before running with your own data.
+By default, the processing examples run GPS + Galileo + BeiDou over one hour of the sample day of `sample_data/` (each in a few seconds) and write generated files under `examples/output/`; `--full` (or `FULL_DAY = True` in the script) processes the whole day (see `examples/README.md`). The download example is a dry run without network access by default. Some workflows require matching observation, navigation, SP3, ANTEX, GIM, SINEX, and bias files; check the path block in each script before running with your own data.
 
 Common signal-mode defaults:
 
@@ -212,10 +257,32 @@ Common signal-mode defaults:
 from gnx_py.spp import SPPConfig, SPPSession
 from gnx_py.ppp import PPPConfig, PPPSession
 from gnx_py.ionosphere import TECConfig, TECSession
-from gnx_py.orbits import SISConfig, SISController
+from gnx_py.orbits import SISConfig, SISSession
+from gnx_py.downloaders import DownloadConfig, DownloadSession
 ```
 
 The example scripts are the recommended entry point before building custom workflows.
+
+### Plotting results
+
+`gnx_py.viz` plots the results of each workflow. Every plot returns a
+`matplotlib.figure.Figure`, nothing calls `plt.show()`, and single-axes plots
+accept an `ax=` argument so they compose into larger layouts:
+
+```python
+from gnx_py.viz import apply_publication_style, plot_positioning_series, plot_spp_positioning
+
+apply_publication_style()
+
+# PPP
+fig = plot_positioning_series(ppp_result.solution, convergence_time=15, title="PPP: BRUX")
+fig.savefig("ppp_convergence.png", dpi=300)
+
+# SPP: position errors plus the per-constellation satellite count
+fig = plot_spp_positioning(spp_result.solution, title="SPP: BRUX")
+```
+
+See `gnx_py/viz/README.md` for the map, ionosphere and comparison plots.
 
 ---
 
@@ -224,27 +291,38 @@ The example scripts are the recommended entry point before building custom workf
 ```text
 GNX/
 ├─ gnx_py/             # Python package: SPP, PPP, ionosphere, orbits, I/O, corrections
+│  ├─ core/            # Settings, time and coordinate conversions, signal tables, preprocessing, cycle slips
+│  ├─ models/          # Tides, ocean loading, troposphere, wind-up, attitude, ANTEX, a priori position, biases
+│  ├─ io/              # Readers: RINEX observations, navigation and clocks, SP3, SINEX, ORBEX, ERP, compression
+│  ├─ spp/             # Single Point Positioning: SPPConfig/SPPSession
 │  ├─ ppp/             # PPP filters, PPP session routing, PPP-AR helpers
 │  ├─ ionosphere/      # STEC/TEC processing, GIM/IONEX, models, monitoring, kriging
-│  └─ orbits/          # SIS/SISRE orbit and clock comparison tools
+│  ├─ orbits/          # SIS/SISRE orbit and clock comparison tools
+│  ├─ downloaders/     # GNSS archive downloads: DownloadConfig/DownloadSession (CDDIS, BKG, CODE, EUREF)
+│  └─ viz/             # Plotting: PPP, orbits, ionosphere, maps, diagrams
 ├─ examples/           # Small editable user examples using sample_data
-├─ sample_data/        # Compact example products for smoke tests and tutorials
+├─ sample_data/        # One day of example data and products (about 110 MB) for the examples and tutorials
 ├─ tutorial/           # Jupyter notebooks and manual build tooling
 ├─ assets/             # Static repository assets
 ├─ GNX_manual.pdf      # Generated manual/tutorial PDF snapshot
 ├─ pyproject.toml      # Package metadata, dependencies, optional extras
-├─ setup.py            # Setuptools compatibility shim
+├─ requirements-*.txt  # Mirrors of the runtime dependencies and of the tutorial extra
+├─ CHANGELOG.md        # Release notes
+├─ CITATION.cff        # Citation metadata
+├─ LICENSE             # MIT license
+├─ THIRD_PARTY_NOTICES # Third-party code and data used by the repository
+├─ .github/workflows/  # Continuous integration: installation check on Linux, macOS and Windows
 └─ README.md
 ```
 
-Large tutorial data bundles may be distributed through GitHub Releases rather than committed directly to the repository.
+The modules that were directly under `gnx_py` before v1.0.0 are in `core`, `models`, `io` and `spp` (and `download` in `downloaders`); their old import paths (`gnx_py.rinex_obs`, `gnx_py.tools`, ...) still work and give the same modules.
 
 ---
 
 ## Documentation and Tutorials
 
-- `examples/` contains small, editable scripts for SPP, PPP, SISE/SISRE, and STEC workflows.
-- `gnx_py/ppp/README.md`, `gnx_py/ionosphere/README.md`, and `gnx_py/orbits/README.md` provide module-level notes for the main processing domains.
+- `examples/` contains small, editable scripts for SPP, PPP, SISE/SISRE, and STEC workflows on `sample_data` and for downloading the inputs of a project (see `examples/README.md`).
+- `gnx_py/ppp/README.md`, `gnx_py/ionosphere/README.md`, `gnx_py/orbits/README.md`, and `gnx_py/downloaders/README.md` provide module-level notes for the main processing domains and the downloads.
 - `tutorial/` contains Jupyter notebooks that form a longer guided manual.
 - `GNX_manual.pdf` is a generated snapshot of the manual/tutorial material.
 
@@ -252,9 +330,17 @@ The tutorial notebooks are the best place for longer exploratory workflows. The 
 
 ---
 
+## Validation
+
+Before the 1.0.0 release every processing branch (SPP, PPP, ionosphere, orbits, downloads, plots) was run over a matrix of settings, products, stations, and days, and every graded number was compared with an independent reference. The data are public GNSS files of the stations BRUX, NKLG, and NYA2 on 2024-035 (quiet), 2024-131 (storm onset), and 2024-132 (storm). The positioning accuracy limits are referred to RTKLIB 2.4.2 on the same data, `min(2 x design limit, max(1.5 R, R + a))` with the RTKLIB value `R` and a floor `a` fixed before any comparison with GNX-py (the sensitivity of RTKLIB itself to equally valid settings). Configurations that stay outside their limit for an established cause that is not a GNX-py defect are listed as known limitations in [`CHANGELOG.md`](CHANGELOG.md) instead of loosening the limit.
+
+The continuous-integration workflow `.github/workflows/ci.yml` installs the package on Linux, macOS, and Windows with Python 3.12, imports it, and runs `examples/run_spp_example.py` (one hour, GPS + Galileo + BeiDou) on `sample_data/`.
+
+---
+
 ## Known Limitations and Validation Status
 
-GNX-py is actively developed research software. The project has tests and example workflows for important branches, but not every constellation, receiver, station, product source, signal mode, and arc condition has the same validation depth.
+GNX-py is actively developed research software. Its important branches are validated and have example workflows, but not every constellation, receiver, station, product source, signal mode, and arc condition has the same validation depth.
 
 Current limitations to keep in mind:
 
@@ -268,6 +354,9 @@ Current limitations to keep in mind:
 - Some public classes and exports are retained for legacy/reference compatibility and are not all ideal starting points for new workflows.
 - Kriging, some model-comparison paths, and some ionosphere monitoring utilities are research-facing and should be validated for the selected dataset.
 - `sample_data/` is meant for smoke tests, tutorials, and regression-style checks. It is not a full scientific validation dataset for every mode.
+- GLONASS and QZSS are supported only in SP3-vs-SP3 orbit comparisons (no antenna offsets or group delays).
+- Downloads cover BKG, CDDIS, CODE, and the EUREF archive at BKG (no IGN/WHU mirrors, no ATX/SINEX/BLQ files); OPS long product names are generated from GPS week 2238 (November 2022), older short product names are not, long observation names are generated for daily 30 s mixed files (`01D_30S_MO`) only, and archive layouts not confirmed by a listing are marked "assumed" in the product catalogue.
+- The validation configurations that stay outside their accuracy limits for an established cause that is not a GNX-py defect are listed as known limitations in [`CHANGELOG.md`](CHANGELOG.md).
 
 These limitations are intentional status markers. They make it easier to use stable paths confidently while keeping experimental GNSS research workflows accessible for validation.
 
@@ -279,7 +368,7 @@ Pull requests are welcome, especially for:
 
 - additional validation datasets and reproducible examples;
 - documentation and tutorial improvements;
-- tests for new constellation/signal/product combinations;
+- validation cases for new constellation/signal/product combinations (the validation suite is not part of this repository: describe the data, the settings and the expected result in the pull request);
 - performance improvements that preserve numerical behavior;
 - careful API cleanup with compatibility notes.
 
@@ -289,16 +378,20 @@ For ideas, bugs, or questions, open a GitHub Issue.
 
 ## Citation
 
-If you use GNX-py in research, please cite the project repository and the relevant GNSS products, standards, and scientific methods used in your workflow. A formal `CITATION.cff` file or DOI entry has not yet been added.
+If you use GNX-py in research, please cite it with the metadata of [`CITATION.cff`](CITATION.cff) (GitHub shows it as "Cite this repository"), together with the GNSS products, standards, and scientific methods used in your workflow.
 
 ---
 
 ## License
 
-The package metadata declares the project license as **MIT** in `pyproject.toml`.
+GNX-py is released under the **MIT** license; see [`LICENSE`](LICENSE). Third-party code and data included in the repository keep their own licences and attributions; they (the filterpy Kalman update, the IERS tide routines, the RTKLIB ocean-loading table, phase wind-up and LAMBDA search, the sample data) are listed in [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES). The GNSS data in `sample_data/` and the station observations behind the tutorial TEC files are not under the MIT license: they keep their providers' terms (the IGS terms of use for most products, CC BY 4.0 for the EPN/ROB station observations, CC BY-NC 4.0 for the GFZ bias file), and their producers should be cited as listed there.
 
 ---
 
 ## Acknowledgements
 
 GNX-py workflows align with GNSS standards and products from the broader geodesy community, including RINEX, SP3, ANTEX, SINEX, IONEX/GIM, IGS/MGEX-style product conventions, and classical PPP and ionospheric modelling literature.
+
+Compact RINEX (Hatanaka-compressed) observation files are decompressed in memory with the RNXCMP `crx2rnx` program of the Geospatial Information Authority of Japan, which the `hatanaka` Python package installs (MIT; it bundles RNXCMP under the GSI terms); GNX starts it through its internal `posix_spawn` helper (`gnx_py.core._proc.run`). The format and the tools are described in:
+
+- Hatanaka, Y. (2008). A Compression Format and Tools for GNSS Observation Data. *Bulletin of the Geographical Survey Institute*, 55, 21–30.

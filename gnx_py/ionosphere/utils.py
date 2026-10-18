@@ -14,6 +14,8 @@ Notes:
 """
 import os
 import logging
+import difflib as _difflib
+import numbers as _numbers
 from typing import Optional, Iterable, Tuple, List, Dict
 from pathlib import Path
 import pandas as pd
@@ -23,13 +25,101 @@ PI = np.pi
 
 logger = logging.getLogger(__name__)
 
+
+# --- argument checks shared by the ionosphere helpers (utils, models, monitoring) ---
+def _value_repr(value) -> str:
+    """repr of a user value; numpy scalars are shown as plain Python values."""
+    if isinstance(value, str):
+        return repr(str(value))
+    if isinstance(value, (np.integer, np.floating, np.bool_)):
+        return repr(value.item())
+    return repr(value)
+
+
+def _did_you_mean(value, allowed, *, fuzzy: bool = True) -> Optional[str]:
+    """Closest allowed name for a case (or, with ``fuzzy``, spelling) variant of ``value``."""
+    if not isinstance(value, str):
+        return None
+    names = {a.casefold(): a for a in allowed if isinstance(a, str)}
+    hit = names.get(value.strip().casefold())
+    if hit is not None or not fuzzy:
+        return hit
+    close = _difflib.get_close_matches(value.strip().casefold(), list(names), n=1, cutoff=0.6)
+    return names[close[0]] if close else None
+
+
+def _check_choice(name: str, value, allowed, *, extra: str = "", fuzzy: bool = True):
+    """Raise ValueError unless ``value`` is one of ``allowed`` (exact match, no normalisation).
+
+    The message lists the valid values and, for a case or spelling variant, adds
+    "did you mean ...?" (``fuzzy=False`` limits the hint to case variants, for
+    short codes where a spelling neighbour would mislead, e.g. 'GLO' -> 'GAL').
+    """
+    allowed = list(allowed)
+    if not isinstance(value, (bool, np.bool_)):
+        for a in allowed:
+            if isinstance(a, str) != isinstance(value, str):
+                continue
+            try:
+                if a == value:
+                    return value
+            except (TypeError, ValueError):  # e.g. an array compared with a scalar
+                break
+    msg = f"{name} must be one of {allowed!r} (got {_value_repr(value)})"
+    hint = _did_you_mean(value, allowed, fuzzy=fuzzy)
+    if hint is not None:
+        msg += f"; did you mean {hint!r}?"
+    if extra:
+        msg += f" {extra}"
+    raise ValueError(msg)
+
+
+def _fmt_bound(b) -> str:
+    return f"{b:g}" if isinstance(b, float) else str(b)
+
+
+def _check_number(name: str, value, *, gt=None, ge=None, lt=None, le=None, unit: str = "",
+                  allow_none: bool = False, integer: bool = False):
+    """Raise ValueError unless ``value`` is a finite (integer) number inside the given bounds.
+
+    The message names the setting and the allowed range, e.g.
+    ``"iono_h_m must be > 0 (got 0)"`` or ``"min_elev_deg must be in [0, 90] deg (got 95)"``.
+    """
+    if value is None and allow_none:
+        return None
+    lo = (f"({_fmt_bound(gt)}" if gt is not None else f"[{_fmt_bound(ge)}" if ge is not None else None)
+    hi = (f"{_fmt_bound(lt)})" if lt is not None else f"{_fmt_bound(le)}]" if le is not None else None)
+    if lo and hi:
+        cond = f"in {lo}, {hi}"
+    elif lo:
+        cond = (">" if gt is not None else ">=") + " " + lo[1:]
+    elif hi:
+        cond = ("<" if lt is not None else "<=") + " " + hi[:-1]
+    else:
+        cond = ""
+    cond = (cond + (f" {unit}" if unit and cond else "")).strip()
+    kind = "an integer" if integer else "a finite number"
+    number = (isinstance(value, _numbers.Real) and not isinstance(value, (bool, np.bool_))
+              and bool(np.isfinite(value)))
+    if number and integer and not float(value).is_integer():
+        number = False
+    if not number:
+        what = f"{kind} {cond}".strip()
+        none_ok = " or None" if allow_none else ""
+        raise ValueError(f"{name} must be {what}{none_ok} (got {_value_repr(value)})")
+    bad = ((gt is not None and not value > gt) or (ge is not None and not value >= ge)
+           or (lt is not None and not value < lt) or (le is not None and not value <= le))
+    if bad:
+        raise ValueError(f"{name} must be {cond} (got {_value_repr(value)})")
+    return int(value) if integer else value
+
 def get_ipp(ev, az, lat, lon, ish=450.0, R=6371.0):
     """Compute ionospheric pierce point (IPP) geographic coordinates.
 
         Status:
-            Active geometry helper. A similar implementation also exists on
-            ``TECInterpolator``; keep them numerically equivalent if either is
-            changed.
+            Active geometry helper (NTCM). ``TECInterpolator.get_ipp`` (GIM path)
+            computes the same pierce point except beyond the pole (see Notes):
+            keep the two equal elsewhere if either is changed.
 
         Computes the latitude and longitude of the ionospheric pierce point (IPP)
         at a specified thin-shell ionosphere height using the receiver geodetic
@@ -54,6 +144,13 @@ def get_ipp(ev, az, lat, lon, ish=450.0, R=6371.0):
               NumPy broadcasting rules based on the inputs.
             - Elevation and azimuth are assumed to follow the local topocentric
               frame at the receiver location.
+            - The longitude is lon + asin(sin(psi) sin(az) / cos(lat_ipp)), the
+              formula of the NTCM-G model description: a line of sight crossing
+              the pole (high-latitude receivers looking poleward) gets its pierce
+              point folded onto the near meridian, as Annex D of that description
+              computes it (NTCM uses this function). ``TECInterpolator.get_ipp``
+              (GIM path) puts such a point on the far meridian, as RTKLIB
+              ``ionppp``; BDGIM has its own pierce point (``bdgim.ipp_rad``).
         """
 
     ev = np.array(ev, dtype=float)  # Upewnij się, że `ev` jest tablicą typu float
@@ -131,7 +228,7 @@ def stec_mf(ev, ish=450e03, R=6371e03, no=1):
         of the input elevation array.
 
     Raises:
-        AssertionError: If `no` is not in {1, 2, 3, 4}.
+        ValueError: If `no` is not one of 1, 2, 3, 4.
 
     Notes:
         - The mapping function (MF) is typically multiplied by vertical TEC (VTEC)
@@ -140,9 +237,9 @@ def stec_mf(ev, ish=450e03, R=6371e03, no=1):
         - Input elevation is converted to radians internally.
     """
 
+    _check_choice("no", no, [1, 2, 3, 4])
     ev = np.array(ev, dtype=float)
     ev = np.deg2rad(ev)
-    assert no in [1, 2, 3, 4]
     if no == 1:
         sinz = (R / (R + ish)) * np.sin(0.9782 * ((PI / 2) - ev))
         mf = 1 / (np.sqrt(1 - (sinz ** 2)))
@@ -157,6 +254,12 @@ def stec_mf(ev, ish=450e03, R=6371e03, no=1):
 
     return mf
 
+#: TEC columns of TECSession STEC files stored in el/m^2 (converted to TECU by ``load_stec_folder``)
+STEC_TEC_COLUMNS = ("leveled_tec", "median_leveled_tec", "code_tec", "phase_tec", "leveled_tec_sg",
+                    "leveled_tec_cheby", "stec_uncal", "stec_sat", "stec_rcv", "stec_full")
+STEC_TEC_UNITS = ("el/m2", "TECU")
+
+
 def load_stec_folder(
     folder: os.PathLike | str,
     *,
@@ -168,7 +271,8 @@ def load_stec_folder(
     keep_columns: Optional[Iterable[str]] = None,
     required_columns: Optional[Iterable[str]] = None,
     quiet: bool = False,
-    skip_negative:bool=True
+    skip_negative:bool=True,
+    tec_units: str = "el/m2",
 ) -> Tuple[pd.DataFrame, Dict[str, object]]:
     """
     Load STEC parquet files from a folder.
@@ -185,10 +289,11 @@ def load_stec_folder(
       2) Reads the parquet into a DataFrame. By default all stored columns are
          retained.
       3) If an elevation column is available, keeps only rows with
-         ``ev > min_elev_deg``.
+         ``ev >= min_elev_deg``.
       4) If a TEC column is available and ``skip_negative`` is true, rejects the
          entire file if any ``leveled_tec`` is negative.
-      5) Appends an extra column ``name`` with the station name and collects results.
+      5) Converts every TEC column to TECU (see ``tec_units``).
+      6) Appends an extra column ``name`` with the station name and collects results.
 
     Parameters
     ----------
@@ -197,7 +302,8 @@ def load_stec_folder(
     file_suffix : str, optional
         File name suffix to match (default: ``"STEC.parquet.gzip"``).
     min_elev_deg : float, optional
-        Minimum elevation threshold in degrees; rows with ``ev <= min_elev_deg`` are dropped.
+        Minimum elevation threshold in degrees; rows with ``ev < min_elev_deg`` are dropped
+        (a sample exactly at the threshold is kept).
     station_name_len : int, optional
         Number of leading characters used as the station name (default: 6).
         Assumes filenames begin with a station identifier (e.g., ``"ABCD01…"``).
@@ -205,7 +311,8 @@ def load_stec_folder(
         Number of leading characters used as the short unique station ID (default: 4).
     network_filter : Iterable[str] | None, optional
         If provided, keep only files whose short unique ID is in this set/list.
-        (Comparison is case-sensitive.)
+        (Comparison is case-sensitive.) A single string raises TypeError: pass
+        ``["BAUT", "BOGE"]``, not ``"BAUTBOGE"``.
     keep_columns : Iterable[str] | None, optional
         Optional output/read column subset. When ``None`` (default), all columns
         stored in each parquet file are loaded and preserved. When provided,
@@ -224,6 +331,14 @@ def load_stec_folder(
     skip_negative : bool, optional
         If True and the TEC column is present, skip files containing negative
         TEC values.
+    tec_units : {"el/m2", "TECU"}, optional
+        Unit of the TEC columns stored in the files (default ``"el/m2"``, as
+        written by ``TECSession``). The output TEC columns are always in TECU:
+        with ``"el/m2"`` every TEC column present (the TEC role column, e.g.
+        ``leveled_tec``, plus ``code_tec``, ``phase_tec``, ``median_leveled_tec``,
+        ``leveled_tec_sg``, ``leveled_tec_cheby``, ``stec_uncal``, ``stec_sat``,
+        ``stec_rcv`` and ``stec_full``) is divided by 1e16; with ``"TECU"`` the
+        values are kept. Columns ending in ``_tecu`` are never converted.
 
     Returns
     -------
@@ -261,6 +376,12 @@ def load_stec_folder(
     folder = Path(folder)
     if not folder.is_dir():
         raise FileNotFoundError(f"Folder not found or not a directory: {folder}")
+    _check_choice("tec_units", tec_units, STEC_TEC_UNITS)
+    if network_filter is not None:
+        if isinstance(network_filter, (str, bytes)):
+            raise TypeError(f"network_filter must be a list/set of station IDs, not a single string "
+                            f"(got {network_filter!r}); e.g. network_filter=['BAUT', 'BOGE']")
+        network_filter = set(network_filter)
 
     default_role_columns = ("lat_ipp", "lon_ipp", "leveled_tec", "ev", "sv", "time")
     role_columns = list(default_role_columns)
@@ -333,11 +454,14 @@ def load_stec_folder(
             return df.reset_index(level=missing_index_cols)
         return df
 
+    tec_divisor = 1e16 if tec_units == "el/m2" else 1.0
+    tec_columns = tuple(dict.fromkeys((tec_col,) + STEC_TEC_COLUMNS))
+
     for fpath in files:
+        # station name and short ID, computed once (also used for files that fail to load)
+        name = fpath.name[:station_name_len]
+        unique_id = name[:unique_id_len]
         try:
-            # Names as in your original logic
-            name = fpath.name[:station_name_len]
-            unique_id = name[:unique_id_len]
             stations_unique.add(unique_id)
 
             if network_filter is not None and unique_id not in network_filter:
@@ -350,7 +474,7 @@ def load_stec_folder(
             # Elevation filtering and column selection
             if min_elev_deg is not None:
                 if ev_col in df.columns:
-                    df = df[df[ev_col] > float(min_elev_deg)]
+                    df = df[df[ev_col] >= float(min_elev_deg)]
                 elif not quiet:
                     logger.warning(
                         "[STEC LOAD] file=%s event=skip-elevation-filter missing_column=%s",
@@ -382,8 +506,10 @@ def load_stec_folder(
                 continue
             # Add station name column and collect
             df = df.copy()
-            if tec_col in df.columns:
-                df[tec_col] /= 1e16
+            if tec_divisor != 1.0:
+                for col in tec_columns:
+                    if col in df.columns and not col.endswith("_tecu"):
+                        df[col] = df[col] / tec_divisor
             df["name"] = name
 
             if keep_columns_tuple is not None:
@@ -403,7 +529,7 @@ def load_stec_folder(
         except Exception as e:
             errors.append((fpath.name, str(e)))
             rejected_files.append(fpath.name)
-            stations_rejected.add(fpath.name[:unique_id_len])
+            stations_rejected.add(unique_id)
             if not quiet:
                 logger.warning("[STEC LOAD] file=%s event=error error=%s", fpath.name, e)
 

@@ -1,30 +1,40 @@
-import pandas as pd
+"""Statistical helpers of the PPP tutorial (``precise_point_positioning.ipynb``)."""
+
 import numpy as np
+import pandas as pd
+
 
 def measure_convergence_time(df: pd.DataFrame,
                              threshold: float = 0.05,
                              mode: str = '3D',
                              min_stable_duration: int = 10) -> float:
     """
-    Oblicza czas konwergencji PPP jako pierwszą epokę, po której błąd
-    (2D lub 3D) spada poniżej progu i już nie rośnie powyżej niego.
-    
-    Parametry:
+    Convergence time of a PPP solution measured on its accuracy: the first
+    epoch at which the 2D or 3D error has stayed below ``threshold`` for
+    ``min_stable_duration`` consecutive epochs.
+
+    Unlike ``solution["ct_min"]`` of GNX-py, which the filter derives from the
+    stability of its own position estimate, this measure needs the reference
+    coordinates (the ``de``, ``dn``, ``du`` columns).
+
+    Parameters
     ----------
     df : pd.DataFrame
-        DataFrame z indeksem time i kolumnami ['de', 'dn', 'du'].
+        Solution indexed by time, with the columns ``de``, ``dn`` and ``du`` [m].
     threshold : float
-        Próg błędu konwergencji w metrach.
+        Convergence threshold of the error, in metres.
     mode : str
-        '2D' lub '3D' — wybór sposobu obliczania błędu.
+        ``'2D'`` (east and north) or ``'3D'`` (east, north and up).
     min_stable_duration : int
-        Liczba kolejnych epok poniżej progu wymagana do uznania konwergencji.
-    
-    Zwraca:
+        Number of consecutive epochs below the threshold required to accept
+        convergence.
+
+    Returns
     -------
-    float:
-        Czas (w minutach od początku), w którym nastąpiła trwała konwergencja.
-        Zwraca np.nan jeśli konwergencja nie wystąpiła.
+    float
+        Time in minutes from the first epoch of ``df`` to the epoch at which
+        the error has stayed below the threshold for ``min_stable_duration``
+        epochs; ``np.nan`` when that never happens.
     """
     if not set(['de', 'dn', 'du']).issubset(df.columns):
         raise ValueError("DataFrame must contain 'de', 'dn', 'du' columns.")
@@ -40,7 +50,7 @@ def measure_convergence_time(df: pd.DataFrame,
     else:
         raise ValueError("mode must be '2D' or '3D'")
 
-    # Wyszukiwanie konwergencji
+    # first run of min_stable_duration consecutive epochs below the threshold
     below_thresh = df['error'] < threshold
     counter = 0
     for i in range(len(df)):
@@ -52,4 +62,4 @@ def measure_convergence_time(df: pd.DataFrame,
         else:
             counter = 0
 
-    return np.nan  # jeśli nie osiągnięto konwergencji
+    return np.nan  # no convergence

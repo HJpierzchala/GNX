@@ -8,10 +8,16 @@ __pycache__/
 .idea/
 .vscode/
 
-# pliki instalacyjne
+# virtual environments, build and packaging output
+.venv/
+venv/
+env/
 *.egg-info/
+pip-wheel-metadata/
+build/
+dist/
 
-# duże dane (jak się kiedyś pojawią)
+# large data (anything else is downloaded by the user)
 data/
 *.sp3
 *.clk
@@ -19,20 +25,18 @@ data/
 *.nc
 *.zip
 
-.venv/
-venv/
-env/
-.venv/
-venv/
-env/
-*.egg-info/
-build/
-dist/
+# Sample data of the examples and tutorials: tracked although the patterns above match them (on a
+# case-insensitive file system *.sp3 also matches .SP3); keep each name explicit.
+!/sample_data/COD0MGXFIN_20240340000_01D_05M_ORB.SP3
+!/sample_data/COD0MGXFIN_20240350000_01D_05M_ORB.SP3
+!/sample_data/COD0MGXFIN_20240360000_01D_05M_ORB.SP3
+!/sample_data/GRG0MGXFIN_20240340000_01D_05M_ORB.SP3
+!/sample_data/GRG0MGXFIN_20240350000_01D_05M_ORB.SP3
+!/sample_data/GRG0MGXFIN_20240360000_01D_05M_ORB.SP3
+!/sample_data/BRD400DLR_S_20240350000_01D_MN.rnx
+!/sample_data/BRDC00IGS_R_20240350000_01D_MN.rnx
 
-.venv/
-__pycache__/
-.pytest_cache/
-
+# outputs of the examples, tutorials and tools
 outputs/
 output/
 results/
@@ -40,7 +44,6 @@ tmp/
 logs/
 reports/
 validation_out/
-
 sample_data/output/
 sample_data/tec_output/
 examples/output/
@@ -55,8 +58,31 @@ examples/output/
 *.h5
 *.hdf5
 
+# tool caches
+.pytest_cache/
 .coverage
 htmlcov/
 .mypy_cache/
 .ruff_cache/
-pip-wheel-metadata/
+
+# secrets
+.env
+
+# Tutorial build artifacts and the files written by the tutorial notebooks (figures/roti, figures/gix of
+# activity_indexes.ipynb and output/kriging of kriging.ipynb are regenerated on every run)
+tutorial/_build/
+tutorial/ionosphere/figures/
+tutorial/ionosphere/output/
+
+# Sample STEC results of the examples (sample_data/output/, matched by output/ and *.parquet.gzip above): the four
+# tracked files stay tracked by name, anything else written there stays local
+!/sample_data/output/
+/sample_data/output/*
+!/sample_data/output/BOR1_E_STEC.parquet.gzip
+!/sample_data/output/BOR1_G_STEC.parquet.gzip
+!/sample_data/output/BRUX_E_STEC.parquet.gzip
+!/sample_data/output/BRUX_G_STEC.parquet.gzip
+
+# STEC network of 2024-035 read by the ionosphere tutorials activity_indexes.ipynb and kriging.ipynb (matched by
+# *.parquet.gzip above): tracked and published, anything else in that folder stays local
+!/tutorial/ionosphere/network/*_STEC.parquet.gzip

@@ -1,0 +1,28 @@
+# Citation metadata of GNX-py (Citation File Format 1.2.0, https://citation-file-format.github.io).
+# "version" equals the version in pyproject.toml; a DOI or a paper ("preferred-citation") can be added when one
+# exists.
+cff-version: 1.2.0
+message: "If you use GNX-py in your research, please cite it using the metadata from this file."
+type: software
+title: "GNX-py"
+version: "1.0.0"
+date-released: "2026-10-17"
+abstract: >-
+  GNX-py is a Python library for GNSS data processing: single point positioning (SPP), precise point
+  positioning (PPP) with optional ambiguity resolution, signal-in-space (SIS/SISRE) evaluation of broadcast
+  and precise orbits and clocks, slant and vertical TEC processing with ionospheric models, and GNSS data
+  downloads, for GPS, Galileo and BeiDou.
+authors:
+  - family-names: "Pierzchała"
+    given-names: "Hubert"
+repository-code: "https://github.com/HJpierzchala/GNX"
+url: "https://github.com/HJpierzchala/GNX"
+license: MIT
+keywords:
+  - GNSS
+  - PPP
+  - SPP
+  - SISRE
+  - ionosphere
+  - STEC
+  - RINEX

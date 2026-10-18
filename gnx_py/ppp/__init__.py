@@ -27,6 +27,10 @@ from .pppar import *
 # documents the historical preprocessing surface.
 from .preprocessing import *
 
+# The PPP filters' EKF (Cholesky gain, bug-fix stage 11c); every filter module imports it as
+# ``ExtendedKalmanFilter``, so ``gnx_py.ppp.ExtendedKalmanFilter`` is this class too.
+from .ppp_helpers import GNXExtendedKalmanFilter
+
 # Compatibility snapshot for ``from gnx_py.ppp import *``. Keep this broad for
 # now: it preserves the historical public surface while tests document which
 # names are intended PPP API and which are candidates for future pruning.
@@ -44,6 +48,7 @@ __all__ = (
     "GIMReader",
     "GNSSDataProcessor2",
     "GNSS_MODE_SIGNALS",
+    "GNXExtendedKalmanFilter",
     "Generic",
     "List",
     "Literal",
@@ -58,13 +63,10 @@ __all__ = (
     "PPPFilterMultiGNSSIonConstGEC",
     "PPPResult",
     "PPPSession",
-    "PPPSingleFreqMultiGNSS",
     "PPPSingleFreqSingleGNSS",
     "PPPUdGenericMixedGNSS",
     "PPPUdMixedGNSS",
-    "PPPUdMultiGNSS",
     "PPPUdSingleGNSS",
-    "PPPUducSFMultiGNSS",
     "PPPUducSFSingleGNSS",
     "Path",
     "SIGNALS",
@@ -92,7 +94,6 @@ __all__ = (
     "decorrel",
     "ecef2geodetic",
     "ecef_to_enu",
-    "emission_interp",
     "field",
     "frequency_hz",
     "guarded_session_run",

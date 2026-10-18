@@ -1,0 +1,399 @@
+THIRD-PARTY NOTICES FOR GNX (gnx_py)
+=====================================
+
+GNX is distributed under the MIT License (see LICENSE). Parts of this repository
+are derived from, or are, third-party code and data. They keep their own licences
+and attributions, listed below. The Python packages GNX depends on (numpy, scipy,
+pandas, xarray, astropy, Cartopy, numba, filterpy, hatanaka, ...) are installed
+separately and are not part of this repository.
+
+
+1. filterpy (MIT License)
+-------------------------
+
+Where:  gnx_py/ppp/ppp_helpers.py, GNXExtendedKalmanFilter.predict_update and
+        GNXExtendedKalmanFilter.update.
+What:   adapted from filterpy 1.4.5, filterpy/kalman/EKF.py
+        (ExtendedKalmanFilter.predict_update and .update). GNX changes the gain
+        (Cholesky solve instead of an explicit inverse) and skips rejected rows;
+        the differences are described in the source.
+
+    The MIT License (MIT)
+
+    Copyright (c) 2015 Roger R. Labbe Jr
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+    THE SOFTWARE.
+
+
+2. IERS Conventions software (IERS Conventions Software License)
+-----------------------------------------------------------------
+
+Where:  gnx_py/models/tides.py, the step-2 solid-tide correction:
+        step2_diurnal, step2_long_period, solid_tide_step2,
+        _fundamental_arguments_deg and the tables _STEP2DIU / _STEP2LON.
+What:   a derived work of the IERS Conventions (2010) routines STEP2DIU and
+        STEP2LON (called by DEHANTTIDEINEL; V. Dehant, original code 1996;
+        B.E. Stetzler, standardised 2009-2010). GNX re-implements them in NumPy
+        (vectorised over epochs, renamed, inputs as GPST epoch labels converted to
+        the routines' UTC hour and TT centuries); the coefficient tables and the
+        fundamental arguments are those of the routines. This is not IERS
+        Conventions software, and it is neither distributed nor endorsed by the
+        IERS Conventions Center. The other solid-tide terms of tides.py (step 1)
+        are written from the equations of the IERS Conventions (2010).
+
+Reference (please cite when you publish results that use these corrections):
+
+    Petit, G. and Luzum, B. (eds.), IERS Conventions (2010), IERS Technical
+    Note No. 36, Frankfurt am Main: Verlag des Bundesamts fuer Kartographie und
+    Geodaesie, 2010.
+
+    Mathews, P. M., Dehant, V., and Gipson, J. M., 1997, "Tidal station
+    displacements", J. Geophys. Res., 102(B9), pp. 20,469-20,477.
+
+The licence notice of the original routines, reproduced intact:
+
+    Copyright (C) 2008
+    IERS Conventions Center
+
+    ==================================
+    IERS Conventions Software License
+    ==================================
+
+    NOTICE TO USER:
+
+    BY USING THIS SOFTWARE YOU ACCEPT THE FOLLOWING TERMS AND CONDITIONS
+    WHICH APPLY TO ITS USE.
+
+    1. The Software is provided by the IERS Conventions Center ("the
+       Center").
+
+    2. Permission is granted to anyone to use the Software for any
+       purpose, including commercial applications, free of charge,
+       subject to the conditions and restrictions listed below.
+
+    3. You (the user) may adapt the Software and its algorithms for your
+       own purposes and you may distribute the resulting "derived work"
+       to others, provided that the derived work complies with the
+       following requirements:
+
+       a) Your work shall be clearly identified so that it cannot be
+          mistaken for IERS Conventions software and that it has been
+          neither distributed by nor endorsed by the Center.
+
+       b) Your work (including source code) must contain descriptions of
+          how the derived work is based upon and/or differs from the
+          original Software.
+
+       c) The name(s) of all modified routine(s) that you distribute
+          shall be changed.
+
+       d) The origin of the IERS Conventions components of your derived
+          work must not be misrepresented; you must not claim that you
+          wrote the original Software.
+
+       e) The source code must be included for all routine(s) that you
+          distribute.  This notice must be reproduced intact in any
+          source distribution.
+
+    4. In any published work produced by the user and which includes
+       results achieved by using the Software, you shall acknowledge
+       that the Software was used in obtaining those results.
+
+    5. The Software is provided to the user "as is" and the Center makes
+       no warranty as to its use or performance.   The Center does not
+       and cannot warrant the performance or results which the user may
+       obtain by using the Software.  The Center makes no warranties,
+       express or implied, as to non-infringement of third party rights,
+       merchantability, or fitness for any particular purpose.  In no
+       event will the Center be liable to the user for any consequential,
+       incidental, or special damages, including any lost profits or lost
+       savings, even if a Center representative has been advised of such
+       damages, or for any claim by any third party.
+
+    Correspondence concerning IERS Conventions software should be
+    addressed as follows:
+
+                       Gerard Petit
+       Internet email: gpetit[at]bipm.org
+       Postal address: IERS Conventions Center
+                       Time, frequency and gravimetry section, BIPM
+                       Pavillon de Breteuil
+                       92312 Sevres  FRANCE
+
+       or
+
+                       Brian Luzum
+       Internet email: brian.luzum[at]usno.navy.mil
+       Postal address: IERS Conventions Center
+                       Earth Orientation Department
+                       3450 Massachusetts Ave, NW
+                       Washington, DC 20392
+
+
+3. RTKLIB (BSD 2-clause License)
+--------------------------------
+
+Where and what (all in the gnx_py package):
+
+  gnx_py/models/ocean_loading.py, the table _OTL_ARGS and the function
+        otl_arguments: a Python port of the ocean tide loading displacement of
+        RTKLIB 2.4.2 p13, src/ppp.c, function tide_oload (Copyright (C)
+        2010-2018 by T.TAKASU, All rights reserved): its args[][5] table
+        (angular speed and Doodson multipliers of the 11 BLQ constituents) is
+        copied value for value, and the astronomical arguments repeat its
+        arithmetic and summation order. RTKLIB took the arguments from the IERS
+        routine ARG.f (Doodson angles h0, s0, p0 at 0h UT); ocean_loading_enu
+        rotates the result as RTKLIB's tidedisp does.
+
+  gnx_py/models/corrections.py, the functions windupcorr and
+        process_windup_correction_vectorized: the phase wind-up of RTKLIB 2.4.2,
+        src/rtkcmn.c, function windupcorr (T. Takasu; model of Wu et al., 1993),
+        ported with its vectors and arithmetic; the vectorised function repeats
+        it over epochs (unwrapped with numpy.unwrap) and optionally takes the
+        satellite body axes of an attitude model or the orbit-normal frame.
+
+  gnx_py/ppp/pppar.py, the functions ldldecom, decorrel and ssearch (with the
+        helpers _gauss, _perm, _round_half_up and _sgn): a Python port of the
+        LAMBDA / MLAMBDA integer least-squares estimation of RTKLIB 2.4.2,
+        src/lambda.c (functions LD, gauss, perm, reduction and search; T. Takasu).
+        The differences are described in the source.
+
+RTKLIB itself is not part of this repository. Apart from the files listed above,
+the GNX docstrings and comments that name an RTKLIB function (for example the mean
+pole and pole tide of gnx_py/models/tides.py, which follow the IERS Conventions
+2010 equations as RTKLIB tide_pole and iers_mean_pole do) describe the model GNX
+follows and are a reference, not a copy of RTKLIB code.
+
+    The RTKLIB software package is distributed under the following BSD 2-clause
+    license (http://opensource.org/licenses/BSD-2-Clause) and additional two
+    exclusive clauses. Users are permitted to develop, produce or sell their own
+    non-commercial or commercial products utilizing, linking or including RTKLIB as
+    long as they comply with the license.
+
+              Copyright (c) 2007-2013, T. Takasu, All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the following conditions are met:
+
+    - Redistributions of source code must retain the above copyright notice, this
+      list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright notice, this
+      list of conditions and the following disclaimer in the documentation and/or
+      other materials provided with the distribution.
+
+    - The software package includes some companion executive binaries or shared
+      libraries necessary to execute APs on Windows. These licenses succeed to the
+      original ones of these software.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+    GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+    HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+    THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+(The notice above is the LICENSE section of RTKLIB 2.4.2 readme.txt; the source
+files of 2.4.2 p13 carry "Copyright (C) 2007-2020 by T.TAKASU, All rights reserved.")
+
+
+4. Data in this repository
+--------------------------
+
+The GNSS data and products below are redistributed for the examples and the
+tutorials under their published file names. Their content is unchanged; the
+archives publish them gzip-compressed (.gz), and all of them except the BRUX
+observation file (.crx.gz) and igs20.atx are stored here decompressed. The files
+were obtained from the public archives of the BKG GNSS Data Center
+(https://igs.bkg.bund.de) and of NASA's Crustal Dynamics Data Information System
+(CDDIS), data centres of the International GNSS Service (IGS).
+
+These files are NOT covered by the MIT License of GNX-py. They remain the work of
+their producers and keep the terms of their providers, summarised below as the
+providers publish them (checked on 2026-10-17; the links give the full terms).
+Please cite the producers when you use the files or results computed from them.
+
+Terms of the IGS (all files distributed through the IGS data centres)
+
+  IGS Data and Product Disclaimer and Terms of Use, 5 August 2020,
+  https://igs.org/wp-content/uploads/2020/09/IGS-Data-and-Product-Disclaimer-and-Terms-of-Use-200805.pdf:
+  IGS data and products "have been made openly available for use without
+  restriction, and continue to be offered free of cost or obligation", and "By
+  accessing data, products, and any other information from the IGS, users agree
+  to appropriately cite and attribute these resources to providers and their
+  sponsors, acknowledgment of IGS and its contributing organizations, and to
+  adherence to professional and ethical standards." The IGS does not publish a
+  Creative Commons or other named licence for its data and products; the
+  citation it asks for (https://igs.org/documents-posters/#citation) is Johnston
+  et al. (2017), listed at the end of this section. NASA CDDIS lists IGS
+  collections it archives (for example the broadcast navigation below) as free
+  and open data under the NASA Earthdata Data Use and Citation Guidance.
+
+sample_data/ (day 2024-035, with 2024-034 and 2024-036 for the precise orbits)
+
+  BRDC00IGS_R_20240350000_01D_MN.rnx
+      Broadcast navigation merged by the IGS. Terms: IGS terms above.
+      Citation (CDDIS): International GNSS Service (IGS), Ground-Based Global
+      Navigation Satellite System Combined Broadcast Ephemeris Data (daily
+      files) from NASA CDDIS, Greenbelt, MD, USA, archived by NASA Crustal
+      Dynamics Data Information System (CDDIS),
+      https://doi.org/10.5067/GNSS/gnss_daily_b_001.
+
+  BRD400DLR_S_20240350000_01D_MN.rnx
+      RINEX 4 broadcast navigation merged by DLR/GSOC for the IGS Multi-GNSS
+      Experiment (MGEX). Citation: Montenbruck, O. and Steigenberger, P. (2022),
+      BRD400DLR: DLR's merged multi-GNSS broadcast ephemeris product in RINEX 4
+      format [Data set], DLR/GSOC, https://doi.org/10.57677/BRD400DLR (the DOI
+      resolves to the IGS MGEX product description). No licence is stated by
+      the DOI record or the product page: IGS terms above.
+
+  BRUX00BEL_R_20240350000_01D_30S_MO.crx.gz
+      Observations of the IGS / EUREF Permanent Network (EPN) station BRUX,
+      operated by the Royal Observatory of Belgium (ROB). Licence: Creative
+      Commons Attribution 4.0 International (CC BY 4.0,
+      https://creativecommons.org/licenses/by/4.0/), stated by ROB on the DOI
+      landing page https://doi.org/10.24414/FST8-P256 (named in the file
+      header) and in the station record https://doi.org/10.24414/ROB-GNSS-BRUX00BEL.
+      Citation (as given by ROB): Royal Observatory of Belgium (2018): ROB GNSS
+      Network Data, Available from Royal Observatory of Belgium.
+      https://doi.org/10.24414/FST8-P256
+
+  COD0MGXFIN_20240340000_01D_05M_ORB.SP3 (and the files of 035 and 036)
+      MGEX orbits and clocks of the Center for Orbit Determination in Europe
+      (CODE), Astronomical Institute of the University of Bern (AIUB).
+      Citation: Dach, R., Schaer, S., Arnold, D., Brockmann, E., Kalarus, M.S.,
+      Lasser, M., Stebler, P. and Jaeggi, A. (2024), CODE product series for the
+      IGS-MGEX project [Dataset], Astronomical Institute, University of Bern,
+      https://doi.org/10.48350/197028. The SP3 headers name the product DOI
+      10.48350/185742, which doi.org does not resolve ("DOI Not Found",
+      2026-10-17). The repository record (BORIS, University of Bern) states
+      "BORIS standard license" and open access; AIUB publishes no named licence
+      for the product files: IGS terms above.
+
+  COD0OPSFIN_20240350000_01D_01D_OSB.BIA, COD0OPSFIN_20240350000_01D_01H_GIM.INX
+      CODE final observable-specific biases and global ionosphere maps.
+      Citation: Dach, R. et al. (2024), CODE final product series for the IGS
+      [Dataset], Astronomical Institute, University of Bern,
+      https://doi.org/10.48350/197025. Terms as for the CODE MGEX files.
+
+  GRG0MGXFIN_20240340000_01D_05M_ORB.SP3 (and the files of 035 and 036),
+  GRG0MGXFIN_20240350000_01D_01D_OSB.BIA
+      Orbits, clocks and biases of the CNES/CLS IGS analysis centre (GRG). No
+      product DOI and no licence are published by the provider: IGS terms
+      above. The bias file cites Banville, S., Geng, J., Loyer, S. et al.
+      (2020), On the interoperability of IGS products for precise point
+      positioning with ambiguity resolution, J. Geod. 94, 10,
+      https://doi.org/10.1007/s00190-019-01335-w.
+
+  GFZ0MGXRAP_20240350000_01D_01D_OSB.BIA
+      MGEX rapid observable-specific biases of the GFZ Helmholtz Centre for
+      Geosciences, Potsdam. GFZ Data Services publishes this product series as
+      Deng, Z., Nischan, T. and Bradke, M. (2017), Multi-GNSS Rapid Orbit-,
+      Clock- & EOP-Product Series, GFZ Data Services,
+      https://doi.org/10.5880/GFZ.1.1.2017.002, under the Creative Commons
+      Attribution Non Commercial 4.0 International licence (CC BY-NC 4.0,
+      https://creativecommons.org/licenses/by-nc/4.0/). That record describes
+      the orbit, clock and EOP files and does not name the bias file; this
+      notice applies the same terms to it. CC BY-NC 4.0 does not permit
+      commercial use of this file.
+
+  CAS0MGXRAP_20240350000_01D_01D_DCB.BSX, CAS0OPSRAP_20240350000_01D_01D_DCB.BIA,
+  CAS1OPSRAP_20240350000_01D_01D_DCB.BIA
+      Multi-GNSS differential code biases of the Chinese Academy of Sciences
+      (CAS). No product DOI and no licence are published by the provider: IGS
+      terms above. The files cite Wang, N., Yuan, Y., Li, Z., Montenbruck, O.
+      and Tan, B. (2016), Determination of differential code biases with
+      multi-GNSS observations, J. Geod. 90(3), 209-228,
+      https://doi.org/10.1007/s00190-015-0867-4.
+
+  IGS0OPSFIN_20240350000_01D_02H_GIM.INX
+      IGS final combined global ionosphere maps (the CODE, JPL and UPC maps,
+      combined at the University of Warmia and Mazury in Olsztyn, as the file
+      header states). Terms: IGS terms above. Reference: Hernandez-Pajares, M.
+      et al. (2009), The IGS VTEC maps: a reliable source of ionospheric
+      information since 1998, J. Geod. 83(3-4), 263-275,
+      https://doi.org/10.1007/s00190-008-0266-1.
+
+  IGS0OPSSNX_20240350000_01D_01D_CRD.SNX
+      IGS daily combined SINEX solution (combination by IGN for the IGS; the
+      contributing analysis centres are listed in the file). Terms: IGS terms
+      above.
+
+  igs20.atx
+      IGS antenna calibrations, IGS20 ANTEX (release IGS20_2437), maintained by
+      the IGS antenna working group; the file header lists the references of
+      its calibrations. Terms: IGS terms above. Introduction of igs20.atx:
+      IGSMAIL-8238 (2022), https://lists.igs.org/pipermail/igsmail/2022/008234.html.
+
+Results computed with GNX-py (part of GNX-py, MIT License, for the GNX-py
+processing; the attribution of the data they were computed from applies to
+them):
+
+  sample_data/dcb_table.csv           PPP-derived receiver DCB values of EPN
+                                      stations, computed by the author of
+                                      GNX-py; read by the calibration tutorial
+  sample_data/output/*_STEC.parquet.gzip
+                                      slant TEC computed from the observations
+                                      of the EPN stations BOR1 and BRUX
+  tutorial/ionosphere/network/*_STEC.parquet.gzip
+                                      slant TEC (day 2024-035) computed from the
+                                      observations of 38 EPN stations (BKG GNSS
+                                      Data Center), with the CODE final orbits
+                                      and GIM and the IGS broadcast navigation
+
+  EPN observations behind these results: the EPN Data Access and Use Policy
+  (EUREF Governing Board, version of 2 July 2026,
+  https://epncb.eu/_documentation/EPNDataAccessandUsePolicy_2026.pdf) lets each
+  station operator distribute its data under CC0 or CC BY and states "EPN assets
+  for which no explicit licence has been declared are considered to be
+  distributed under CC BY 4.0." The EPN station records (the DOI records
+  https://doi.org/10.24414/ROB-EUREF-<nine-character station ID> and, for the
+  stations without one, the EPN Historical Data Center records
+  https://w3id.org/EUREF-HDC/<nine-character station ID>) give CC BY 4.0 for
+  every station used here: BAUT, BOGE, BOR1, BPDL, BRTS, BRUX, BYDG, CLIB, CPAR,
+  CRAK, GELL, GOML, GOP6, GOR2, GWWL, HOBU, HOFJ, JOZ2, KATO, KLNK, LAMA, LDB2,
+  LEIJ, LIDA, LODZ, MNKW, MOGI, PINS, POTS, PSTV, PTBB, REDZ, RVNE, SAS2, SULP,
+  SWKI, TER2, WARN and ZYWI. These results are adaptations of those data
+  (processed into DCB and slant TEC values with GNX-py); credit the EPN, its
+  station operators (named in the EPN site logs, https://epncb.eu) and the BKG
+  GNSS Data Center. Where a station has a DOI its landing page gives the
+  citation; otherwise the policy's generic citation is "<Agency> (<year>),
+  <Title>, Retrieved <Date>, from <URL>".
+
+Suggested references for the data:
+
+  Johnston, G., Riddell, A. and Hausler, G. (2017), The International GNSS
+  Service, in: Teunissen, P.J.G. and Montenbruck, O. (eds.), Springer Handbook
+  of Global Navigation Satellite Systems, Springer, pp. 967-982,
+  https://doi.org/10.1007/978-3-319-42928-1_33.
+
+  Montenbruck, O. et al. (2017), The Multi-GNSS Experiment (MGEX) of the
+  International GNSS Service (IGS) - Achievements, prospects and challenges,
+  Advances in Space Research 59(7), pp. 1671-1697.
+
+  Bruyninx, C., Legrand, J., Fabian, A. and Pottiaux, E. (2019), GNSS metadata
+  and data validation in the EUREF Permanent Network, GPS Solutions 23(4), 106.
+
+  Noll, C. (2010), The Crustal Dynamics Data Information System: a resource to
+  support scientific analysis using space geodesy, Advances in Space Research
+  45(12), pp. 1421-1440.

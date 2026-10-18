@@ -1,26 +1,31 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gnx_py"
-version = "0.1.0"
-description = "GNSS processing library for PPP, SISRE/URE evaluation, and ionospheric modelling."
+version = "1.0.0"
+description = "GNSS processing library: SPP, PPP with ambiguity resolution, SIS/SISRE evaluation, ionospheric TEC modelling and GNSS data downloads."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12,<3.13"
-license = { text = "MIT" }
+# SPDX licence expression and licence files (PEP 639; the build needs setuptools >= 77)
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
 authors = [
   { name = "Hubert Pierzchała" }
 ]
-keywords = ["GNSS", "PPP", "SISRE", "ionosphere", "STEC", "RINEX"]
+keywords = ["GNSS", "SPP", "PPP", "SISRE", "ionosphere", "STEC", "RINEX"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering",
 ]
+# Runtime dependencies: the single source of truth. requirements-runtime.txt mirrors them and
+# requirements-tutorial.txt mirrors the "tutorial" extra below.
 dependencies = [
   "numpy>=2.2,<2.4",
   "numba==0.63.1",
@@ -30,36 +35,52 @@ dependencies = [
   "pandas>=2.3,<2.4",
   "scipy>=1.12,<2.0",
   "xarray>=2025.1,<2026.0",
+  "netCDF4>=1.6",
   "pyarrow>=14",
   "filterpy==1.4.5",
-  "georinex==1.16.2",
+  "hatanaka>=2.8.1",
+  "ncompress>=1.0",
   "tabulate==0.9.0",
+  "requests>=2.28,<3",
 ]
 
 [project.optional-dependencies]
+# test tools (pytest and its plugins, georinex as an independent RINEX reference)
+test = [
+  "pytest>=8,<10",
+  "pytest-xdist>=3.6,<4",
+  "pytest-timeout>=2.3,<3",
+  "python-dotenv>=1.0,<2",
+  "allpairspy>=2.5,<3",
+  "psutil>=5.9,<8",
+  "georinex==1.16.2",
+]
+# lazily loaded xarray datasets (chunks=...), e.g. the chunked NetCDF output of the kriging grids
+# (save_grids_to_netcdf(..., chunks=...)); without dask those calls raise
+dask = [
+  "dask[array]>=2024.1",
+]
 tutorial = [
   "seaborn>=0.13,<0.14",
   "nbformat>=5,<6",
   "nbconvert>=7,<8",
-  "ipykernel>=6,<7",
+  "ipykernel>=6,<8",
   "jupyterlab>=4,<5",
 ]
+# everything for development: the test tools, the tutorials, coverage and linters
 dev = [
-  "pytest>=8,<9",
+  "gnx_py[test,tutorial]",
   "pytest-cov>=5,<7",
   "ruff>=0.6,<1",
   "black>=24.0,<26",
   "mypy>=1.10,<2",
-  "seaborn>=0.13,<0.14",
-  "nbformat>=5,<6",
-  "nbconvert>=7,<8",
-  "ipykernel>=6,<7",
-  "jupyterlab>=4,<5",
 ]
 
 [project.urls]
 Homepage = "https://github.com/HJpierzchala/GNX"
 Repository = "https://github.com/HJpierzchala/GNX"
+Changelog = "https://github.com/HJpierzchala/GNX/blob/main/CHANGELOG.md"
+Issues = "https://github.com/HJpierzchala/GNX/issues"
 
 [tool.setuptools]
 include-package-data = false
@@ -67,11 +88,3 @@ include-package-data = false
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gnx_py", "gnx_py.*"]
-exclude = [
-  "docs*",
-  "examples*",
-  "sample_data*",
-  "scripts*",
-  "tests*",
-  "tutorial*",
-]

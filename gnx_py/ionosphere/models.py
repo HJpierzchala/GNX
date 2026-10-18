@@ -1,4 +1,4 @@
-"""Ionopsheric modeling utilities.
+"""Ionospheric modeling utilities.
 
 This module provides implementations of classic and empirical ionospheric models
 and helpers used in GNSS processing, including:
@@ -37,9 +37,9 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import xarray as xr
-from ..conversion import geographic2geomagnetic_latitude,spherical2ecef,ecef2geodetic
-from .utils import get_ipp, get_local_time, stec_mf
-from ..time import gpst2utc, local2gsow
+from ..core.conversion import geographic2geomagnetic_latitude,spherical2ecef,ecef2geodetic
+from .utils import get_ipp, get_local_time, stec_mf, _check_choice
+from ..core.time import gpst2utc, local2gsow
 
 C = 299792458
 PI = np.pi
@@ -66,7 +66,8 @@ def klobuchar(azimuth, elev, fi, lambda_, tow, beta, alfa):
             alfa (array-like of float, length 4): Klobuchar amplitude (GPSA) coefficients.
 
         Returns:
-            float: Ionospheric slant delay in meters.
+            float: Ionospheric slant delay in meters on GPS L1; another signal f
+                takes ``gnss.gamma('L1', f)`` times this delay (IS-GPS-200 20.3.3.5.2.5).
 
         Notes:
             - Elevation is converted to semicircles internally as per the model definition.
@@ -121,6 +122,103 @@ def klobuchar(azimuth, elev, fi, lambda_, tow, beta, alfa):
 
     dIon1 = c * dIon1
     return dIon1
+
+
+def klobuchar_array(azimuth, elev, fi, lambda_, tow, beta, alfa):
+    """Vectorised :func:`klobuchar` (GPS, IS-GPS-200 20.3.3.5.2.5): slant delay [m] on L1.
+
+    Same formulas and clamps as the scalar reference, element-wise over ``azimuth``,
+    ``elev`` and ``tow`` (GPS seconds of week or of day).
+    """
+    a = np.deg2rad(np.asarray(azimuth, dtype=float))
+    e = np.asarray(elev, dtype=float) / 180.0
+    tow = np.asarray(tow, dtype=float)
+    psi = 0.0137 / (e + 0.11) - 0.022
+    lat_i = np.clip(fi / 180.0 + psi * np.cos(a), -0.416, 0.416)
+    long_i = lambda_ / 180.0 + psi * np.sin(a) / np.cos(lat_i * np.pi)
+    lat_m = lat_i + 0.064 * np.cos((long_i - 1.617) * np.pi)
+    t = np.mod(4.32e4 * long_i + tow, 86400.0)
+    sF = 1.0 + 16.0 * (0.53 - e) ** 3
+    per = beta[0] + beta[1] * lat_m + beta[2] * lat_m ** 2 + beta[3] * lat_m ** 3
+    per = np.where(per < 72000.0, 72000.0, per)
+    x = 2.0 * np.pi * (t - 50400.0) / per
+    amp = alfa[0] + alfa[1] * lat_m + alfa[2] * lat_m ** 2 + alfa[3] * lat_m ** 3
+    amp = np.where(amp < 0.0, 0.0, amp)
+    d = np.where(np.abs(x) > 1.57, sF * 5e-9, sF * (5e-9 + amp * (1.0 - x ** 2 / 2.0 + x ** 4 / 24.0)))
+    return 2.99792458e8 * d
+
+
+#: BDS Klobuchar shell (BDS-SIS-ICD-B1I 3.0, 5.2.4.7): Earth radius and ionospheric height [km]
+BDS_KLOBUCHAR_R_KM = 6378.0
+BDS_KLOBUCHAR_H_KM = 375.0
+#: BDT = GPST - 14 s
+BDT_MINUS_GPST_S = -14.0
+
+
+def klobuchar_bds(azimuth, elev, fi, lambda_, sod_bdt, alfa, beta):
+    """BeiDou Klobuchar slant ionospheric delay [m] on B1I (BDS-SIS-ICD-B1I 3.0, 5.2.4.7).
+
+    The BDS model differs from the GPS one (IS-GPS-200): a spherical IPP on a
+    375 km shell (R = 6378 km) with the geographic IPP latitude, a cosine (not
+    its series) for the daytime term, the period A4 clamped to 72000-172800 s,
+    and the slant factor 1/sqrt(1 - (R cos E / (R + h))^2). The coefficients
+    are the BDSA/BDSB values of the navigation header (RINEX ``BDSA``/``BDSB``),
+    in the units of the GPS ones (s/semicircle^n). Vectorised.
+
+    Opt-in in the sessions: ``Config.bds_klobuchar="icd"`` (SPP, PPP, TEC and
+    ``compare_models``). The default ``"gps"`` takes the GPS Klobuchar
+    coefficients scaled to the BeiDou signal: the BDS-2 broadcast coefficients are fitted for the
+    Asia-Pacific service area, and over 9 station-days (BRUX/NKLG/NYA2 x
+    2024-035/131/132) the slant RMS against the COD GIM at B1I is 17.95 TECU
+    GPS-scaled and 19.58 TECU with this model, worse on 5 of 9 days (1 tie).
+    In SPP 29 BeiDou rows got worse and 22 better (NKLG 2024-132 C-only
+    rms_3d 3.08 -> 6.75 m). The function itself matches an independent ICD
+    implementation to 3.6e-14 m (2000 random cases).
+    BDGIM, the global BDS-3 model, is implemented in
+    :mod:`gnx_py.ionosphere.bdgim` (BDS-SIS-ICD-B2b-1.0 §7.7;
+    ionosphere_model='bdgim').
+
+    Parameters
+    ----------
+    azimuth, elev : array_like
+        Satellite azimuth and elevation [deg].
+    fi, lambda_ : float or array_like
+        Receiver geographic latitude and longitude [deg].
+    sod_bdt : array_like
+        BDT seconds of day (or of week; taken modulo 86400). BDT = GPST - 14 s.
+    alfa, beta : sequence of 4 floats, or arrays (n, 4)
+        BDSA (alpha_n) and BDSB (beta_n) coefficients: one set for every row, or one set per row (the
+        broadcast set in force at each epoch, ``rinex_nav.broadcast_iono_at``).
+
+    Returns
+    -------
+    numpy.ndarray
+        Slant group delay [m] at B1I; another signal f takes ``gnss.gamma('B1I', f)``
+        times this delay.
+    """
+    R, h = BDS_KLOBUCHAR_R_KM, BDS_KLOBUCHAR_H_KM
+    E = np.deg2rad(np.asarray(elev, dtype=float))
+    A = np.deg2rad(np.asarray(azimuth, dtype=float))
+    fu = np.deg2rad(np.asarray(fi, dtype=float))
+    lu = np.deg2rad(np.asarray(lambda_, dtype=float))
+    psi = np.pi / 2 - E - np.arcsin(R / (R + h) * np.cos(E))
+    phi_m = np.arcsin(np.sin(fu) * np.cos(psi) + np.cos(fu) * np.sin(psi) * np.cos(A))
+    lam_m = lu + np.arcsin(np.sin(psi) * np.sin(A) / np.cos(phi_m))
+    x = np.abs(phi_m / np.pi)
+    # one set (4,) for all rows, or one set per row (n, 4) (the set in force at each epoch, bug-fix stage 10)
+    al = np.asarray(alfa, dtype=float)
+    be = np.asarray(beta, dtype=float)
+    al = al.T if al.ndim == 2 else al
+    be = be.T if be.ndim == 2 else be
+    a2 = sum(al[n] * x ** n for n in range(4))
+    a2 = np.where(a2 < 0.0, 0.0, a2)
+    a4 = sum(be[n] * x ** n for n in range(4))
+    a4 = np.clip(a4, 72000.0, 172800.0)
+    t = np.mod(np.asarray(sod_bdt, dtype=float) + lam_m * 43200.0 / np.pi, 86400.0)
+    iz = np.where(np.abs(t - 50400.0) < a4 / 4.0,
+                  5e-9 + a2 * np.cos(2.0 * np.pi * (t - 50400.0) / a4), 5e-9)
+    slant = 1.0 / np.sqrt(1.0 - (R * np.cos(E) / (R + h)) ** 2)
+    return C * slant * iz
 
 
 def sun_dec(doy):
@@ -259,11 +357,24 @@ def get_vtec(LT, doy, fmag, fmag_deg, klobpar, cos3x, cos2x, sys='GPS'):
         Returns:
             numpy.ndarray or float: Estimated VTEC in TECU.
 
+        Raises:
+            ValueError: If ``sys`` is not 'GPS' or 'GAL'.
+
         Notes:
             - The model is parameterized with sys-dependent constants (k).
             - Inputs may be arrays; broadcasting follows NumPy semantics.
         """
 
+    _check_choice("sys", sys, ['GPS', 'GAL'], fuzzy=False,
+                  extra="(NTCM coefficients are defined for GPS and Galileo only)")
+    # coefficients k1..k12 of the NTCM model (Jakowski et al. 2011, J. Geod. 85, 965-974,
+    # doi:10.1007/s00190-011-0455-1). 'GAL': Table 3 of the NTCM G Ionospheric Model Description, issue 1.0
+    # (European GNSS (Galileo) Open Service, European Union / European GNSS Service Centre, May 2022,
+    # https://www.gsc-europa.eu/sites/default/files/NTCM-G_Ionospheric_Model_Description_-_v1.0.pdf), equal digit
+    # by digit. 'GPS': the NTCM driven by the GPS Klobuchar coefficients (NTCM-Klobpar; Hoque, Jakowski and
+    # Berdermann 2017, GPS Solut. 21, 1563-1572, doi:10.1007/s10291-017-0632-7); this set is not checked against
+    # the paper (no open-access copy; the open-access follow-up, Hoque, Jakowski and Berdermann 2018, J. Space
+    # Weather Space Clim. 8, A20, doi:10.1051/swsc/2018009, does not list the coefficients).
     if sys == 'GPS':
         k = (
         0.87909, 0.17466, -0.02500, 0.06058, 0.00714, 0.01992, -0.02634, -0.31836, 0.99221, 1.01612, 2.59418, 0.35127)
@@ -372,8 +483,24 @@ def ntcm_vtec(pos, DOY, ev, az, epoch, gala, mf_no=1,return_vtec=False):
     Notes:
         - An azimuth-dependent driving parameter `azpar` is formed per provided `gala`.
         - Uses `get_vtec` with sys='GAL' and maps VTEC to STEC via `stec_mf`.
+        - Verification: the 38 rows of Annex D of the NTCM-G model description (European GNSS (Galileo) Open
+          Service, NTCM-G Ionospheric Model Description, issue 1.0, 2022) to 4.9e-5 TECU with ``mf_no=1``, and
+          an independent implementation (ray/sphere pierce point, pole vector) to 1e-12 TECU on random
+          geometry; the SPP session's 'ion' column of an NTCM row equals it.
+        - The pierce-point longitude is the description's lambda + asin(...) (``utils.get_ipp``): a pierce point
+          beyond the pole is folded onto the near meridian, as Annex D row 6 (82.49 N looking poleward) is
+          computed. At NYA2 (78.9 N) that concerns 1.3 % of the GPS L1 rows of a day (up to 5 TECU there); the
+          slant RMS against the COD GIM is the same either way.
+        - ``gala`` is one set; the sessions (``tools.DDPreprocessing.compute_ntcm``) pass per epoch the set in
+          force (RINEX 4 '> ION E' records, the latest at or before the epoch; RINEX 3 the header set; since v1.0.0, before that one set per run).
+        - Model accuracy (slant TEC against the COD GIM on the validation rows; Klobuchar
+          on the same lines of sight in brackets): BRUX 2024-02-04 10-11 h -17.9 (-4.7) TECU, NYA2 2024-035 -9.7
+          mean / 11.9 RMS, NKLG 2024-132 (storm) +21.0..+24.0 mean / 28.5-31.6 RMS (-1.4..+0.1 / 13.6-14.4),
+          NYA2 2024-132 +18.5 mean / 19.6 RMS, scale 1.95 (+1.4 / 6.4). On those rows NTCM SPP stays above a
+          reference computed with the Klobuchar model; the implementation is not the cause.
     """
 
+    _check_choice("mf_no", mf_no, [1, 2, 3, 4])
     fi_pp, la_pp = get_ipp(ev=ev, az=az, lat=pos[0], lon=pos[1])
     UT = gpst2utc(epoch)  # czas UTC
     local_times_list = get_local_time(la_pp, ut=UT)
@@ -401,8 +528,8 @@ def compute_ntcm_grid(
     lon_grid,
     times,
     gal_alpha,
-    shell_height: float = 450e3,
-    earth_radius: float = 6371e3,
+    shell_height: float | None = None,
+    earth_radius: float | None = None,
     doy: int | None = None,
 ) -> xr.Dataset:
     """
@@ -413,6 +540,10 @@ def compute_ntcm_grid(
     Experimental grid-generation helper used by tutorials/research workflows.
     It is not part of the core STEC measurement pipeline.
 
+    The NTCM-G VTEC (eq. 3) is evaluated directly at each grid node, which is
+    the ionospheric point (geocentric latitude, as in IONEX), vectorised over
+    the grid. No line of sight, elevation or mapping function is involved.
+
     Parameters
     ----------
     lat_grid : array-like
@@ -420,16 +551,14 @@ def compute_ntcm_grid(
     lon_grid : array-like
         Vector of longitudes (deg).
     times : array-like
-        Vector of times (e.g., np.datetime64, list[Timestamp], DatetimeIndex).
+        Vector of GPST times (e.g., np.datetime64, list[Timestamp], DatetimeIndex);
+        converted to UTC for the local time, as in ``ntcm_vtec``.
     gal_alpha : any
-        Parameter(s) gal_alpha passed to gnx.ntcm_vtec (argument 'gala').
-    shell_height : float, optional
-        Height of the ionospheric shell above the Earth's surface [m], default 450e3.
-    earth_radius : float, optional
-        Earth's radius [m], default 6371e3.
+        Galileo broadcast coefficients (ai0, ai1, ai2), as ``gala`` of ``ntcm_vtec``.
+    shell_height, earth_radius : float, optional
+        Deprecated and unused: the grid nodes are the ionospheric points.
     doy : int or None, optional
-        Day-of-year passed to gnx.ntcm_vtec (DOY argument).
-        If None, it will be calculated from the first element of `times`.
+        Day-of-year used for every epoch; None takes the day of the first element of `times`.
 
     Returns
     -------
@@ -437,6 +566,11 @@ def compute_ntcm_grid(
         Dataset with one variable 'V' with dimensions (time, lat, lon),
         with unit and description attributes.
     """
+    import warnings
+
+    if shell_height is not None or earth_radius is not None:
+        warnings.warn("compute_ntcm_grid: shell_height and earth_radius are unused (the grid nodes are the "
+                      "ionospheric points) and will be removed", DeprecationWarning, stacklevel=2)
 
     lat_grid = np.asarray(lat_grid, dtype=float)
     lon_grid = np.asarray(lon_grid, dtype=float)
@@ -445,27 +579,17 @@ def compute_ntcm_grid(
     if doy is None:
         doy = times[0].dayofyear
 
+    gala = gal_alpha
+    lat2, lon2 = np.meshgrid(lat_grid, lon_grid, indexing="ij")
+    cos3x, cos2x = sol_zen_deps(lat2, sun_dec(doy))
+    fmag, fmag_deg = geographic2geomagnetic_latitude(fi_pp=lat2, la_pp=lon2)
+    azpar = np.abs(np.sqrt(gala[0] ** 2 + 1633.33 * gala[1] ** 2 + 4802000 * gala[2] ** 2
+                           + 3266.67 * gala[0] * gala[2]))
     V = np.empty((times.size, lat_grid.size, lon_grid.size), dtype=float)
-
-    for i, lat in enumerate(lat_grid):
-        for j, lon in enumerate(lon_grid):
-
-            sph = np.array([lat, lon, earth_radius + shell_height], dtype=float)
-            ecef = spherical2ecef(sph=sph)
-            geodetic = ecef2geodetic(ecef=ecef, deg=True)  # [lat, lon, h]
-
-            for k, t in enumerate(times):
-                t = pd.Timestamp(t)
-                vtec = ntcm_vtec(
-                    pos=geodetic,
-                    DOY=doy,
-                    ev=0.0,
-                    az=0.0,
-                    epoch=t,
-                    gala=gal_alpha,
-                    return_vtec=True,
-                )
-                V[k, i, j] = vtec
+    for k, t in enumerate(times):
+        lt = get_local_time(lon2, ut=gpst2utc(pd.Timestamp(t)))
+        V[k] = get_vtec(LT=lt, doy=doy, fmag=fmag, fmag_deg=fmag_deg, klobpar=azpar, cos3x=cos3x,
+                        cos2x=cos2x, sys='GAL')
 
     da_V = xr.DataArray(
         V,

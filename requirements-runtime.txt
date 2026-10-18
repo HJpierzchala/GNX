@@ -1,19 +1,22 @@
-# Runtime dependencies for GNX (pip / Windows / Python 3.12)
-# Keep these as COMPATIBILITY RANGES, not hard pins.
-# For reproducible dev installs, use constraints-win.txt with `pip install -e . -c constraints-win.txt`.
+# Runtime dependencies of GNX-py (Python 3.12): a mirror of [project] dependencies in pyproject.toml,
+# which is the single source of truth (change pyproject.toml first). Mostly compatibility ranges; numba,
+# astropy, Cartopy, filterpy and tabulate are pinned to the versions GNX-py 1.0.0 was validated with.
+# The package itself installs them:
+#   python -m pip install -e .
 
-numpy>=2.2,<2.4
-numba==0.63.1  # required; NumPy 2.4 not supported yet
-# (llvmlite is pulled in by numba, but pinning helps reproducibility)
-# llvmlite==0.44.0
-
+numpy>=2.2,<2.4        # Numba 0.63.1 does not support NumPy 2.4 yet
+numba==0.63.1          # pulls llvmlite
 astropy==7.0.0
 Cartopy==0.24.1
 matplotlib>=3.10,<3.11
 pandas>=2.3,<2.4
 scipy>=1.12,<2.0
 xarray>=2025.1,<2026.0
+netCDF4>=1.6
 pyarrow>=14
 filterpy==1.4.5
-georinex==1.16.2
+hatanaka>=2.8.1        # Compact RINEX (Hatanaka) observation files
+ncompress>=1.0         # Unix compress (.Z) archive files
 tabulate==0.9.0
+requests>=2.28,<3
+# georinex is not a runtime dependency: GNX-py reads RINEX with its own readers.
