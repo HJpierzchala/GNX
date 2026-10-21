@@ -33,6 +33,8 @@ Version 1.0.0 is the first stable release. Besides many fixes (see [`CHANGELOG.m
 - **`SISSession`**, the signal-in-space session (formerly `SISController`);
 - a **validation** of every processing branch over a matrix of settings, products, stations and days, with the positioning accuracy limits referred to RTKLIB on the same data (see [Validation](#validation)).
 
+Version 1.0.1 (2026-10-21) is a documentation release: the tutorial and `GNX_manual.pdf` cite the algorithms, models and formats they use.
+
 ---
 
 ## Current Capabilities

@@ -5,8 +5,8 @@ cff-version: 1.2.0
 message: "If you use GNX-py in your research, please cite it using the metadata from this file."
 type: software
 title: "GNX-py"
-version: "1.0.0"
-date-released: "2026-10-17"
+version: "1.0.1"
+date-released: "2026-10-21"
 abstract: >-
   GNX-py is a Python library for GNSS data processing: single point positioning (SPP), precise point
   positioning (PPP) with optional ambiguity resolution, signal-in-space (SIS/SISRE) evaluation of broadcast

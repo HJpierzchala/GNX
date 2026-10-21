@@ -4,6 +4,31 @@ All notable changes to GNX-py are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-10-21
+
+Documentation release.
+
+### Changed
+
+- Documentation: the tutorial and the manual cite the algorithms, models and formats they use (67 new references,
+  fixes of existing ones). All seven tutorial notebooks cite their sources where the text names an algorithm, a
+  model, a file format, a product or an interface document: the observation formats (RINEX 2.11, 3.05 and 4.02,
+  RINEX clock, SP3-d, ANTEX, SINEX, Bias-SINEX, IONEX, ORBEX), the GPS, Galileo and BeiDou interface documents,
+  the broadcast ionosphere models (Klobuchar, NTCM-G, BDGIM), the troposphere models, the IERS 2010 site
+  displacement, the satellite attitude laws, the phase wind-up, the Kalman filter, the PPP ambiguity resolution
+  (LAMBDA, MLAMBDA, ratio test, partial fixing), the analysis-centre products, the ionospheric activity indexes
+  and kriging. The SISE definition is now cited from the Galileo OS Service Definition Document, and the eclipse
+  condition from Montenbruck and Gill (2000).
+- Documentation: the RTKLIB 2.4.2 manual (Takasu 2013) is cited where GNX-py follows RTKLIB: the routines it ports
+  (ocean tide loading, phase wind-up, LAMBDA/MLAMBDA), the GDOP limit of SPP, the ZTD process noise, the
+  fix-and-hold constraint, the receiver and satellite antenna offsets and the ionospheric pierce point. The
+  activity-index chapter no longer calls the IPP coordinates geocentric.
+- Bibliography (`tutorial/bibliography.bib`): corrected authors (Mannucci et al. 1998, Carmo et al. 2021), titles
+  (Klobuchar 1987, IS-GPS-200N, IONEX Version 1, NTCM-G), institution names (UNB TR 203), years and entry types
+  (IS-GPS-200N, DSP Guide, Glaner 2022), added DOIs (Springer Handbook, Kouba and Héroux 2001, Glaner 2022) and
+  issue numbers, and replaced links that no longer answer (IS-GPS-200N, Galileo OS SIS ICD, IONEX, Schaer 1999) or
+  were missing (UNB TR 203, Hatanaka 2008).
+
 ## [1.0.0] - 2026-10-17
 
 GNX-py 1.0.0 is the first stable release. Before the release every processing branch (SPP, PPP, ionosphere,

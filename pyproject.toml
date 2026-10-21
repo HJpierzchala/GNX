@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gnx_py"
-version = "1.0.0"
+version = "1.0.1"
 description = "GNSS processing library: SPP, PPP with ambiguity resolution, SIS/SISRE evaluation, ionospheric TEC modelling and GNSS data downloads."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12,<3.13"
